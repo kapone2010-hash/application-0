@@ -1,18 +1,68 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from html import escape
 from time import sleep
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
+from bs4 import BeautifulSoup
 import pandas as pd
 import requests
 import streamlit as st
 
 
 USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
+REQUEST_HEADERS = {
+    "User-Agent": "Application-0 GovDash SDR research prototype (public web discovery; +https://github.com/kapone2010-hash/application-0)"
+}
+BLOCKED_FETCH_DOMAINS = {
+    "linkedin.com",
+    "www.linkedin.com",
+    "facebook.com",
+    "www.facebook.com",
+    "x.com",
+    "twitter.com",
+    "www.google.com",
+    "duckduckgo.com",
+    "www.duckduckgo.com",
+    "instagram.com",
+    "www.instagram.com",
+}
+CONTACT_TITLE_KEYWORDS = [
+    "chief executive",
+    "ceo",
+    "president",
+    "founder",
+    "business development",
+    "bd",
+    "growth",
+    "capture",
+    "proposal",
+    "contracts",
+    "contracting",
+    "program manager",
+    "program director",
+    "operations",
+    "vp",
+    "vice president",
+    "director",
+    "cto",
+    "chief technology",
+]
+GENERIC_EMAIL_PREFIXES = {"info", "support", "sales", "contact", "admin", "hello", "careers", "jobs", "hr"}
+DEFAULT_CADENCE = [
+    ("Day 1", "Email", "Congratulate them on the award, cite the agency/value, and ask who owns capture or proposal operations."),
+    ("Day 2", "LinkedIn", "Connect with the named target and reference the award without pitching hard."),
+    ("Day 4", "Call", "Ask for the capture/proposal/contracts owner and mention the award-specific GovDash workflow."),
+    ("Day 7", "Email", "Send the short demo premise: award record, compliance matrix, reusable past performance, and option-year evidence."),
+    ("Day 10", "Call", "Follow up with one concrete question about kickoff, recompete, or follow-on capture process."),
+    ("Day 14", "Nurture", "Send a useful GovDash use case and move to monthly nurture if there is no engagement."),
+]
 
 
 def parse_iso_date(value: str) -> date | None:
@@ -161,6 +211,29 @@ class ContactTarget:
     search_query: str
 
 
+@dataclass(frozen=True)
+class PublicContact:
+    full_name: str
+    title: str
+    email: str
+    phone: str
+    source_url: str
+    evidence: str
+    confidence: int
+    recommended_reason: str
+
+
+@dataclass(frozen=True)
+class CompanyIntel:
+    company: str
+    website: str
+    what_they_do: str
+    why_they_may_have_won: str
+    contacts: tuple[PublicContact, ...]
+    sources: tuple[str, ...]
+    scanned_urls: tuple[str, ...]
+
+
 def build_search_payload(start: date, end: date, limit: int, min_amount: int, keyword: str) -> dict:
     filters: dict[str, object] = {
         "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
@@ -285,6 +358,433 @@ def public_links(prospect: Prospect) -> dict[str, str]:
         "USAspending": search_url(f'site:usaspending.gov "{prospect.award_id}"'),
         "SAM.gov": search_url(f'site:sam.gov "{prospect.award_id}" "{company}"'),
     }
+
+
+def html_escape(value: object) -> str:
+    return escape(str(value or ""), quote=True)
+
+
+def normalize_search_result_url(href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith("//"):
+        href = f"https:{href}"
+    parsed = urlparse(href)
+    query = parse_qs(parsed.query)
+    if "uddg" in query:
+        return unquote(query["uddg"][0])
+    return href
+
+
+def url_domain(url: str) -> str:
+    return urlparse(url).netloc.lower().replace("www.", "")
+
+
+def domain_root(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def fetchable_public_url(url: str) -> bool:
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    if parsed.scheme not in {"http", "https"} or not domain:
+        return False
+    if domain in BLOCKED_FETCH_DOMAINS or domain.replace("www.", "") in BLOCKED_FETCH_DOMAINS:
+        return False
+    if any(domain.endswith(f".{blocked}") for blocked in BLOCKED_FETCH_DOMAINS):
+        return False
+    return True
+
+
+def clean_text_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    lines = [line.strip() for line in soup.get_text("\n").splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def source_links_from_html(html: str, base_url: str, limit: int = 5) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    root = url_domain(base_url)
+    keywords = ("about", "leadership", "team", "management", "contact", "news", "contract", "federal")
+    links: list[str] = []
+    for anchor in soup.find_all("a", href=True):
+        label = anchor.get_text(" ", strip=True).lower()
+        href = anchor.get("href") or ""
+        url = urljoin(base_url, href)
+        if url_domain(url) != root:
+            continue
+        if not any(keyword in f"{label} {url.lower()}" for keyword in keywords):
+            continue
+        if url not in links and fetchable_public_url(url):
+            links.append(url)
+        if len(links) >= limit:
+            break
+    return links
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_public_web(query: str, max_results: int = 5) -> tuple[str, ...]:
+    try:
+        response = requests.get(PUBLIC_SEARCH_URL, params={"q": query}, headers=REQUEST_HEADERS, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException:
+        return tuple()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    results: list[str] = []
+    for anchor in soup.select("a.result__a"):
+        url = normalize_search_result_url(anchor.get("href", ""))
+        if url and fetchable_public_url(url) and url not in results:
+            results.append(url)
+        if len(results) >= max_results:
+            break
+    return tuple(results)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_public_page(url: str) -> tuple[str, str]:
+    if not fetchable_public_url(url):
+        return "", ""
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=12, allow_redirects=True)
+        response.raise_for_status()
+    except requests.RequestException:
+        return "", ""
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type and "html" not in content_type and "text" not in content_type:
+        return "", response.url
+    return response.text[:400_000], response.url
+
+
+def extract_emails(text: str) -> list[str]:
+    emails = re.findall(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, flags=re.IGNORECASE)
+    cleaned = []
+    for email in emails:
+        email = email.strip(".,;:()[]{}<>").lower()
+        if email.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            continue
+        if email not in cleaned:
+            cleaned.append(email)
+    return cleaned[:12]
+
+
+def extract_phones(text: str) -> list[str]:
+    phones = re.findall(r"(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}", text)
+    cleaned = []
+    for phone in phones:
+        normalized = re.sub(r"\s+", " ", phone).strip(" .,-")
+        digits = re.sub(r"\D", "", normalized)
+        if len(digits) in {10, 11} and normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned[:10]
+
+
+def title_from_line(line: str) -> str:
+    lower = line.lower()
+    title_map = {
+        "chief executive": "Chief Executive Officer",
+        "ceo": "Chief Executive Officer",
+        "president": "President",
+        "founder": "Founder",
+        "business development": "Business Development Leader",
+        "capture": "Capture Leader",
+        "proposal": "Proposal Leader",
+        "contracts": "Contracts Leader",
+        "contracting": "Contracts Leader",
+        "program manager": "Program Manager",
+        "program director": "Program Director",
+        "operations": "Operations Leader",
+        "vice president": "Vice President",
+        "vp": "Vice President",
+        "director": "Director",
+        "chief technology": "Chief Technology Officer",
+        "cto": "Chief Technology Officer",
+    }
+    for keyword, title in title_map.items():
+        if keyword in lower:
+            return title
+    return ""
+
+
+def reason_for_title(title: str) -> str:
+    lower = title.lower()
+    if any(term in lower for term in ["capture", "business development", "growth", "president", "chief executive", "founder"]):
+        return "Likely cares about converting the new award into follow-on pipeline and repeatable capture process."
+    if "proposal" in lower:
+        return "Likely feels the pain around compliance matrices, reusable past performance, and proposal drafting speed."
+    if "contract" in lower:
+        return "Likely owns award records, modifications, option years, and contract evidence."
+    if any(term in lower for term in ["technology", "program", "operations"]):
+        return "Likely cares about delivery evidence, kickoff organization, and program execution."
+    return "Public source suggests this person may be relevant to GovDash evaluation or referral."
+
+
+def likely_person_name(value: str) -> bool:
+    banned_words = {
+        "United States",
+        "Privacy Policy",
+        "Terms Conditions",
+        "Contact Us",
+        "About Us",
+        "Read More",
+        "Learn More",
+        "Press Release",
+        "Small Business",
+        "Department Defense",
+        "Federal Government",
+        "Contract Award",
+    }
+    if value in banned_words:
+        return False
+    parts = value.split()
+    if not (2 <= len(parts) <= 4):
+        return False
+    return all(part[:1].isupper() and len(part.strip("., ")) > 1 for part in parts)
+
+
+def extract_contacts_from_text(text: str, source_url: str) -> list[PublicContact]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    contacts: list[PublicContact] = []
+    for line in lines:
+        compact = re.sub(r"\s+", " ", line)
+        lower = compact.lower()
+        if not any(keyword in lower for keyword in CONTACT_TITLE_KEYWORDS):
+            continue
+        if len(compact) > 280:
+            compact = compact[:280]
+        title = title_from_line(compact)
+        names = re.findall(r"\b([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+){1,3})\b", compact)
+        emails = extract_emails(compact)
+        phones = extract_phones(compact)
+        for name in names[:3]:
+            if not likely_person_name(name):
+                continue
+            confidence = 70
+            if emails:
+                confidence += 15
+            if phones:
+                confidence += 10
+            contacts.append(
+                PublicContact(
+                    full_name=name,
+                    title=title or "Potential leadership/contact role",
+                    email=emails[0] if emails else "",
+                    phone=phones[0] if phones else "",
+                    source_url=source_url,
+                    evidence=compact,
+                    confidence=min(confidence, 95),
+                    recommended_reason=reason_for_title(title),
+                )
+            )
+
+    for email in extract_emails(text):
+        prefix = email.split("@", 1)[0].lower()
+        if prefix in GENERIC_EMAIL_PREFIXES:
+            title = "Company public inbox"
+            confidence = 45
+        else:
+            title = "Public email contact"
+            confidence = 55
+        contacts.append(
+            PublicContact(
+                full_name="",
+                title=title,
+                email=email,
+                phone="",
+                source_url=source_url,
+                evidence=f"Public email found on source page: {email}",
+                confidence=confidence,
+                recommended_reason="Useful as a fallback route if no named contact is verified yet.",
+            )
+        )
+
+    return contacts
+
+
+def dedupe_contacts(contacts: list[PublicContact]) -> tuple[PublicContact, ...]:
+    best: dict[str, PublicContact] = {}
+    for contact in contacts:
+        key = contact.email.lower() or f"{contact.full_name.lower()}|{contact.title.lower()}|{url_domain(contact.source_url)}"
+        if not key.strip("|"):
+            continue
+        if key not in best or contact.confidence > best[key].confidence:
+            best[key] = contact
+    return tuple(sorted(best.values(), key=lambda item: (item.confidence, bool(item.full_name), bool(item.email)), reverse=True)[:12])
+
+
+def summarize_company_work(company: str, award_description: str, naics_description: str, psc_description: str, page_texts: list[str]) -> str:
+    company_terms = []
+    for text in page_texts:
+        for line in text.splitlines():
+            lower = line.lower()
+            if len(line) < 40 or len(line) > 260:
+                continue
+            if any(term in lower for term in ["provides", "specializes", "delivers", "services include", "solutions", "capabilities"]):
+                company_terms.append(re.sub(r"\s+", " ", line))
+            if len(company_terms) >= 2:
+                break
+        if len(company_terms) >= 2:
+            break
+
+    if company_terms:
+        return " ".join(company_terms)
+
+    contract_category = naics_description or psc_description or award_description or "the awarded federal work"
+    return f"Public award data indicates {company} is performing work tied to {contract_category}."
+
+
+def summarize_why_won(prospect: Prospect) -> str:
+    category = prospect.naics_description or prospect.psc_description or "the stated contract scope"
+    agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency or "the buying agency"
+    description = prospect.description or "the listed requirement"
+    return (
+        f"USAspending does not publish the evaluation rationale, so this is a reasoned SDR hypothesis: "
+        f"{agency} awarded {prospect.award_id} for {description}. The NAICS/PSC context points to {category}, "
+        f"which suggests the company had relevant capability, eligibility, pricing, past performance, or incumbent/partner fit for that scope."
+    )
+
+
+def public_intel_key(company: str) -> str:
+    return f"public_intel_{company}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_public_intel(
+    company: str,
+    award_id: str,
+    award_amount: float,
+    agency: str,
+    description: str,
+    naics_description: str,
+    psc_description: str,
+    psc_code: str,
+) -> CompanyIntel:
+    queries = [
+        f'"{company}" official website',
+        f'"{company}" leadership',
+        f'"{company}" "business development"',
+        f'"{company}" "capture manager"',
+        f'"{company}" "proposal manager"',
+        f'"{company}" "contracts manager"',
+        f'"{company}" "{award_id}" contract award',
+    ]
+
+    candidate_urls: list[str] = []
+    for query in queries:
+        for url in search_public_web(query, max_results=4):
+            if url not in candidate_urls:
+                candidate_urls.append(url)
+        if len(candidate_urls) >= 12:
+            break
+
+    website = ""
+    for url in candidate_urls:
+        domain = url_domain(url)
+        if not any(blocked in domain for blocked in ["usaspending.gov", "sam.gov", "govinfo.gov", "defense.gov", "prnewswire.com"]):
+            website = domain_root(url)
+            break
+
+    scan_urls = list(candidate_urls[:8])
+    if website and website not in scan_urls:
+        scan_urls.insert(0, website)
+
+    scanned_urls: list[str] = []
+    source_urls: list[str] = []
+    page_texts: list[str] = []
+    contacts: list[PublicContact] = []
+
+    index = 0
+    while index < len(scan_urls) and len(scanned_urls) < 12:
+        url = scan_urls[index]
+        index += 1
+        if url in scanned_urls:
+            continue
+        html, resolved_url = fetch_public_page(url)
+        final_url = resolved_url or url
+        if not html:
+            continue
+        scanned_urls.append(final_url)
+        source_urls.append(final_url)
+        page_text = clean_text_from_html(html)
+        page_texts.append(page_text[:20_000])
+        contacts.extend(extract_contacts_from_text(page_text[:35_000], final_url))
+
+        if website and url_domain(final_url) == url_domain(website):
+            for extra_url in source_links_from_html(html, final_url, limit=5):
+                if extra_url not in scan_urls and len(scan_urls) < 16:
+                    scan_urls.append(extra_url)
+
+    primary_like = Prospect(
+        award_id=award_id,
+        company=company,
+        uei="",
+        amount=award_amount,
+        base_obligation_date="",
+        start_date="",
+        end_date="",
+        awarding_agency=agency,
+        awarding_sub_agency="",
+        funding_agency=agency,
+        funding_sub_agency="",
+        description=description,
+        naics_code="",
+        naics_description=naics_description,
+        psc_code=psc_code,
+        psc_description=psc_description,
+        address="",
+        city="",
+        state="",
+        country="",
+    )
+
+    return CompanyIntel(
+        company=company,
+        website=website,
+        what_they_do=summarize_company_work(company, description, naics_description, psc_description, page_texts),
+        why_they_may_have_won=summarize_why_won(primary_like),
+        contacts=dedupe_contacts(contacts),
+        sources=tuple(source_urls[:12]),
+        scanned_urls=tuple(scanned_urls[:12]),
+    )
+
+
+def enrich_account(account: Account) -> CompanyIntel:
+    primary = account.primary
+    agency = primary.funding_sub_agency or primary.awarding_sub_agency or primary.awarding_agency
+    return build_public_intel(
+        account.company,
+        primary.award_id,
+        primary.amount,
+        agency,
+        primary.description,
+        primary.naics_description,
+        primary.psc_description,
+        primary.psc_code,
+    )
+
+
+def public_contacts_dataframe(intel: CompanyIntel) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Name": contact.full_name or "Not named",
+                "Title/Role": contact.title,
+                "Email": contact.email,
+                "Phone": contact.phone,
+                "Confidence": contact.confidence,
+                "Why contact": contact.recommended_reason,
+                "Source": contact.source_url,
+                "Evidence": contact.evidence,
+            }
+            for contact in intel.contacts
+        ]
+    )
 
 
 def suggested_personas(prospect: Prospect) -> list[str]:
@@ -567,6 +1067,17 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
     for account in accounts:
         key = f"crm_{account.company}"
         crm = st.session_state.get(key, {})
+        intel = st.session_state.get(public_intel_key(account.company))
+        best_public_contact = ""
+        best_public_email = ""
+        best_public_phone = ""
+        best_public_source = ""
+        if isinstance(intel, CompanyIntel) and intel.contacts:
+            best = intel.contacts[0]
+            best_public_contact = best.full_name or best.title
+            best_public_email = best.email
+            best_public_phone = best.phone
+            best_public_source = best.source_url
         rows.append(
             {
                 "Company": account.company,
@@ -574,10 +1085,20 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Score": account.priority_score,
                 "Status": crm.get("status", "New"),
                 "Owner": crm.get("owner", ""),
+                "Cadence stage": crm.get("cadence_stage", DEFAULT_CADENCE[0][0]),
+                "Next action": crm.get("next_action", "Email"),
                 "Next step date": crm.get("next_step", ""),
+                "Emailed": crm.get("emailed", False),
+                "Called": crm.get("called", False),
+                "Email outcome": crm.get("email_outcome", ""),
+                "Call outcome": crm.get("call_outcome", ""),
                 "Primary persona": crm.get("persona", suggested_personas(account.primary)[0]),
                 "Best contact target": contact_targets(account)[0].title,
                 "Why this contact": contact_targets(account)[0].why,
+                "Best public contact": best_public_contact,
+                "Best public email": best_public_email,
+                "Best public phone": best_public_phone,
+                "Best public source": best_public_source,
                 "Notes": crm.get("notes", ""),
                 "Award": account.primary.award_id,
                 "Amount": money(account.primary.amount),
@@ -738,6 +1259,29 @@ st.markdown(
         font-weight: 700;
         margin-right: .35rem;
     }
+    .intel-card {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: .9rem;
+        margin-bottom: .7rem;
+    }
+    .intel-card b {
+        display: block;
+        margin-bottom: .25rem;
+    }
+    .source-list a {
+        display: block;
+        margin: 0 0 .35rem 0;
+        overflow-wrap: anywhere;
+    }
+    .cadence-row {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: .7rem .8rem;
+        margin-bottom: .5rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -750,6 +1294,7 @@ st.markdown(
       <p>SDR command center for newly reported government-contract winners. Pull live public award data, group account activity, prioritize outreach, and turn each win into a GovDash demo angle.</p>
       <div class="mini-row">
         <span class="mini">USAspending public API</span>
+        <span class="mini">Public web intel scan</span>
         <span class="mini">Account-level scoring</span>
         <span class="mini">GovDash demo builder</span>
         <span class="mini">CRM-ready workflow</span>
@@ -802,7 +1347,7 @@ if api_messages:
         for message in api_messages:
             st.write(message)
 
-tabs = st.tabs(["Account Radar", "Contact Finder", "SDR Workbench", "Demo Builder", "Outreach Sequence", "Data Notes"])
+tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "CRM Cadence", "Demo Builder", "Outreach Sequence", "Data Notes"])
 
 with tabs[0]:
     st.subheader("Account Radar")
@@ -851,6 +1396,96 @@ with tabs[0]:
 
 with tabs[1]:
     if not accounts:
+        st.info("No accounts to enrich. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_intel_account_name = st.selectbox("Scan public sources for", [account.company for account in accounts], key="intel_account")
+        selected_intel_account = next(account for account in accounts if account.company == selected_intel_account_name)
+        selected_intel = selected_intel_account.primary
+
+        st.markdown(
+            f"""
+            <div class="prospect-card">
+              <span class="tier-pill">{selected_intel_account.tier} | score {selected_intel_account.priority_score}</span>
+              <h3>{html_escape(selected_intel_account.company)}</h3>
+              <div class="muted"><b>What they won:</b> {html_escape(selected_intel.award_id)} | {money(selected_intel.amount)} | {html_escape(selected_intel.funding_sub_agency or selected_intel.awarding_sub_agency or selected_intel.awarding_agency)}</div>
+              <div class="muted">{html_escape(selected_intel.description)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.caption(
+            "Public scan searches open web results and public company pages. It does not bypass logins, paywalls, robots restrictions, or invent missing emails and phone numbers."
+        )
+
+        run_scan = st.button("Run public scan", key=f"run_scan_{selected_intel_account.company}")
+        existing_intel = st.session_state.get(public_intel_key(selected_intel_account.company))
+        if run_scan:
+            with st.spinner("Scanning public sources for company intel and contact evidence..."):
+                existing_intel = enrich_account(selected_intel_account)
+                st.session_state[public_intel_key(selected_intel_account.company)] = existing_intel
+
+        if isinstance(existing_intel, CompanyIntel):
+            intel_cols = st.columns([0.55, 0.45])
+            with intel_cols[0]:
+                st.markdown("### Company Intel")
+                if existing_intel.website:
+                    st.link_button("Open likely company website", existing_intel.website)
+                st.markdown(
+                    f"""
+                    <div class="intel-card">
+                      <b>What the company appears to do</b>
+                      {html_escape(existing_intel.what_they_do)}
+                    </div>
+                    <div class="intel-card">
+                      <b>Why they may have won</b>
+                      {html_escape(existing_intel.why_they_may_have_won)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("### Source Pages Scanned")
+                if existing_intel.sources:
+                    st.markdown(
+                        '<div class="source-list">'
+                        + "".join(
+                            f'<a href="{html_escape(url)}" target="_blank" rel="noopener noreferrer">{html_escape(url)}</a>'
+                            for url in existing_intel.sources
+                        )
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.info("No public pages could be fetched. Use the manual search links in Contact Finder.")
+
+            with intel_cols[1]:
+                st.markdown("### Public Contacts Found")
+                if existing_intel.contacts:
+                    st.dataframe(public_contacts_dataframe(existing_intel), width="stretch", hide_index=True)
+                    st.download_button(
+                        "Download public intel CSV",
+                        data=public_contacts_dataframe(existing_intel).to_csv(index=False),
+                        file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-public-intel.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.warning("No named public contacts or public emails were found in the pages scanned.")
+
+                st.markdown("### What SDR Should Verify")
+                for item in [
+                    "Confirm the person still works at the company.",
+                    "Confirm the email or phone is business contact information from the source page.",
+                    "Confirm the person owns BD, capture, proposal, contracts, or program execution.",
+                    "Do not add personal or residential data to outreach notes.",
+                ]:
+                    st.markdown(f'<div class="cadence-row">{html_escape(item)}</div>', unsafe_allow_html=True)
+        else:
+            st.info("Click Run public scan to pull public-source company intel, source pages, and available business contact evidence for this account.")
+
+
+with tabs[2]:
+    if not accounts:
         st.info("No accounts to research. Adjust filters on the left to load recent award winners.")
     else:
         selected_contact_account_name = st.selectbox("Find contacts for", [account.company for account in accounts], key="contact_account")
@@ -887,6 +1522,20 @@ with tabs[1]:
             link_cols[1].link_button("Company site search", search_url(f'"{selected_contact_account.company}" "{target.title}"'))
             link_cols[2].link_button("Email pattern search", search_url(f'"{selected_contact_account.company}" email {target.title}'))
 
+        st.markdown("### Actual Public Contacts")
+        contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
+        if st.button("Scan public sources for actual contacts", key=f"contact_scan_{selected_contact_account.company}"):
+            with st.spinner("Searching public pages for named contacts, emails, and phone numbers..."):
+                contact_intel = enrich_account(selected_contact_account)
+                st.session_state[public_intel_key(selected_contact_account.company)] = contact_intel
+
+        if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
+            st.dataframe(public_contacts_dataframe(contact_intel), width="stretch", hide_index=True)
+        elif isinstance(contact_intel, CompanyIntel):
+            st.info("The scan did not find a verified named contact. Use the role-based search links above and keep the account in Researching.")
+        else:
+            st.caption("Run the scan to populate public names, business emails, business phones, and source evidence when available.")
+
         st.markdown("### Contact Verification Checklist")
         checklist_cols = st.columns(4)
         checklist_cols[0].checkbox("Name verified", key=f"{selected_contact_account.company}_name_verified")
@@ -913,7 +1562,7 @@ with tabs[1]:
             mime="text/csv",
         )
 
-with tabs[2]:
+with tabs[3]:
     if not accounts:
         st.info("No accounts to work. Adjust filters on the left to load recent award winners.")
     else:
@@ -947,20 +1596,57 @@ with tabs[2]:
             st.markdown("### CRM Fields")
             crm_key = f"crm_{selected_account.company}"
             current = st.session_state.get(crm_key, {})
-            status = st.selectbox("Status", DEFAULT_STATUSES, index=DEFAULT_STATUSES.index(current.get("status", "New")))
+            status_default = current.get("status", "New")
+            status_index = DEFAULT_STATUSES.index(status_default) if status_default in DEFAULT_STATUSES else 0
+            status = st.selectbox("Status", DEFAULT_STATUSES, index=status_index)
             owner = st.text_input("Owner", value=current.get("owner", ""))
+            personas = suggested_personas(selected)
+            persona_default = current.get("persona", personas[0])
+            persona_index = personas.index(persona_default) if persona_default in personas else 0
             persona = st.selectbox(
                 "Primary persona",
-                suggested_personas(selected),
-                index=0,
+                personas,
+                index=persona_index,
             )
-            next_step = st.date_input("Next step date", value=date.today() + timedelta(days=2))
+            cadence_labels = [step[0] for step in DEFAULT_CADENCE]
+            current_cadence = current.get("cadence_stage", cadence_labels[0])
+            cadence_index = cadence_labels.index(current_cadence) if current_cadence in cadence_labels else 0
+            cadence_stage = st.selectbox("Cadence stage", cadence_labels, index=cadence_index)
+            action_options = ["Email", "Call", "LinkedIn", "Research", "Demo follow-up", "Nurture"]
+            action_default = current.get("next_action", action_options[0])
+            action_index = action_options.index(action_default) if action_default in action_options else 0
+            next_action = st.selectbox("Next action", action_options, index=action_index)
+            next_step_default = parse_iso_date(current.get("next_step", "")) or date.today() + timedelta(days=2)
+            next_step = st.date_input("Next step date", value=next_step_default)
+            action_cols = st.columns(2)
+            emailed = action_cols[0].checkbox("Emailed", value=bool(current.get("emailed", False)))
+            called = action_cols[1].checkbox("Called", value=bool(current.get("called", False)))
+            email_outcomes = ["", "Not sent", "Sent", "Opened", "Replied", "Bounced", "Unsubscribed"]
+            email_default = current.get("email_outcome", "")
+            email_outcome = st.selectbox(
+                "Email outcome",
+                email_outcomes,
+                index=email_outcomes.index(email_default) if email_default in email_outcomes else 0,
+            )
+            call_outcomes = ["", "Not called", "No answer", "Left voicemail", "Connected", "Bad number", "Referred"]
+            call_default = current.get("call_outcome", "")
+            call_outcome = st.selectbox(
+                "Call outcome",
+                call_outcomes,
+                index=call_outcomes.index(call_default) if call_default in call_outcomes else 0,
+            )
             notes = st.text_area("Notes", value=current.get("notes", ""), placeholder="Contact names, call notes, objection, next action...")
             st.session_state[crm_key] = {
                 "status": status,
                 "owner": owner,
                 "persona": persona,
+                "cadence_stage": cadence_stage,
+                "next_action": next_action,
                 "next_step": next_step.isoformat(),
+                "emailed": emailed,
+                "called": called,
+                "email_outcome": email_outcome,
+                "call_outcome": call_outcome,
                 "notes": notes,
             }
 
@@ -975,11 +1661,21 @@ with tabs[2]:
 
             st.markdown("### Best Contact")
             best_target = contact_targets(selected_account)[0]
+            crm_intel = st.session_state.get(public_intel_key(selected_account.company))
+            if isinstance(crm_intel, CompanyIntel) and crm_intel.contacts:
+                best_public = crm_intel.contacts[0]
+                best_contact_body = (
+                    f"{best_public.full_name or best_public.title}"
+                    f"{' | ' + best_public.email if best_public.email else ''}"
+                    f"{' | ' + best_public.phone if best_public.phone else ''}"
+                )
+            else:
+                best_contact_body = f"{best_target.title} - {best_target.why}"
             st.markdown(
                 f"""
                 <div class="target-card">
-                  <h4>{best_target.title}</h4>
-                  <div class="muted">{best_target.why}</div>
+                  <h4>{html_escape(best_target.title)}</h4>
+                  <div class="muted">{html_escape(best_contact_body)}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -988,7 +1684,28 @@ with tabs[2]:
         st.markdown("### Account Award History")
         st.dataframe(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
 
-with tabs[3]:
+        st.markdown("### Recommended Cadence")
+        cadence_cols = st.columns(2)
+        for index, (day, action, detail) in enumerate(DEFAULT_CADENCE):
+            with cadence_cols[index % 2]:
+                st.markdown(
+                    f"""
+                    <div class="cadence-row">
+                      <b>{html_escape(day)} - {html_escape(action)}</b><br>
+                      <span class="muted">{html_escape(detail)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        st.download_button(
+            "Download CRM cadence CSV",
+            data=crm_dataframe(accounts).to_csv(index=False),
+            file_name="application-0-crm-cadence.csv",
+            mime="text/csv",
+        )
+
+with tabs[4]:
     if not accounts:
         st.info("No accounts to demo. Adjust filters on the left to load recent award winners.")
     else:
@@ -1064,7 +1781,7 @@ with tabs[3]:
             f"at {selected_demo.awarding_agency or 'the buying agency'}.\""
         )
 
-with tabs[4]:
+with tabs[5]:
     if not accounts:
         st.info("No accounts to sequence. Adjust filters on the left to load recent award winners.")
     else:
@@ -1095,7 +1812,7 @@ with tabs[4]:
                 unsafe_allow_html=True,
             )
 
-with tabs[5]:
+with tabs[6]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "
@@ -1103,8 +1820,8 @@ with tabs[5]:
     )
     st.markdown("### Contact Quality Guardrails")
     st.write(
-        "The app avoids inventing personal contact details. It shows public recipient address data, likely personas, public research links, and CRM notes fields. "
-        "For verified emails and phone numbers, connect a compliant enrichment vendor or require SDR verification before outreach."
+        "The app avoids inventing contact details. Public Intel only shows names, emails, phones, and evidence found on public pages the app could fetch. "
+        "Treat those findings as SDR research, verify role and business contact status, and do not store personal or residential information."
     )
     st.markdown("### What To Add Next")
     st.write(

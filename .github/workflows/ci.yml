@@ -1,0 +1,24 @@
+name: Application 0 CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  app-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Streamlit app
+        run: python -m py_compile app.py

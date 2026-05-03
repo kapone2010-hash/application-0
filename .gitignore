@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/
+*.log
+.venv/
+venv/
+
+# Older local projects/artifacts not part of Application 0
+/agents/
+/foia_triage/
+/tests/
+/opt-in-guess-who-game/
+/chris_brown_usher_concert_program.md

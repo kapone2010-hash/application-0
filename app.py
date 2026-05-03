@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from html import escape
-from time import sleep
+from time import monotonic, sleep
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -17,6 +17,9 @@ USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spendi
 PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
+SCAN_BUDGET_SECONDS = 28
+SEARCH_TIMEOUT_SECONDS = 6
+PAGE_TIMEOUT_SECONDS = 6
 REQUEST_HEADERS = {
     "User-Agent": "Application-0 GovDash SDR research prototype (public web discovery; +https://github.com/kapone2010-hash/application-0)"
 }
@@ -376,6 +379,12 @@ def html_escape(value: object) -> str:
     return escape(str(value or ""), quote=True)
 
 
+def anchor_slug(value: str) -> str:
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1-\2", value or "")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", spaced.lower()).strip("-")
+    return re.sub(r"-+", "-", slug)
+
+
 def normalize_search_result_url(href: str) -> str:
     if not href:
         return ""
@@ -448,7 +457,7 @@ def search_web_results(
     fetchable_only: bool = True,
 ) -> tuple[WebSearchResult, ...]:
     try:
-        response = requests.get(PUBLIC_SEARCH_URL, params={"q": query}, headers=REQUEST_HEADERS, timeout=15)
+        response = requests.get(PUBLIC_SEARCH_URL, params={"q": query}, headers=REQUEST_HEADERS, timeout=SEARCH_TIMEOUT_SECONDS)
         response.raise_for_status()
     except requests.RequestException:
         return tuple()
@@ -504,7 +513,7 @@ def fetch_public_page(url: str) -> tuple[str, str]:
     if not fetchable_public_url(url):
         return "", ""
     try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=12, allow_redirects=True)
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=PAGE_TIMEOUT_SECONDS, allow_redirects=True)
         response.raise_for_status()
     except requests.RequestException:
         return "", ""
@@ -793,6 +802,53 @@ def linkedin_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
     )
 
 
+def contact_matches_role(contact: PublicContact, role: str) -> bool:
+    haystack = " ".join([contact.title, contact.evidence, contact.recommended_reason]).lower()
+    role_text = role.lower()
+    role_aliases = {
+        "president/ceo or govcon practice lead": ["president", "chief executive", "ceo", "founder", "growth", "business development"],
+        "vp/director of business development": ["business development", "growth", "vice president", "vp", "director"],
+        "capture manager": ["capture"],
+        "proposal manager": ["proposal"],
+        "contracts manager": ["contract", "contracts", "contracting"],
+        "cto/vp engineering or technical program lead": ["technology", "technical", "engineering", "cto", "program"],
+        "program operations lead": ["program", "operations"],
+    }
+    aliases = role_aliases.get(role_text, [part for part in re.split(r"[/ ]+", role_text) if len(part) > 3])
+    return any(alias in haystack for alias in aliases)
+
+
+def best_contact_for_target(target: ContactTarget, contacts: tuple[PublicContact, ...]) -> PublicContact | None:
+    matches = [contact for contact in contacts if contact_matches_role(contact, target.title)]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: (item.confidence, bool(item.full_name), bool(item.email), bool(item.phone)), reverse=True)[0]
+
+
+def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = None) -> pd.DataFrame:
+    contacts = intel.contacts if isinstance(intel, CompanyIntel) else tuple()
+    rows = []
+    for target in contact_targets(account):
+        best = best_contact_for_target(target, contacts)
+        search = search_url(target.search_query)
+        rows.append(
+            {
+                "Rank": target.rank,
+                "Target role": target.title,
+                "Best known person": best.full_name if best and best.full_name else "Research needed",
+                "Likely title": best.title if best else target.title,
+                "Email": best.email if best else "",
+                "Phone": best.phone if best else "",
+                "Confidence": best.confidence if best else "",
+                "Source type": "LinkedIn signal" if best and "linkedin.com" in best.source_url.lower() else ("Public web" if best else "Manual research"),
+                "Source / search URL": best.source_url if best else search,
+                "Why this person": best.recommended_reason if best else target.why,
+                "Message angle": target.message_angle,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def summarize_company_work(company: str, award_description: str, naics_description: str, psc_description: str, page_texts: list[str]) -> str:
     company_terms = []
     for text in page_texts:
@@ -829,6 +885,10 @@ def public_intel_key(company: str) -> str:
     return f"public_intel_{company}"
 
 
+def scan_budget_available(started_at: float) -> bool:
+    return monotonic() - started_at < SCAN_BUDGET_SECONDS
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def build_public_intel(
     company: str,
@@ -840,22 +900,23 @@ def build_public_intel(
     psc_description: str,
     psc_code: str,
 ) -> CompanyIntel:
+    scan_started_at = monotonic()
     queries = [
         f'"{company}" official website',
         f'"{company}" leadership',
         f'"{company}" "business development"',
-        f'"{company}" "capture manager"',
-        f'"{company}" "proposal manager"',
         f'"{company}" "contracts manager"',
         f'"{company}" "{award_id}" contract award',
     ]
 
     candidate_urls: list[str] = []
     for query in queries:
-        for url in search_public_web(query, max_results=4):
+        if not scan_budget_available(scan_started_at):
+            break
+        for url in search_public_web(query, max_results=3):
             if url not in candidate_urls:
                 candidate_urls.append(url)
-        if len(candidate_urls) >= 12:
+        if len(candidate_urls) >= 8:
             break
 
     website = ""
@@ -865,7 +926,7 @@ def build_public_intel(
             website = domain_root(url)
             break
 
-    scan_urls = list(candidate_urls[:8])
+    scan_urls = list(candidate_urls[:6])
     if website and website not in scan_urls:
         scan_urls.insert(0, website)
 
@@ -877,7 +938,7 @@ def build_public_intel(
     linkedin_signals: list[WebSearchResult] = []
 
     index = 0
-    while index < len(scan_urls) and len(scanned_urls) < 12:
+    while index < len(scan_urls) and len(scanned_urls) < 6 and scan_budget_available(scan_started_at):
         url = scan_urls[index]
         index += 1
         if url in scanned_urls:
@@ -898,15 +959,17 @@ def build_public_intel(
                 linkedin_signals.append(signal)
 
         if website and url_domain(final_url) == url_domain(website):
-            for extra_url in source_links_from_html(html, final_url, limit=5):
-                if extra_url not in scan_urls and len(scan_urls) < 16:
+            for extra_url in source_links_from_html(html, final_url, limit=3):
+                if extra_url not in scan_urls and len(scan_urls) < 10:
                     scan_urls.append(extra_url)
 
-    for query in linkedin_role_queries(company):
-        for result in search_linkedin_web(query, max_results=3):
+    for query in linkedin_role_queries(company)[:7]:
+        if not scan_budget_available(scan_started_at):
+            break
+        for result in search_linkedin_web(query, max_results=2):
             if result.url not in [signal.url for signal in linkedin_signals]:
                 linkedin_signals.append(result)
-        if len(linkedin_signals) >= 18:
+        if len(linkedin_signals) >= 10:
             break
 
     linkedin_contacts = dedupe_contacts([*page_linkedin_contacts, *linkedin_contacts_from_results(tuple(linkedin_signals))])
@@ -942,7 +1005,7 @@ def build_public_intel(
         why_they_may_have_won=summarize_why_won(primary_like),
         contacts=all_contacts,
         linkedin_contacts=linkedin_contacts,
-        linkedin_signals=tuple(linkedin_signals[:18]),
+        linkedin_signals=tuple(linkedin_signals[:10]),
         sources=tuple(source_urls[:12]),
         scanned_urls=tuple(scanned_urls[:12]),
     )
@@ -1267,7 +1330,10 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
         best_public_email = ""
         best_public_phone = ""
         best_public_source = ""
+        best_row: dict[str, object] = {}
         if isinstance(intel, CompanyIntel) and intel.contacts:
+            best_df = people_to_contact_dataframe(account, intel)
+            best_row = best_df.iloc[0].to_dict() if not best_df.empty else {}
             best = intel.contacts[0]
             best_public_contact = best.full_name or best.title
             best_public_email = best.email
@@ -1290,10 +1356,10 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Primary persona": crm.get("persona", suggested_personas(account.primary)[0]),
                 "Best contact target": contact_targets(account)[0].title,
                 "Why this contact": contact_targets(account)[0].why,
-                "Best public contact": best_public_contact,
+                "Best public contact": best_row.get("Best known person", best_public_contact) if isinstance(intel, CompanyIntel) else best_public_contact,
                 "Best public email": best_public_email,
                 "Best public phone": best_public_phone,
-                "Best public source": best_public_source,
+                "Best public source": best_row.get("Source / search URL", best_public_source) if isinstance(intel, CompanyIntel) else best_public_source,
                 "Notes": crm.get("notes", ""),
                 "Award": account.primary.award_id,
                 "Amount": money(account.primary.amount),
@@ -1777,14 +1843,26 @@ with tabs[2]:
         )
 
         st.markdown("### Best People To Contact")
-        st.caption("The app ranks the roles most likely to care about GovDash. Use the search links to find and verify named people before outreach.")
+        st.caption("The app ranks the roles most likely to care about GovDash. Public scan results update the table below; otherwise each row gives the right LinkedIn search path.")
+        current_contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
+        if not isinstance(current_contact_intel, CompanyIntel):
+            current_contact_intel = None
+        st.dataframe(people_to_contact_dataframe(selected_contact_account, current_contact_intel), width="stretch", hide_index=True)
+
+        jump_links = " ".join(
+            f'<a class="mini" href="#{anchor_slug(target.title)}">{html_escape(target.title)}</a>'
+            for target in contact_targets(selected_contact_account)
+        )
+        st.markdown(f'<div class="mini-row">{jump_links}</div>', unsafe_allow_html=True)
+
         for target in contact_targets(selected_contact_account):
+            target_anchor = anchor_slug(target.title)
             st.markdown(
                 f"""
-                <div class="target-card">
-                  <span class="target-rank">{target.rank}</span><h4>{target.title}</h4>
-                  <div class="muted"><b>Why this person:</b> {target.why}</div>
-                  <div class="muted"><b>Message angle:</b> {target.message_angle}</div>
+                <div class="target-card" id="{target_anchor}">
+                  <span class="target-rank">{target.rank}</span><h4>{html_escape(target.title)}</h4>
+                  <div class="muted"><b>Why this person:</b> {html_escape(target.why)}</div>
+                  <div class="muted"><b>Message angle:</b> {html_escape(target.message_angle)}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1804,6 +1882,14 @@ with tabs[2]:
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
             st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
             st.dataframe(public_contacts_dataframe(contact_intel), width="stretch", hide_index=True)
+            st.markdown("### Updated People To Contact")
+            st.dataframe(people_to_contact_dataframe(selected_contact_account, contact_intel), width="stretch", hide_index=True)
+            st.download_button(
+                "Download updated people CSV",
+                data=people_to_contact_dataframe(selected_contact_account, contact_intel).to_csv(index=False),
+                file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-people-to-contact.csv",
+                mime="text/csv",
+            )
             linkedin_contacts = getattr(contact_intel, "linkedin_contacts", tuple())
             if linkedin_contacts:
                 st.markdown("### LinkedIn People Signals")

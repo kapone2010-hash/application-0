@@ -54,3 +54,5 @@ app.py
 - If the app cannot find `app.py`, confirm the main file path is exactly `app.py`.
 - If no leads appear, widen the date range or lower the minimum award amount.
 - If USAspending is temporarily unavailable, retry after a few minutes.
+- If the deployed app redirects to Streamlit sign-in instead of opening for a prospect, open the app in Streamlit Community Cloud, go to app settings/share settings, and make sure the app is public or shared with the viewer.
+- If public/LinkedIn scanning feels slow, the app now stops the scan after a short time budget and keeps whatever public evidence it found. Use the role-specific LinkedIn buttons when search engines return no public result data.

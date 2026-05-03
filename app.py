@@ -1110,6 +1110,45 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def account_names(accounts: list[Account]) -> list[str]:
+    return [account.company for account in accounts]
+
+
+def set_active_company(company: str) -> None:
+    st.session_state["active_company"] = company
+    st.session_state["active_company_picker"] = company
+
+
+def sync_active_company_picker() -> None:
+    st.session_state["active_company"] = st.session_state.get("active_company_picker", "")
+
+
+def ensure_active_company(accounts: list[Account]) -> Account | None:
+    if not accounts:
+        st.session_state.pop("active_company", None)
+        st.session_state.pop("active_company_picker", None)
+        return None
+
+    names = account_names(accounts)
+    current = st.session_state.get("active_company")
+    if current not in names:
+        current = names[0]
+        st.session_state["active_company"] = current
+
+    picker_value = st.session_state.get("active_company_picker")
+    if picker_value not in names:
+        st.session_state["active_company_picker"] = current
+
+    return next(account for account in accounts if account.company == st.session_state["active_company"])
+
+
+def active_account(accounts: list[Account]) -> Account:
+    selected = ensure_active_company(accounts)
+    if selected is None:
+        raise ValueError("No active account is available.")
+    return selected
+
+
 st.set_page_config(
     page_title="Application 0 | GovDash SDR Prospecting",
     page_icon="0",
@@ -1342,6 +1381,21 @@ metrics[3].metric("Top account score", max((account.priority_score for account i
 
 st.caption(f"Live source refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change or Refresh live data is clicked.")
 
+selected_global_account = ensure_active_company(accounts)
+if selected_global_account:
+    selector_cols = st.columns([0.68, 0.32])
+    with selector_cols[0]:
+        st.selectbox(
+            "Active company",
+            account_names(accounts),
+            key="active_company_picker",
+            on_change=sync_active_company_picker,
+            help="This selected company drives Public Intel, Contact Finder, CRM Cadence, Demo Builder, and Outreach.",
+        )
+    selected_global_account = active_account(accounts)
+    with selector_cols[1]:
+        st.metric("Selected company score", selected_global_account.priority_score, selected_global_account.tier)
+
 if api_messages:
     with st.expander("API notes"):
         for message in api_messages:
@@ -1352,6 +1406,21 @@ tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "CRM Cadence"
 with tabs[0]:
     st.subheader("Account Radar")
     if accounts:
+        st.markdown("### Company Buttons")
+        st.caption("Click a company here to update every tab and field that depends on the selected account.")
+        button_cols = st.columns(min(4, len(accounts)))
+        for index, account in enumerate(accounts[:12]):
+            with button_cols[index % len(button_cols)]:
+                is_active = account.company == active_account(accounts).company
+                label_prefix = "Selected" if is_active else "Use"
+                st.button(
+                    f"{label_prefix}: {account.company}",
+                    key=f"use_company_{index}_{account.company}",
+                    on_click=set_active_company,
+                    args=(account.company,),
+                    use_container_width=True,
+                )
+
         st.dataframe(account_dataframe(accounts), width="stretch", hide_index=True)
 
         export_cols = st.columns(3)
@@ -1398,9 +1467,9 @@ with tabs[1]:
     if not accounts:
         st.info("No accounts to enrich. Adjust filters on the left to load recent award winners.")
     else:
-        selected_intel_account_name = st.selectbox("Scan public sources for", [account.company for account in accounts], key="intel_account")
-        selected_intel_account = next(account for account in accounts if account.company == selected_intel_account_name)
+        selected_intel_account = active_account(accounts)
         selected_intel = selected_intel_account.primary
+        st.caption(f"Using active company: {selected_intel_account.company}")
 
         st.markdown(
             f"""
@@ -1488,9 +1557,9 @@ with tabs[2]:
     if not accounts:
         st.info("No accounts to research. Adjust filters on the left to load recent award winners.")
     else:
-        selected_contact_account_name = st.selectbox("Find contacts for", [account.company for account in accounts], key="contact_account")
-        selected_contact_account = next(account for account in accounts if account.company == selected_contact_account_name)
+        selected_contact_account = active_account(accounts)
         primary = selected_contact_account.primary
+        st.caption(f"Using active company: {selected_contact_account.company}")
 
         st.markdown(
             f"""
@@ -1566,9 +1635,9 @@ with tabs[3]:
     if not accounts:
         st.info("No accounts to work. Adjust filters on the left to load recent award winners.")
     else:
-        selected_account_name = st.selectbox("Select an account", [account.company for account in accounts])
-        selected_account = next(account for account in accounts if account.company == selected_account_name)
+        selected_account = active_account(accounts)
         selected = selected_account.primary
+        st.caption(f"Using active company: {selected_account.company}")
 
         overview_cols = st.columns([0.58, 0.42])
         with overview_cols[0]:
@@ -1709,13 +1778,8 @@ with tabs[4]:
     if not accounts:
         st.info("No accounts to demo. Adjust filters on the left to load recent award winners.")
     else:
-        selected_demo_account_name = st.selectbox(
-            "Build demo for",
-            [account.company for account in accounts],
-            index=0,
-            key="demo_account",
-        )
-        selected_demo_account = next(account for account in accounts if account.company == selected_demo_account_name)
+        selected_demo_account = active_account(accounts)
+        st.caption(f"Using active company: {selected_demo_account.company}")
         demo_awards = sorted(selected_demo_account.prospects, key=lambda prospect: prospect.amount, reverse=True)
         selected_award_label = st.selectbox(
             "Select award/use case",
@@ -1723,7 +1787,7 @@ with tabs[4]:
                 f"{prospect.award_id} | {money(prospect.amount)} | {prospect.description[:80]}"
                 for prospect in demo_awards
             ],
-            key="demo_award",
+            key=f"demo_award_{selected_demo_account.company}",
         )
         selected_demo = demo_awards[
             [
@@ -1785,14 +1849,9 @@ with tabs[5]:
     if not accounts:
         st.info("No accounts to sequence. Adjust filters on the left to load recent award winners.")
     else:
-        selected_sequence_account_name = st.selectbox(
-            "Build outreach for",
-            [account.company for account in accounts],
-            index=0,
-            key="sequence_account",
-        )
-        selected_sequence_account = next(account for account in accounts if account.company == selected_sequence_account_name)
+        selected_sequence_account = active_account(accounts)
         selected_sequence = selected_sequence_account.primary
+        st.caption(f"Using active company: {selected_sequence_account.company}")
 
         st.markdown("### First-Touch Email")
         st.code(outreach_copy(selected_sequence), language="text")

@@ -224,12 +224,22 @@ class PublicContact:
 
 
 @dataclass(frozen=True)
+class WebSearchResult:
+    title: str
+    url: str
+    snippet: str
+    query: str
+
+
+@dataclass(frozen=True)
 class CompanyIntel:
     company: str
     website: str
     what_they_do: str
     why_they_may_have_won: str
     contacts: tuple[PublicContact, ...]
+    linkedin_contacts: tuple[PublicContact, ...]
+    linkedin_signals: tuple[WebSearchResult, ...]
     sources: tuple[str, ...]
     scanned_urls: tuple[str, ...]
 
@@ -352,6 +362,8 @@ def public_links(prospect: Prospect) -> dict[str, str]:
         "Company site": search_url(f'"{company}" official website'),
         "Leadership": search_url(f'"{company}" leadership government contracts'),
         "LinkedIn contacts": linkedin_url(company, "capture proposal contracts"),
+        "LinkedIn company": search_url(f'site:linkedin.com/company "{company}"'),
+        "LinkedIn jobs": search_url(f'site:linkedin.com/jobs "{company}" government'),
         "Contracts contact": search_url(f'"{company}" contracts manager email government'),
         "Proposal team": search_url(f'"{company}" proposal manager capture manager'),
         "News": search_url(f'"{company}" "{prospect.award_id}" contract award'),
@@ -429,7 +441,12 @@ def source_links_from_html(html: str, base_url: str, limit: int = 5) -> list[str
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def search_public_web(query: str, max_results: int = 5) -> tuple[str, ...]:
+def search_web_results(
+    query: str,
+    max_results: int = 5,
+    allowed_domains: tuple[str, ...] = tuple(),
+    fetchable_only: bool = True,
+) -> tuple[WebSearchResult, ...]:
     try:
         response = requests.get(PUBLIC_SEARCH_URL, params={"q": query}, headers=REQUEST_HEADERS, timeout=15)
         response.raise_for_status()
@@ -437,14 +454,49 @@ def search_public_web(query: str, max_results: int = 5) -> tuple[str, ...]:
         return tuple()
 
     soup = BeautifulSoup(response.text, "html.parser")
-    results: list[str] = []
-    for anchor in soup.select("a.result__a"):
+    results: list[WebSearchResult] = []
+    seen: set[str] = set()
+    for result in soup.select(".result"):
+        anchor = result.select_one("a.result__a")
+        if not anchor:
+            continue
         url = normalize_search_result_url(anchor.get("href", ""))
-        if url and fetchable_public_url(url) and url not in results:
-            results.append(url)
+        if not url or url in seen:
+            continue
+        domain = url_domain(url)
+        if allowed_domains and not any(domain == allowed or domain.endswith(f".{allowed}") for allowed in allowed_domains):
+            continue
+        if fetchable_only and not fetchable_public_url(url):
+            continue
+        snippet = result.select_one(".result__snippet")
+        results.append(
+            WebSearchResult(
+                title=anchor.get_text(" ", strip=True),
+                url=url,
+                snippet=snippet.get_text(" ", strip=True) if snippet else "",
+                query=query,
+            )
+        )
+        seen.add(url)
         if len(results) >= max_results:
             break
     return tuple(results)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_public_web(query: str, max_results: int = 5) -> tuple[str, ...]:
+    results = search_web_results(query, max_results=max_results, fetchable_only=True)
+    return tuple(result.url for result in results)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_linkedin_web(query: str, max_results: int = 5) -> tuple[WebSearchResult, ...]:
+    return search_web_results(
+        query,
+        max_results=max_results,
+        allowed_domains=("linkedin.com",),
+        fetchable_only=False,
+    )
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -618,6 +670,129 @@ def dedupe_contacts(contacts: list[PublicContact]) -> tuple[PublicContact, ...]:
     return tuple(sorted(best.values(), key=lambda item: (item.confidence, bool(item.full_name), bool(item.email)), reverse=True)[:12])
 
 
+def clean_linkedin_title(title: str) -> str:
+    title = re.sub(r"\s*\|\s*LinkedIn.*$", "", title, flags=re.IGNORECASE).strip()
+    title = re.sub(r"\s+-\s+LinkedIn.*$", "", title, flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+", " ", title)
+
+
+def linkedin_role_queries(company: str) -> list[str]:
+    roles = [
+        "capture manager",
+        "proposal manager",
+        "business development",
+        "contracts manager",
+        "program manager",
+        "president",
+        "CEO",
+        "chief technology officer",
+    ]
+    queries = [f'site:linkedin.com/company "{company}"', f'site:linkedin.com/jobs "{company}" government contract']
+    queries.extend(f'site:linkedin.com/in "{company}" "{role}"' for role in roles)
+    return queries
+
+
+def linkedin_contacts_from_results(results: tuple[WebSearchResult, ...]) -> tuple[PublicContact, ...]:
+    contacts: list[PublicContact] = []
+    for result in results:
+        lower_url = result.url.lower()
+        if "linkedin.com/in/" not in lower_url:
+            continue
+
+        cleaned_title = clean_linkedin_title(result.title)
+        title_parts = [part.strip(" -–|") for part in re.split(r"\s[-–|]\s", cleaned_title) if part.strip(" -–|")]
+        name = title_parts[0] if title_parts and likely_person_name(title_parts[0]) else ""
+        role_text = " ".join(title_parts[1:3]) or result.snippet
+        role = title_from_line(role_text) or (title_parts[1] if len(title_parts) > 1 else "LinkedIn profile signal")
+        evidence = " ".join(part for part in [cleaned_title, result.snippet] if part).strip()
+        if not name and not any(keyword in evidence.lower() for keyword in CONTACT_TITLE_KEYWORDS):
+            continue
+
+        confidence = 68 if name and role != "LinkedIn profile signal" else 52
+        contacts.append(
+            PublicContact(
+                full_name=name,
+                title=role,
+                email="",
+                phone="",
+                source_url=result.url,
+                evidence=evidence[:300],
+                confidence=confidence,
+                recommended_reason=reason_for_title(role),
+            )
+        )
+    return dedupe_contacts(contacts)
+
+
+def linkedin_contacts_from_page(html: str, source_url: str) -> tuple[tuple[PublicContact, ...], tuple[WebSearchResult, ...]]:
+    soup = BeautifulSoup(html, "html.parser")
+    contacts: list[PublicContact] = []
+    signals: list[WebSearchResult] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href") or ""
+        if "linkedin.com/in/" not in href.lower():
+            continue
+        profile_url = urljoin(source_url, href)
+        if profile_url in seen:
+            continue
+        seen.add(profile_url)
+
+        anchor_text = anchor.get_text(" ", strip=True)
+        parent_text = anchor.parent.get_text(" ", strip=True) if anchor.parent else anchor_text
+        evidence_text = re.sub(r"\s+", " ", parent_text or anchor_text or profile_url).strip()
+        names = re.findall(r"\b([A-Z][a-zA-Z'’-]+(?:\s+[A-Z][a-zA-Z'’-]+){1,3})\b", evidence_text)
+        name = ""
+        if likely_person_name(anchor_text):
+            name = anchor_text
+        else:
+            for candidate in names:
+                if likely_person_name(candidate):
+                    name = candidate
+                    break
+
+        role = title_from_line(evidence_text) or "LinkedIn profile linked from public company page"
+        confidence = 74 if name and role != "LinkedIn profile linked from public company page" else 58
+        contacts.append(
+            PublicContact(
+                full_name=name,
+                title=role,
+                email="",
+                phone="",
+                source_url=profile_url,
+                evidence=f"LinkedIn profile link found on {source_url}: {evidence_text[:220]}",
+                confidence=confidence,
+                recommended_reason=reason_for_title(role),
+            )
+        )
+        signals.append(
+            WebSearchResult(
+                title=anchor_text or name or "LinkedIn profile link",
+                url=profile_url,
+                snippet=evidence_text[:240],
+                query=f"LinkedIn link found on {source_url}",
+            )
+        )
+
+    return dedupe_contacts(contacts), tuple(signals)
+
+
+def linkedin_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Signal": "Profile" if "linkedin.com/in/" in signal.url.lower() else "Company/Jobs",
+                "Title": signal.title,
+                "Snippet": signal.snippet,
+                "LinkedIn URL": signal.url,
+                "Search query": signal.query,
+            }
+            for signal in intel.linkedin_signals
+        ]
+    )
+
+
 def summarize_company_work(company: str, award_description: str, naics_description: str, psc_description: str, page_texts: list[str]) -> str:
     company_terms = []
     for text in page_texts:
@@ -698,6 +873,8 @@ def build_public_intel(
     source_urls: list[str] = []
     page_texts: list[str] = []
     contacts: list[PublicContact] = []
+    page_linkedin_contacts: list[PublicContact] = []
+    linkedin_signals: list[WebSearchResult] = []
 
     index = 0
     while index < len(scan_urls) and len(scanned_urls) < 12:
@@ -714,11 +891,26 @@ def build_public_intel(
         page_text = clean_text_from_html(html)
         page_texts.append(page_text[:20_000])
         contacts.extend(extract_contacts_from_text(page_text[:35_000], final_url))
+        page_contacts, page_signals = linkedin_contacts_from_page(html, final_url)
+        page_linkedin_contacts.extend(page_contacts)
+        for signal in page_signals:
+            if signal.url not in [item.url for item in linkedin_signals]:
+                linkedin_signals.append(signal)
 
         if website and url_domain(final_url) == url_domain(website):
             for extra_url in source_links_from_html(html, final_url, limit=5):
                 if extra_url not in scan_urls and len(scan_urls) < 16:
                     scan_urls.append(extra_url)
+
+    for query in linkedin_role_queries(company):
+        for result in search_linkedin_web(query, max_results=3):
+            if result.url not in [signal.url for signal in linkedin_signals]:
+                linkedin_signals.append(result)
+        if len(linkedin_signals) >= 18:
+            break
+
+    linkedin_contacts = dedupe_contacts([*page_linkedin_contacts, *linkedin_contacts_from_results(tuple(linkedin_signals))])
+    all_contacts = dedupe_contacts([*contacts, *linkedin_contacts])
 
     primary_like = Prospect(
         award_id=award_id,
@@ -748,7 +940,9 @@ def build_public_intel(
         website=website,
         what_they_do=summarize_company_work(company, description, naics_description, psc_description, page_texts),
         why_they_may_have_won=summarize_why_won(primary_like),
-        contacts=dedupe_contacts(contacts),
+        contacts=all_contacts,
+        linkedin_contacts=linkedin_contacts,
+        linkedin_signals=tuple(linkedin_signals[:18]),
         sources=tuple(source_urls[:12]),
         scanned_urls=tuple(scanned_urls[:12]),
     )
@@ -778,6 +972,7 @@ def public_contacts_dataframe(intel: CompanyIntel) -> pd.DataFrame:
                 "Email": contact.email,
                 "Phone": contact.phone,
                 "Confidence": contact.confidence,
+                "Source type": "LinkedIn signal" if "linkedin.com" in contact.source_url.lower() else "Public web",
                 "Why contact": contact.recommended_reason,
                 "Source": contact.source_url,
                 "Evidence": contact.evidence,
@@ -1484,7 +1679,7 @@ with tabs[1]:
         )
 
         st.caption(
-            "Public scan searches open web results and public company pages. It does not bypass logins, paywalls, robots restrictions, or invent missing emails and phone numbers."
+            "Public scan searches open web results, public company pages, and public LinkedIn search-result signals. It does not bypass LinkedIn login, paywalls, robots restrictions, or invent missing emails and phone numbers."
         )
 
         run_scan = st.button("Run public scan", key=f"run_scan_{selected_intel_account.company}")
@@ -1541,10 +1736,18 @@ with tabs[1]:
                 else:
                     st.warning("No named public contacts or public emails were found in the pages scanned.")
 
+                st.markdown("### LinkedIn Intelligence")
+                linkedin_signals = getattr(existing_intel, "linkedin_signals", tuple())
+                if linkedin_signals:
+                    st.dataframe(linkedin_signals_dataframe(existing_intel), width="stretch", hide_index=True)
+                else:
+                    st.caption("No public LinkedIn search signals were found yet. Run the scan again to refresh LinkedIn profile, company, and job-result signals.")
+
                 st.markdown("### What SDR Should Verify")
                 for item in [
                     "Confirm the person still works at the company.",
                     "Confirm the email or phone is business contact information from the source page.",
+                    "Open LinkedIn source links manually to verify current title before outreach.",
                     "Confirm the person owns BD, capture, proposal, contracts, or program execution.",
                     "Do not add personal or residential data to outreach notes.",
                 ]:
@@ -1591,7 +1794,7 @@ with tabs[2]:
             link_cols[1].link_button("Company site search", search_url(f'"{selected_contact_account.company}" "{target.title}"'))
             link_cols[2].link_button("Email pattern search", search_url(f'"{selected_contact_account.company}" email {target.title}'))
 
-        st.markdown("### Actual Public Contacts")
+        st.markdown("### Actual People To Contact")
         contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         if st.button("Scan public sources for actual contacts", key=f"contact_scan_{selected_contact_account.company}"):
             with st.spinner("Searching public pages for named contacts, emails, and phone numbers..."):
@@ -1599,11 +1802,31 @@ with tabs[2]:
                 st.session_state[public_intel_key(selected_contact_account.company)] = contact_intel
 
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
+            st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
             st.dataframe(public_contacts_dataframe(contact_intel), width="stretch", hide_index=True)
+            linkedin_contacts = getattr(contact_intel, "linkedin_contacts", tuple())
+            if linkedin_contacts:
+                st.markdown("### LinkedIn People Signals")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Name": contact.full_name or "Needs manual verification",
+                                "Likely role": contact.title,
+                                "Why contact": contact.recommended_reason,
+                                "LinkedIn URL": contact.source_url,
+                                "Evidence": contact.evidence,
+                            }
+                            for contact in linkedin_contacts
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
         elif isinstance(contact_intel, CompanyIntel):
-            st.info("The scan did not find a verified named contact. Use the role-based search links above and keep the account in Researching.")
+            st.info("The scan did not find a verified named contact. Use the role-based LinkedIn and company search links above and keep the account in Researching.")
         else:
-            st.caption("Run the scan to populate public names, business emails, business phones, and source evidence when available.")
+            st.caption("Run the scan to populate public names, LinkedIn profile signals, business emails, business phones, and source evidence when available.")
 
         st.markdown("### Contact Verification Checklist")
         checklist_cols = st.columns(4)
@@ -1880,6 +2103,7 @@ with tabs[6]:
     st.markdown("### Contact Quality Guardrails")
     st.write(
         "The app avoids inventing contact details. Public Intel only shows names, emails, phones, and evidence found on public pages the app could fetch. "
+        "LinkedIn intelligence uses public search-result signals and source links; it does not scrape protected LinkedIn pages. "
         "Treat those findings as SDR research, verify role and business contact status, and do not store personal or residential information."
     )
     st.markdown("### What To Add Next")

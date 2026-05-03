@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from time import sleep
 from urllib.parse import quote_plus
 
 import pandas as pd
@@ -11,6 +12,14 @@ import streamlit as st
 
 USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 DEFAULT_LOOKBACK_DAYS = 30
+DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
+
+
+def parse_iso_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value[:10])
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,69 @@ class Prospect:
         return "Newly reported"
 
 
+@dataclass(frozen=True)
+class Account:
+    company: str
+    prospects: tuple[Prospect, ...]
+
+    @property
+    def primary(self) -> Prospect:
+        return sorted(self.prospects, key=lambda item: (item.govdash_fit_score, item.amount), reverse=True)[0]
+
+    @property
+    def award_count(self) -> int:
+        return len(self.prospects)
+
+    @property
+    def total_amount(self) -> float:
+        return sum(prospect.amount for prospect in self.prospects)
+
+    @property
+    def largest_award(self) -> float:
+        return max((prospect.amount for prospect in self.prospects), default=0)
+
+    @property
+    def agencies(self) -> list[str]:
+        names = {
+            prospect.funding_sub_agency
+            or prospect.awarding_sub_agency
+            or prospect.awarding_agency
+            for prospect in self.prospects
+        }
+        return sorted(name for name in names if name)
+
+    @property
+    def latest_award_date(self) -> str:
+        dates = [prospect.base_obligation_date for prospect in self.prospects if prospect.base_obligation_date]
+        return max(dates) if dates else ""
+
+    @property
+    def priority_score(self) -> int:
+        primary = self.primary
+        score = primary.govdash_fit_score
+        if self.award_count >= 3:
+            score += 8
+        elif self.award_count == 2:
+            score += 4
+        if self.total_amount >= 5_000_000:
+            score += 8
+        elif self.total_amount >= 1_000_000:
+            score += 4
+        if len(self.agencies) >= 2:
+            score += 5
+        if any("option" in prospect.description.lower() for prospect in self.prospects):
+            score += 4
+        return min(score, 100)
+
+    @property
+    def tier(self) -> str:
+        if self.priority_score >= 85:
+            return "Tier 1"
+        if self.priority_score >= 70:
+            return "Tier 2"
+        return "Tier 3"
+
+
 def build_search_payload(start: date, end: date, limit: int, min_amount: int, keyword: str) -> dict:
     filters: dict[str, object] = {
         "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
@@ -124,10 +196,17 @@ def build_search_payload(start: date, end: date, limit: int, min_amount: int, ke
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_recent_awards(start: date, end: date, limit: int, min_amount: int, keyword: str) -> tuple[list[dict], list[str]]:
     payload = build_search_payload(start, end, limit, min_amount, keyword)
-    response = requests.post(USASPENDING_AWARD_SEARCH_URL, json=payload, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("results", []), data.get("messages", [])
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = requests.post(USASPENDING_AWARD_SEARCH_URL, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("results", []), data.get("messages", [])
+        except requests.RequestException as exc:
+            last_error = exc
+            sleep(0.8 * (attempt + 1))
+    raise RuntimeError(f"USAspending did not respond after 3 attempts: {last_error}") from last_error
 
 
 def nested_field(row: dict, field: str, child: str) -> str:
@@ -187,6 +266,8 @@ def public_links(prospect: Prospect) -> dict[str, str]:
         "Company site": search_url(f'"{company}" official website'),
         "Leadership": search_url(f'"{company}" leadership government contracts'),
         "LinkedIn contacts": linkedin_url(company, "capture proposal contracts"),
+        "Contracts contact": search_url(f'"{company}" contracts manager email government'),
+        "Proposal team": search_url(f'"{company}" proposal manager capture manager'),
         "News": search_url(f'"{company}" "{prospect.award_id}" contract award'),
         "USAspending": search_url(f'site:usaspending.gov "{prospect.award_id}"'),
         "SAM.gov": search_url(f'site:sam.gov "{prospect.award_id}" "{company}"'),
@@ -202,6 +283,61 @@ def suggested_personas(prospect: Prospect) -> list[str]:
         personas.append("Program Operations Lead")
     personas.append("Contracts Manager")
     return personas
+
+
+def why_now_triggers(prospect: Prospect) -> list[str]:
+    triggers = []
+    start = parse_iso_date(prospect.start_date)
+    end = parse_iso_date(prospect.end_date)
+    today = date.today()
+    description = prospect.description.lower()
+    if start and start <= today <= start + timedelta(days=45):
+        triggers.append("Award kickoff is happening now, so documentation and owner assignment are urgent.")
+    elif start and today < start:
+        triggers.append("The period of performance has not started yet, which makes this a clean pre-kickoff outreach window.")
+    if end and end <= today + timedelta(days=365):
+        triggers.append("The end date is within a year, so option-year or recompete readiness may matter soon.")
+    if any(term in description for term in ["option", "idiq", "task order", "blanket", "bpa"]):
+        triggers.append("The award language suggests repeat ordering or option work, which fits a follow-on capture workflow.")
+    if prospect.amount >= 1_000_000:
+        triggers.append("The obligation is large enough to justify executive attention and repeatable contract-management process.")
+    if not triggers:
+        triggers.append("The award is newly reported, creating a timely reason to congratulate and discuss follow-on growth.")
+    return triggers
+
+
+def score_breakdown(account: Account) -> list[str]:
+    primary = account.primary
+    reasons = [
+        f"{primary.govdash_fit_score}/99 award fit on the strongest contract.",
+        f"{account.award_count} recent award{'s' if account.award_count != 1 else ''} totaling {money(account.total_amount)}.",
+    ]
+    if primary.naics_code.startswith(("541", "517", "561")):
+        reasons.append("NAICS category maps well to capture, proposal, IT, telecom, or support-services workflows.")
+    if len(account.agencies) >= 2:
+        reasons.append("Multiple buying organizations suggest expansion potential beyond one program.")
+    if primary.end_date:
+        reasons.append("Known performance dates support option-year, recompete, and contract evidence planning.")
+    return reasons
+
+
+def next_best_action(account: Account) -> str:
+    if account.tier == "Tier 1":
+        return "Research two named contacts today and send a personalized first-touch email."
+    if account.tier == "Tier 2":
+        return "Validate company domain and one capture/proposal contact before adding to sequence."
+    return "Save for nurture unless the agency, NAICS, or keyword is strategically important."
+
+
+def discovery_questions(prospect: Prospect) -> list[str]:
+    agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency
+    return [
+        f"How are you organizing kickoff requirements and owner assignments for {prospect.award_id}?",
+        f"Which parts of this {agency or 'agency'} win can become reusable past performance for future pursuits?",
+        "Where do proposal, capture, contracts, and delivery teams lose the most time today?",
+        "How do you prepare evidence for modifications, option years, and follow-on opportunities?",
+        "What would make a GovDash demo useful enough for your capture or proposal team to evaluate?",
+    ]
 
 
 def demo_steps(prospect: Prospect) -> list[tuple[str, str]]:
@@ -242,6 +378,33 @@ def outreach_copy(prospect: Prospect) -> str:
     )
 
 
+def call_opener(prospect: Prospect) -> str:
+    agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency
+    return (
+        f"Congrats on {prospect.award_id} with {agency}. I am calling because teams often use a new award like this "
+        f"to tighten kickoff documentation, turn the win into reusable past performance, and prepare for follow-on work. "
+        "Is capture/proposal operations the right group to speak with?"
+    )
+
+
+def sequence_steps(prospect: Prospect) -> list[tuple[str, str]]:
+    return [
+        ("Day 1 email", "Congratulate them on the award, reference agency/value, and ask whether GovDash is worth a quick look."),
+        ("Day 2 LinkedIn", "Connect with a capture, proposal, contracts, or BD leader using the award as context."),
+        ("Day 4 call", "Use the call opener and ask who owns proposal operations or contract evidence."),
+        ("Day 7 follow-up", "Send a short demo premise around the award kickoff and future pursuit workflow."),
+        ("Day 14 nurture", "Share a relevant GovDash use case: capture workspace, compliance matrix, proposal drafting, or contract management."),
+    ]
+
+
+def group_accounts(prospects: list[Prospect]) -> list[Account]:
+    grouped: dict[str, list[Prospect]] = {}
+    for prospect in prospects:
+        grouped.setdefault(prospect.company, []).append(prospect)
+    accounts = [Account(company=company, prospects=tuple(items)) for company, items in grouped.items()]
+    return sorted(accounts, key=lambda account: (account.priority_score, account.total_amount), reverse=True)
+
+
 def to_dataframe(prospects: list[Prospect]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -260,6 +423,54 @@ def to_dataframe(prospects: list[Prospect]) -> pd.DataFrame:
             for p in prospects
         ]
     )
+
+
+def account_dataframe(accounts: list[Account]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Tier": account.tier,
+                "Score": account.priority_score,
+                "Company": account.company,
+                "Awards": account.award_count,
+                "Total recent value": money(account.total_amount),
+                "Largest award": money(account.largest_award),
+                "Latest award": account.latest_award_date,
+                "Primary agency": account.primary.funding_sub_agency
+                or account.primary.awarding_sub_agency
+                or account.primary.awarding_agency,
+                "Primary NAICS": f"{account.primary.naics_code} {account.primary.naics_description}".strip(),
+                "Why now": " ".join(why_now_triggers(account.primary)[:2]),
+                "Next action": next_best_action(account),
+            }
+            for account in accounts
+        ]
+    )
+
+
+def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
+    rows = []
+    for account in accounts:
+        key = f"crm_{account.company}"
+        crm = st.session_state.get(key, {})
+        rows.append(
+            {
+                "Company": account.company,
+                "Tier": account.tier,
+                "Score": account.priority_score,
+                "Status": crm.get("status", "New"),
+                "Owner": crm.get("owner", ""),
+                "Next step date": crm.get("next_step", ""),
+                "Primary persona": crm.get("persona", suggested_personas(account.primary)[0]),
+                "Notes": crm.get("notes", ""),
+                "Award": account.primary.award_id,
+                "Amount": money(account.primary.amount),
+                "Agency": account.primary.funding_sub_agency
+                or account.primary.awarding_sub_agency
+                or account.primary.awarding_agency,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 st.set_page_config(
@@ -361,6 +572,33 @@ st.markdown(
         border-radius: 8px;
         padding: .8rem;
     }
+    .score-card {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: .85rem;
+        margin-bottom: .6rem;
+    }
+    .score-card b {
+        display: block;
+        margin-bottom: .25rem;
+    }
+    .trigger {
+        border-left: 4px solid var(--green);
+        background: #fff;
+        padding: .65rem .8rem;
+        margin-bottom: .45rem;
+    }
+    .tier-pill {
+        display: inline-block;
+        border-radius: 999px;
+        padding: .25rem .55rem;
+        background: #e8f3f0;
+        color: #175b50;
+        border: 1px solid #b8d8d1;
+        font-weight: 700;
+        font-size: .82rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -370,12 +608,12 @@ st.markdown(
     """
     <section class="top-band">
       <h1>Application 0</h1>
-      <p>SDR prospecting for newly reported government-contract winners. Pull recent public award data, identify likely contacts, and turn each win into a GovDash demo angle.</p>
+      <p>SDR command center for newly reported government-contract winners. Pull live public award data, group account activity, prioritize outreach, and turn each win into a GovDash demo angle.</p>
       <div class="mini-row">
         <span class="mini">USAspending public API</span>
-        <span class="mini">Recent contract awards</span>
+        <span class="mini">Account-level scoring</span>
         <span class="mini">GovDash demo builder</span>
-        <span class="mini">SDR outreach workflow</span>
+        <span class="mini">CRM-ready workflow</span>
       </div>
     </section>
     """,
@@ -385,9 +623,14 @@ st.markdown(
 with st.sidebar:
     st.header("Lead Filters")
     lookback_days = st.slider("Days back", 7, 90, DEFAULT_LOOKBACK_DAYS)
-    result_limit = st.slider("Max awards", 10, 100, 30, step=10)
+    result_limit = st.slider("Max awards", 10, 200, 50, step=10)
     min_amount = st.number_input("Minimum award amount", min_value=0, value=100000, step=50000)
     keyword = st.text_input("Keyword", placeholder="cyber, construction, satellite...")
+    tier_filter = st.multiselect("Priority tiers", ["Tier 1", "Tier 2", "Tier 3"], default=["Tier 1", "Tier 2", "Tier 3"])
+    active_only = st.checkbox("Active or starting soon only")
+    if st.button("Refresh live data"):
+        fetch_recent_awards.clear()
+        st.rerun()
     st.caption("Data comes from USAspending award search. SAM.gov Contract Awards can be added when you provide a SAM.gov public API key.")
 
 end_date = date.today()
@@ -397,82 +640,126 @@ try:
     with st.spinner("Pulling recent public award data..."):
         rows, api_messages = fetch_recent_awards(start_date, end_date, result_limit, int(min_amount), keyword.strip())
     prospects = [parse_prospect(row) for row in rows]
+    st.session_state["last_refresh"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
 except Exception as exc:
     st.error(f"Could not load USAspending data: {exc}")
     st.stop()
 
 prospects = sorted(prospects, key=lambda item: (item.govdash_fit_score, item.amount), reverse=True)
+if active_only:
+    prospects = [prospect for prospect in prospects if prospect.urgency in {"Active now", "Starts soon"}]
+accounts = [account for account in group_accounts(prospects) if account.tier in tier_filter]
 
 metrics = st.columns(4)
-metrics[0].metric("Prospects", len(prospects))
+metrics[0].metric("Accounts", len(accounts))
 metrics[1].metric("Date range", f"{start_date:%b %d} - {end_date:%b %d}")
-metrics[2].metric("Largest award", money(max((p.amount for p in prospects), default=0)))
-metrics[3].metric("Top fit score", max((p.govdash_fit_score for p in prospects), default=0))
+metrics[2].metric("Pipeline value", money(sum(account.total_amount for account in accounts)))
+metrics[3].metric("Top account score", max((account.priority_score for account in accounts), default=0))
+
+st.caption(f"Live source refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change or Refresh live data is clicked.")
 
 if api_messages:
     with st.expander("API notes"):
         for message in api_messages:
             st.write(message)
 
-tabs = st.tabs(["Lead Board", "SDR Workbench", "GovDash Demo", "Data Notes"])
+tabs = st.tabs(["Account Radar", "SDR Workbench", "Demo Builder", "Outreach Sequence", "Data Notes"])
 
 with tabs[0]:
-    st.subheader("Recently Reported Winners")
-    if prospects:
-        st.dataframe(to_dataframe(prospects), width="stretch", hide_index=True)
-    else:
-        st.info("No awards matched these filters. Try a longer date range, lower amount, or broader keyword.")
+    st.subheader("Account Radar")
+    if accounts:
+        st.dataframe(account_dataframe(accounts), width="stretch", hide_index=True)
 
-    st.download_button(
-        "Download lead board CSV",
-        data=to_dataframe(prospects).to_csv(index=False),
-        file_name="application-0-govdash-prospects.csv",
-        mime="text/csv",
-        disabled=not prospects,
-    )
+        export_cols = st.columns(3)
+        export_cols[0].download_button(
+            "Download account radar CSV",
+            data=account_dataframe(accounts).to_csv(index=False),
+            file_name="application-0-account-radar.csv",
+            mime="text/csv",
+        )
+        export_cols[1].download_button(
+            "Download award-level CSV",
+            data=to_dataframe(prospects).to_csv(index=False),
+            file_name="application-0-awards.csv",
+            mime="text/csv",
+        )
+        export_cols[2].download_button(
+            "Download CRM CSV",
+            data=crm_dataframe(accounts).to_csv(index=False),
+            file_name="application-0-crm-export.csv",
+            mime="text/csv",
+        )
 
-with tabs[1]:
-    if not prospects:
-        st.info("No prospects to work. Adjust filters on the left to load recent award winners.")
-    else:
-        left, right = st.columns([0.38, 0.62])
-        with left:
-            selected_company = st.selectbox("Select a company", [p.company for p in prospects])
-
-        selected = next(p for p in prospects if p.company == selected_company)
-
-        with right:
+        st.markdown("### Top Account Briefs")
+        for account in accounts[:5]:
+            primary = account.primary
             st.markdown(
                 f"""
                 <div class="prospect-card">
-                  <h3>{selected.company}</h3>
-                  <div class="muted">{selected.urgency} | {money(selected.amount)} | {selected.awarding_agency}</div>
+                  <span class="tier-pill">{account.tier} | {account.priority_score}</span>
+                  <h3>{account.company}</h3>
+                  <div class="muted">{account.award_count} recent award(s) | {money(account.total_amount)} total | latest {account.latest_award_date or "unknown"}</div>
+                  <div class="muted"><b>Primary trigger:</b> {why_now_triggers(primary)[0]}</div>
+                  <div class="muted"><b>Next action:</b> {next_best_action(account)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("No accounts matched these filters. Try a longer date range, lower amount, broader keyword, or more priority tiers.")
+
+with tabs[1]:
+    if not accounts:
+        st.info("No accounts to work. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_account_name = st.selectbox("Select an account", [account.company for account in accounts])
+        selected_account = next(account for account in accounts if account.company == selected_account_name)
+        selected = selected_account.primary
+
+        overview_cols = st.columns([0.58, 0.42])
+        with overview_cols[0]:
+            st.markdown(
+                f"""
+                <div class="prospect-card">
+                  <span class="tier-pill">{selected_account.tier} | score {selected_account.priority_score}</span>
+                  <h3>{selected_account.company}</h3>
+                  <div class="muted">{selected.urgency} | {money(selected.amount)} primary award | {selected.awarding_agency}</div>
                   <div class="muted">{selected.description}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-        contact_cols = st.columns([0.48, 0.52])
-        with contact_cols[0]:
-            st.markdown("### Contact Information")
-            st.markdown(
-                f"""
-                <div class="contact-box">
-                  <b>Public address</b><br>
-                  {selected.address or "Not provided"}<br>
-                  {selected.location or "Location not provided"}<br><br>
-                  <b>UEI</b><br>{selected.uei or "Not provided"}<br><br>
-                  <b>Likely SDR personas</b><br>
-                  {", ".join(suggested_personas(selected))}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.caption("Public award data usually does not include verified direct emails or phone numbers. Use the links below to confirm people and contact channels before outreach.")
+            st.markdown("### Why Now")
+            for trigger in why_now_triggers(selected):
+                st.markdown(f'<div class="trigger">{trigger}</div>', unsafe_allow_html=True)
 
-        with contact_cols[1]:
-            st.markdown("### Public Research Links")
+            st.markdown("### Score Reasons")
+            for reason in score_breakdown(selected_account):
+                st.markdown(f'<div class="score-card"><b>Signal</b>{reason}</div>', unsafe_allow_html=True)
+
+        with overview_cols[1]:
+            st.markdown("### CRM Fields")
+            crm_key = f"crm_{selected_account.company}"
+            current = st.session_state.get(crm_key, {})
+            status = st.selectbox("Status", DEFAULT_STATUSES, index=DEFAULT_STATUSES.index(current.get("status", "New")))
+            owner = st.text_input("Owner", value=current.get("owner", ""))
+            persona = st.selectbox(
+                "Primary persona",
+                suggested_personas(selected),
+                index=0,
+            )
+            next_step = st.date_input("Next step date", value=date.today() + timedelta(days=2))
+            notes = st.text_area("Notes", value=current.get("notes", ""), placeholder="Contact names, call notes, objection, next action...")
+            st.session_state[crm_key] = {
+                "status": status,
+                "owner": owner,
+                "persona": persona,
+                "next_step": next_step.isoformat(),
+                "notes": notes,
+            }
+
+            st.markdown("### Public Contact Research")
             links = public_links(selected)
             st.markdown(
                 '<div class="link-grid">'
@@ -481,32 +768,79 @@ with tabs[1]:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("### Outreach Draft")
-        st.code(outreach_copy(selected), language="text")
+        st.markdown("### Account Award History")
+        st.dataframe(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
 
 with tabs[2]:
-    if not prospects:
-        st.info("No prospects to demo. Adjust filters on the left to load recent award winners.")
+    if not accounts:
+        st.info("No accounts to demo. Adjust filters on the left to load recent award winners.")
     else:
-        selected_company_demo = st.selectbox(
+        selected_demo_account_name = st.selectbox(
             "Build demo for",
-            [p.company for p in prospects],
+            [account.company for account in accounts],
             index=0,
-            key="demo_company",
+            key="demo_account",
         )
-        selected_demo = next(p for p in prospects if p.company == selected_company_demo)
+        selected_demo_account = next(account for account in accounts if account.company == selected_demo_account_name)
+        selected_demo = selected_demo_account.primary
 
         st.markdown(
             f"""
             <div class="prospect-card">
+              <span class="tier-pill">{selected_demo_account.tier} | {selected_demo_account.priority_score}</span>
               <h3>Demo premise: {selected_demo.company}</h3>
-              <div class="muted">Use their new {money(selected_demo.amount)} award as the opening scene, then show how GovDash turns it into capture, proposal, and contract-management motion.</div>
+              <div class="muted">Use their {money(selected_demo.amount)} award as the opening scene, then show how GovDash turns it into capture, proposal, and contract-management motion.</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        for title, body in demo_steps(selected_demo):
+        demo_cols = st.columns([0.5, 0.5])
+        with demo_cols[0]:
+            st.markdown("### Demo Flow")
+            for title, body in demo_steps(selected_demo):
+                st.markdown(
+                    f"""
+                    <div class="demo-step">
+                      <b>{title}</b><br>
+                      <span class="muted">{body}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        with demo_cols[1]:
+            st.markdown("### Discovery Questions")
+            for question in discovery_questions(selected_demo):
+                st.markdown(f'<div class="score-card">{question}</div>', unsafe_allow_html=True)
+
+        st.markdown("### Demo Talk Track")
+        st.write(
+            f"Lead with: \"You just won {selected_demo.award_id}. In GovDash, we would use that win to centralize the award record, "
+            f"extract reusable past-performance language, prepare for modifications and option years, and identify similar opportunities "
+            f"at {selected_demo.awarding_agency or 'the buying agency'}.\""
+        )
+
+with tabs[3]:
+    if not accounts:
+        st.info("No accounts to sequence. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_sequence_account_name = st.selectbox(
+            "Build outreach for",
+            [account.company for account in accounts],
+            index=0,
+            key="sequence_account",
+        )
+        selected_sequence_account = next(account for account in accounts if account.company == selected_sequence_account_name)
+        selected_sequence = selected_sequence_account.primary
+
+        st.markdown("### First-Touch Email")
+        st.code(outreach_copy(selected_sequence), language="text")
+
+        st.markdown("### Call Opener")
+        st.code(call_opener(selected_sequence), language="text")
+
+        st.markdown("### 14-Day Sequence")
+        for title, body in sequence_steps(selected_sequence):
             st.markdown(
                 f"""
                 <div class="demo-step">
@@ -517,24 +851,18 @@ with tabs[2]:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("### Demo Talk Track")
-        st.write(
-            f"Lead with: \"You just won {selected_demo.award_id}. In GovDash, we would use that win to centralize the award record, "
-            f"extract reusable past-performance language, prepare for modifications and option years, and identify similar opportunities "
-            f"at {selected_demo.awarding_agency or 'the buying agency'}.\""
-        )
-
-with tabs[3]:
+with tabs[4]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "
-        "For deeper SAM.gov award records, add a SAM.gov public API key later and connect the Contract Awards API."
+        "The app retries transient API failures and caches successful responses for 30 minutes to keep the live workflow responsive."
     )
-    st.markdown("### Compliance Notes")
+    st.markdown("### Contact Quality Guardrails")
     st.write(
-        "The app avoids inventing personal contact details. It shows public recipient address data, likely buying personas, and search links that an SDR can use to verify official company pages, LinkedIn profiles, press releases, SAM.gov records, and USAspending pages."
+        "The app avoids inventing personal contact details. It shows public recipient address data, likely personas, public research links, and CRM notes fields. "
+        "For verified emails and phone numbers, connect a compliant enrichment vendor or require SDR verification before outreach."
     )
-    st.markdown("### Next Data Enrichment Options")
+    st.markdown("### What To Add Next")
     st.write(
-        "Good next integrations: SAM.gov Contract Awards API, company-domain discovery, verified email enrichment, CRM export, and a GovDash-specific demo deck generator."
+        "Best next integrations: SAM.gov Contract Awards API, verified contact enrichment, HubSpot/Salesforce sync, account history beyond the current lookback window, and a GovDash demo deck generator."
     )

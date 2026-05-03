@@ -152,6 +152,15 @@ class Account:
         return "Tier 3"
 
 
+@dataclass(frozen=True)
+class ContactTarget:
+    rank: int
+    title: str
+    why: str
+    message_angle: str
+    search_query: str
+
+
 def build_search_payload(start: date, end: date, limit: int, min_amount: int, keyword: str) -> dict:
     filters: dict[str, object] = {
         "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
@@ -260,6 +269,10 @@ def linkedin_url(company: str, persona: str = "") -> str:
     return search_url(query)
 
 
+def target_search_url(company: str, title: str) -> str:
+    return search_url(f'site:linkedin.com/in "{company}" "{title}"')
+
+
 def public_links(prospect: Prospect) -> dict[str, str]:
     company = prospect.company
     return {
@@ -283,6 +296,83 @@ def suggested_personas(prospect: Prospect) -> list[str]:
         personas.append("Program Operations Lead")
     personas.append("Contracts Manager")
     return personas
+
+
+def contact_targets(account: Account) -> list[ContactTarget]:
+    prospect = account.primary
+    text = " ".join([prospect.description, prospect.naics_description, prospect.psc_description]).lower()
+    targets = [
+        ContactTarget(
+            1,
+            "VP/Director of Business Development",
+            "Owns growth pipeline and cares about turning a new award into follow-on pursuits.",
+            "Lead with repeatable capture process and using the win as stronger past performance.",
+            f'site:linkedin.com/in "{account.company}" "business development" government',
+        ),
+        ContactTarget(
+            2,
+            "Capture Manager",
+            "Closest day-to-day owner for recompetes, follow-on opportunities, and opportunity research.",
+            "Lead with faster opportunity qualification, capture workspace setup, and pursuit artifacts.",
+            f'site:linkedin.com/in "{account.company}" "capture manager"',
+        ),
+        ContactTarget(
+            3,
+            "Proposal Manager",
+            "Feels the pain when capture intelligence, compliance matrices, and draft content are scattered.",
+            "Lead with proposal speed, compliance matrix generation, and reusable boilerplate.",
+            f'site:linkedin.com/in "{account.company}" "proposal manager"',
+        ),
+        ContactTarget(
+            4,
+            "Contracts Manager",
+            "Responsible for award records, modifications, option years, and audit-ready evidence.",
+            "Lead with contract record organization, option-year readiness, and delivery proof.",
+            f'site:linkedin.com/in "{account.company}" "contracts manager"',
+        ),
+    ]
+
+    if account.award_count >= 3 or account.total_amount >= 5_000_000:
+        targets.insert(
+            0,
+            ContactTarget(
+                1,
+                "President/CEO or GovCon Practice Lead",
+                "A high-value or repeat-award account may justify executive-level growth and process conversation.",
+                "Lead with scaling federal growth without adding proposal and contract-management drag.",
+                f'site:linkedin.com/in "{account.company}" president OR CEO government',
+            ),
+        )
+
+    if any(term in text for term in ["cyber", "software", "network", "telecom", "cloud", "data", "satellite"]):
+        targets.append(
+            ContactTarget(
+                5,
+                "CTO/VP Engineering or Technical Program Lead",
+                "Technical awards often require security evidence, delivery documentation, and technical-volume reuse.",
+                "Lead with technical evidence reuse, security/compliance documentation, and faster technical proposals.",
+                f'site:linkedin.com/in "{account.company}" CTO OR \"technical program\"',
+            )
+        )
+
+    if any(term in text for term in ["facilities", "construction", "maintenance", "operation", "support services"]):
+        targets.append(
+            ContactTarget(
+                5,
+                "Program Operations Lead",
+                "Operations-heavy awards create kickoff, staffing, subcontractor, and delivery documentation pressure.",
+                "Lead with kickoff tasking, delivery notes, subcontractor coordination, and option-year evidence.",
+                f'site:linkedin.com/in "{account.company}" \"program manager\" operations',
+            )
+        )
+
+    ranked = []
+    seen: set[str] = set()
+    for target in targets:
+        if target.title not in seen:
+            ranked.append(ContactTarget(len(ranked) + 1, target.title, target.why, target.message_angle, target.search_query))
+            seen.add(target.title)
+    return ranked[:6]
 
 
 def why_now_triggers(prospect: Prospect) -> list[str]:
@@ -365,6 +455,29 @@ def demo_steps(prospect: Prospect) -> list[tuple[str, str]]:
     ]
 
 
+def demo_asset_pack(prospect: Prospect) -> dict[str, str]:
+    agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency
+    return {
+        "Opening scene": (
+            f"Start with {prospect.company}'s {money(prospect.amount)} award {prospect.award_id} with {agency}. "
+            f"Show the award record, dates, NAICS/PSC, and the contract description as the source of truth."
+        ),
+        "Pain hypothesis": (
+            f"The team likely needs to organize {prospect.contract_focus} while preserving reusable material for future bids."
+        ),
+        "GovDash workflow": (
+            "Create an award workspace, extract requirements, assign owners, generate a compliance matrix, draft reusable sections, "
+            "and tag delivery evidence for option years or recompetes."
+        ),
+        "Proof moment": (
+            "Show how one award becomes a reusable capture/proposal asset instead of a one-time PDF, spreadsheet, or shared-drive folder."
+        ),
+        "Close": (
+            "Ask whether their capture/proposal/contracts team would benefit from seeing this same workflow mapped to one live pursuit."
+        ),
+    }
+
+
 def outreach_copy(prospect: Prospect) -> str:
     agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency
     return (
@@ -440,6 +553,7 @@ def account_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 or account.primary.awarding_sub_agency
                 or account.primary.awarding_agency,
                 "Primary NAICS": f"{account.primary.naics_code} {account.primary.naics_description}".strip(),
+                "Best contact": contact_targets(account)[0].title,
                 "Why now": " ".join(why_now_triggers(account.primary)[:2]),
                 "Next action": next_best_action(account),
             }
@@ -462,6 +576,8 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Owner": crm.get("owner", ""),
                 "Next step date": crm.get("next_step", ""),
                 "Primary persona": crm.get("persona", suggested_personas(account.primary)[0]),
+                "Best contact target": contact_targets(account)[0].title,
+                "Why this contact": contact_targets(account)[0].why,
                 "Notes": crm.get("notes", ""),
                 "Award": account.primary.award_id,
                 "Amount": money(account.primary.amount),
@@ -599,6 +715,29 @@ st.markdown(
         font-weight: 700;
         font-size: .82rem;
     }
+    .target-card {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: .85rem;
+        margin-bottom: .65rem;
+    }
+    .target-card h4 {
+        margin: .25rem 0 .35rem 0;
+        font-size: 1rem;
+    }
+    .target-rank {
+        display: inline-flex;
+        justify-content: center;
+        align-items: center;
+        width: 1.65rem;
+        height: 1.65rem;
+        border-radius: 999px;
+        color: #fff;
+        background: var(--blue);
+        font-weight: 700;
+        margin-right: .35rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -663,7 +802,7 @@ if api_messages:
         for message in api_messages:
             st.write(message)
 
-tabs = st.tabs(["Account Radar", "SDR Workbench", "Demo Builder", "Outreach Sequence", "Data Notes"])
+tabs = st.tabs(["Account Radar", "Contact Finder", "SDR Workbench", "Demo Builder", "Outreach Sequence", "Data Notes"])
 
 with tabs[0]:
     st.subheader("Account Radar")
@@ -693,6 +832,7 @@ with tabs[0]:
         st.markdown("### Top Account Briefs")
         for account in accounts[:5]:
             primary = account.primary
+            best_target = contact_targets(account)[0]
             st.markdown(
                 f"""
                 <div class="prospect-card">
@@ -700,6 +840,7 @@ with tabs[0]:
                   <h3>{account.company}</h3>
                   <div class="muted">{account.award_count} recent award(s) | {money(account.total_amount)} total | latest {account.latest_award_date or "unknown"}</div>
                   <div class="muted"><b>Primary trigger:</b> {why_now_triggers(primary)[0]}</div>
+                  <div class="muted"><b>Best contact:</b> {best_target.title} - {best_target.why}</div>
                   <div class="muted"><b>Next action:</b> {next_best_action(account)}</div>
                 </div>
                 """,
@@ -709,6 +850,70 @@ with tabs[0]:
         st.info("No accounts matched these filters. Try a longer date range, lower amount, broader keyword, or more priority tiers.")
 
 with tabs[1]:
+    if not accounts:
+        st.info("No accounts to research. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_contact_account_name = st.selectbox("Find contacts for", [account.company for account in accounts], key="contact_account")
+        selected_contact_account = next(account for account in accounts if account.company == selected_contact_account_name)
+        primary = selected_contact_account.primary
+
+        st.markdown(
+            f"""
+            <div class="prospect-card">
+              <span class="tier-pill">{selected_contact_account.tier} | score {selected_contact_account.priority_score}</span>
+              <h3>{selected_contact_account.company}</h3>
+              <div class="muted">{selected_contact_account.award_count} recent award(s) | {money(selected_contact_account.total_amount)} total | primary award {primary.award_id}</div>
+              <div class="muted"><b>Why contact now:</b> {why_now_triggers(primary)[0]}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### Best People To Contact")
+        st.caption("The app ranks the roles most likely to care about GovDash. Use the search links to find and verify named people before outreach.")
+        for target in contact_targets(selected_contact_account):
+            st.markdown(
+                f"""
+                <div class="target-card">
+                  <span class="target-rank">{target.rank}</span><h4>{target.title}</h4>
+                  <div class="muted"><b>Why this person:</b> {target.why}</div>
+                  <div class="muted"><b>Message angle:</b> {target.message_angle}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            link_cols = st.columns(3)
+            link_cols[0].link_button("LinkedIn search", search_url(target.search_query))
+            link_cols[1].link_button("Company site search", search_url(f'"{selected_contact_account.company}" "{target.title}"'))
+            link_cols[2].link_button("Email pattern search", search_url(f'"{selected_contact_account.company}" email {target.title}'))
+
+        st.markdown("### Contact Verification Checklist")
+        checklist_cols = st.columns(4)
+        checklist_cols[0].checkbox("Name verified", key=f"{selected_contact_account.company}_name_verified")
+        checklist_cols[1].checkbox("Current role verified", key=f"{selected_contact_account.company}_role_verified")
+        checklist_cols[2].checkbox("Company domain verified", key=f"{selected_contact_account.company}_domain_verified")
+        checklist_cols[3].checkbox("Safe to sequence", key=f"{selected_contact_account.company}_safe_sequence")
+
+        st.download_button(
+            "Download contact targets CSV",
+            data=pd.DataFrame(
+                [
+                    {
+                        "Company": selected_contact_account.company,
+                        "Rank": target.rank,
+                        "Target title": target.title,
+                        "Why": target.why,
+                        "Message angle": target.message_angle,
+                        "Search URL": search_url(target.search_query),
+                    }
+                    for target in contact_targets(selected_contact_account)
+                ]
+            ).to_csv(index=False),
+            file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-contact-targets.csv",
+            mime="text/csv",
+        )
+
+with tabs[2]:
     if not accounts:
         st.info("No accounts to work. Adjust filters on the left to load recent award winners.")
     else:
@@ -768,10 +973,22 @@ with tabs[1]:
                 unsafe_allow_html=True,
             )
 
+            st.markdown("### Best Contact")
+            best_target = contact_targets(selected_account)[0]
+            st.markdown(
+                f"""
+                <div class="target-card">
+                  <h4>{best_target.title}</h4>
+                  <div class="muted">{best_target.why}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         st.markdown("### Account Award History")
         st.dataframe(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
 
-with tabs[2]:
+with tabs[3]:
     if not accounts:
         st.info("No accounts to demo. Adjust filters on the left to load recent award winners.")
     else:
@@ -782,7 +999,21 @@ with tabs[2]:
             key="demo_account",
         )
         selected_demo_account = next(account for account in accounts if account.company == selected_demo_account_name)
-        selected_demo = selected_demo_account.primary
+        demo_awards = sorted(selected_demo_account.prospects, key=lambda prospect: prospect.amount, reverse=True)
+        selected_award_label = st.selectbox(
+            "Select award/use case",
+            [
+                f"{prospect.award_id} | {money(prospect.amount)} | {prospect.description[:80]}"
+                for prospect in demo_awards
+            ],
+            key="demo_award",
+        )
+        selected_demo = demo_awards[
+            [
+                f"{prospect.award_id} | {money(prospect.amount)} | {prospect.description[:80]}"
+                for prospect in demo_awards
+            ].index(selected_award_label)
+        ]
 
         st.markdown(
             f"""
@@ -794,6 +1025,19 @@ with tabs[2]:
             """,
             unsafe_allow_html=True,
         )
+
+        st.markdown("### Demo Asset Pack")
+        pack = demo_asset_pack(selected_demo)
+        for label, body in pack.items():
+            st.markdown(
+                f"""
+                <div class="score-card">
+                  <b>{label}</b>
+                  {body}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         demo_cols = st.columns([0.5, 0.5])
         with demo_cols[0]:
@@ -820,7 +1064,7 @@ with tabs[2]:
             f"at {selected_demo.awarding_agency or 'the buying agency'}.\""
         )
 
-with tabs[3]:
+with tabs[4]:
     if not accounts:
         st.info("No accounts to sequence. Adjust filters on the left to load recent award winners.")
     else:
@@ -851,7 +1095,7 @@ with tabs[3]:
                 unsafe_allow_html=True,
             )
 
-with tabs[4]:
+with tabs[5]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "

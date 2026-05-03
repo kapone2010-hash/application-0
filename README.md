@@ -9,10 +9,10 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Ranks accounts by GovDash fit, recent award value, number of awards, agencies, NAICS/PSC, and follow-on signals.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
-- Suggests likely SDR personas such as capture, proposal, BD, contracts, and technical leaders.
+- Ranks the best contact targets for each account, explains why each role matters, and gives public search links to verify named people.
 - Shows "why now" triggers and recommended next best actions.
 - Adds CRM-style fields for status, owner, next step date, persona, and notes.
-- Creates GovDash demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
+- Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
 - Exports account radar, award-level records, and CRM-ready CSVs.
 
 ## Setup

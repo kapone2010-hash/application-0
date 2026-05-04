@@ -6049,6 +6049,7 @@ with tabs[0]:
                 data=duplicate_risk.to_csv(index=False),
                 file_name="application-0-account-duplicate-risk.csv",
                 mime="text/csv",
+                key="account_duplicate_risk_download",
             )
 
         export_cols = st.columns(3)
@@ -6057,24 +6058,28 @@ with tabs[0]:
             data=account_dataframe(accounts).to_csv(index=False),
             file_name="application-0-account-radar.csv",
             mime="text/csv",
+            key="account_radar_download",
         )
         export_cols[1].download_button(
             "Download award-level CSV",
             data=to_dataframe(prospects).to_csv(index=False),
             file_name="application-0-awards.csv",
             mime="text/csv",
+            key="award_level_download",
         )
         export_cols[2].download_button(
             "Download CRM CSV",
             data=crm_dataframe(accounts).to_csv(index=False),
             file_name="application-0-crm-export.csv",
             mime="text/csv",
+            key="crm_export_download",
         )
         st.download_button(
             "Download SDR action queue CSV",
             data=action_queue.to_csv(index=False),
             file_name="application-0-sdr-action-queue.csv",
             mime="text/csv",
+            key="sdr_action_queue_download",
         )
 
         st.markdown("### Top Account Briefs")
@@ -6145,6 +6150,7 @@ with tabs[1]:
                 data=sam_opportunities_dataframe(sam_opportunities).to_csv(index=False),
                 file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-sam-gov-context.csv",
                 mime="text/csv",
+                key=f"sam_context_download_{selected_intel_account.company}",
             )
         elif st.session_state.get(sam_msg_key):
             st.info(str(st.session_state[sam_msg_key]))
@@ -6167,6 +6173,7 @@ with tabs[1]:
                     data=pain_points_dataframe(existing_intel).to_csv(index=False),
                     file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-pain-points.csv",
                     mime="text/csv",
+                    key=f"pain_points_download_{selected_intel_account.company}",
                 )
             else:
                 st.info("No pain-point evidence was found in the quick public scan. Try role-specific searches in Contact Finder or broaden the account filters.")
@@ -6191,6 +6198,7 @@ with tabs[1]:
                     data=account_signals_dataframe(existing_intel).to_csv(index=False),
                     file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-call-intel.csv",
                     mime="text/csv",
+                    key=f"call_intel_download_{selected_intel_account.company}",
                 )
             else:
                 st.markdown("### Call Intel Beyond The Award")
@@ -6253,6 +6261,7 @@ with tabs[1]:
                         data=public_contacts_dataframe(existing_intel).to_csv(index=False),
                         file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-public-intel.csv",
                         mime="text/csv",
+                        key=f"public_intel_download_{selected_intel_account.company}",
                     )
                 else:
                     st.warning("No named public contacts or public emails were found in the pages scanned.")
@@ -6274,6 +6283,7 @@ with tabs[1]:
                         data=audit_df.to_csv(index=False),
                         file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-source-audit.csv",
                         mime="text/csv",
+                        key=f"public_source_audit_download_{selected_intel_account.company}",
                     )
                     render_source_audit_persistence(selected_intel_account.company, audit_df, f"public_{selected_intel_account.company}")
 
@@ -6611,6 +6621,7 @@ with tabs[2]:
                 data=hunter_contacts_dataframe(hunter_contacts).to_csv(index=False),
                 file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-hunter-contacts.csv",
                 mime="text/csv",
+                key=f"hunter_contacts_download_{selected_contact_account.company}",
             )
         elif st.session_state.get(hunter_message_key):
             st.info(str(st.session_state[hunter_message_key]))
@@ -6708,6 +6719,7 @@ with tabs[2]:
                     data=audit_df.to_csv(index=False),
                     file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-source-audit.csv",
                     mime="text/csv",
+                    key=f"contact_source_audit_download_{selected_contact_account.company}",
                 )
                 render_source_audit_persistence(selected_contact_account.company, audit_df, f"contact_{selected_contact_account.company}")
 
@@ -6721,6 +6733,7 @@ with tabs[2]:
                 data=people_to_contact_dataframe(selected_contact_account, contact_intel).to_csv(index=False),
                 file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-people-to-contact.csv",
                 mime="text/csv",
+                key=f"updated_people_download_{selected_contact_account.company}",
             )
             linkedin_contacts = getattr(contact_intel, "linkedin_contacts", tuple())
             if linkedin_contacts:
@@ -6782,6 +6795,7 @@ with tabs[2]:
             ).to_csv(index=False),
             file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-contact-targets.csv",
             mime="text/csv",
+            key=f"contact_targets_download_{selected_contact_account.company}",
         )
 
 with tabs[3]:
@@ -6875,6 +6889,7 @@ with tabs[3]:
             data=call_prep_markdown(selected_prep_account, prep_intel, prep_sam),
             file_name=f"{selected_prep_account.company.lower().replace(' ', '-')}-call-prep.md",
             mime="text/markdown",
+            key=f"call_prep_download_{selected_prep_account.company}",
         )
 
 
@@ -7233,6 +7248,7 @@ with tabs[4]:
             data=crm_dataframe(accounts).to_csv(index=False),
             file_name="application-0-crm-cadence.csv",
             mime="text/csv",
+            key="crm_cadence_download",
         )
 
 with tabs[5]:
@@ -7535,6 +7551,7 @@ with tabs[7]:
             data=account_brief_markdown(selected_brief_account, brief_intel, brief_sam),
             file_name=f"{selected_brief_account.company.lower().replace(' ', '-')}-account-brief.md",
             mime="text/markdown",
+            key=f"account_brief_download_{selected_brief_account.company}",
         )
 
 

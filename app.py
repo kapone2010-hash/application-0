@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import re
@@ -33,6 +34,7 @@ PAGE_TIMEOUT_SECONDS = 6
 REQUEST_HEADERS = {
     "User-Agent": "Application-0 GovDash SDR research prototype (public web discovery; +https://github.com/kapone2010-hash/application-0)"
 }
+SAM_QUOTA_LOCK_KEY = "sam_quota_locked_until"
 BLOCKED_FETCH_DOMAINS = {
     "linkedin.com",
     "www.linkedin.com",
@@ -843,6 +845,61 @@ def sam_query_params(account: Account, limit: int = 50) -> dict[str, str]:
     return params
 
 
+def parse_sam_next_access_time(body: str) -> datetime | None:
+    next_access = ""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict):
+        next_access = str(payload.get("nextAccessTime") or "")
+    if not next_access:
+        match = re.search(r"\d{4}-[A-Za-z]{3}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} UTC", body)
+        next_access = match.group(0) if match else ""
+    if not next_access:
+        return None
+    try:
+        return datetime.strptime(next_access, "%Y-%b-%d %H:%M:%S%z UTC").astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def format_sam_quota_message(reset_at: datetime | None) -> str:
+    if reset_at is None:
+        return "SAM.gov quota is temporarily exhausted. The app will use cached and fallback intelligence until SAM.gov allows API access again."
+    reset_utc = reset_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    reset_local = reset_at.astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+    return (
+        f"SAM.gov quota is locked until {reset_utc} ({reset_local}). "
+        "The app will use cached and fallback intelligence and will not retry SAM.gov before that time."
+    )
+
+
+def sam_quota_lock_message() -> str:
+    stored = str(st.session_state.get(SAM_QUOTA_LOCK_KEY) or "")
+    if not stored:
+        return ""
+    try:
+        reset_at = datetime.fromisoformat(stored)
+    except ValueError:
+        st.session_state.pop(SAM_QUOTA_LOCK_KEY, None)
+        return ""
+    if reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=timezone.utc)
+    reset_at = reset_at.astimezone(timezone.utc)
+    if datetime.now(timezone.utc) >= reset_at:
+        st.session_state.pop(SAM_QUOTA_LOCK_KEY, None)
+        return ""
+    return format_sam_quota_message(reset_at)
+
+
+def remember_sam_quota_lock(reset_at: datetime | None) -> str:
+    if reset_at is None:
+        reset_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    st.session_state[SAM_QUOTA_LOCK_KEY] = reset_at.astimezone(timezone.utc).isoformat()
+    return format_sam_quota_message(reset_at)
+
+
 def company_match_score(account: Account, item: dict[str, object]) -> tuple[int, list[str]]:
     company = account.company.lower()
     company_tokens = [token for token in re.split(r"[^a-z0-9]+", company) if len(token) > 3]
@@ -927,6 +984,9 @@ def sam_match_score(opportunity: SamOpportunity) -> int:
 def fetch_sam_opportunities(account: Account, limit: int = 50) -> tuple[tuple[SamOpportunity, ...], str]:
     if not sam_enabled():
         return tuple(), "SAM_API_KEY is not configured."
+    quota_message = sam_quota_lock_message()
+    if quota_message:
+        return tuple(), quota_message
     params = sam_query_params(account, limit)
     try:
         response = requests.get(
@@ -939,7 +999,10 @@ def fetch_sam_opportunities(account: Account, limit: int = 50) -> tuple[tuple[Sa
         payload = response.json()
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
-        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        raw_body = exc.response.text if exc.response is not None else str(exc)
+        if status == 429:
+            return tuple(), remember_sam_quota_lock(parse_sam_next_access_time(raw_body))
+        body = raw_body[:180]
         return tuple(), f"SAM.gov returned HTTP {status}: {body}"
     except requests.RequestException as exc:
         return tuple(), f"SAM.gov request failed: {exc}"
@@ -4721,7 +4784,13 @@ def build_full_pursuit_package(account: Account, sync_to_hubspot: bool = True) -
             sam_opportunities, sam_message = fetch_sam_opportunities(account)
             st.session_state[sam_intel_key(account.company)] = sam_opportunities
             st.session_state[sam_message_key(account.company)] = sam_message
-            add_step("SAM.gov", "Complete", sam_message, "Use SAM notice context for procurement details, not as contractor contact data.")
+            sam_status = "Complete" if sam_opportunities else "Deferred" if "quota" in sam_message.lower() else "Needs review"
+            sam_next_action = (
+                "Use cached/fallback account intelligence until the SAM.gov quota resets."
+                if sam_status == "Deferred"
+                else "Use SAM notice context for procurement details, not as contractor contact data."
+            )
+            add_step("SAM.gov", sam_status, sam_message, sam_next_action)
         except Exception as exc:
             add_step("SAM.gov", "Needs review", f"SAM.gov enrichment failed: {exc}", "Try SAM.gov enrichment again from Public Intel.")
     else:
@@ -5238,6 +5307,10 @@ def auto_sam_context(account: Account) -> tuple[SamOpportunity, ...]:
         return sam_opportunities
     if not sam_enabled():
         st.session_state[sam_msg_key] = "SAM_API_KEY is not configured."
+        return tuple()
+    quota_message = sam_quota_lock_message()
+    if quota_message:
+        st.session_state[sam_msg_key] = quota_message
         return tuple()
     with st.spinner(f"Automatically pulling SAM.gov context for {account.company}..."):
         try:
@@ -6050,6 +6123,9 @@ with st.sidebar:
     st.header("SAM.gov")
     if sam_enabled():
         st.success("SAM API key configured")
+        sam_lockout = sam_quota_lock_message()
+        if sam_lockout:
+            st.warning(sam_lockout)
     else:
         st.info("SAM API key missing")
     st.caption("SAM.gov enrichment runs automatically for the active account.")

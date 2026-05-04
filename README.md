@@ -12,7 +12,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Adds a dynamic SDR action queue that blends award fit, verified contacts, public call-intel signals, pain evidence, open tasks, and contact readiness.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
 - Automatically scans public web sources for company descriptions, likely website, source pages, public business emails/phones, named contacts, call-intel signals, evidence-backed pain points, and public LinkedIn result signals when available.
-- Automatically enriches active accounts with SAM.gov award-notice context when `SAM_API_KEY` is configured, including notice type, solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, government POC, and source links when available.
+- Automatically enriches active accounts with SAM.gov award-notice context when `SAM_API_KEY` is configured, including notice type, solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, government POC, and source links when available. If SAM.gov throttles the API key, the app remembers the reset time, pauses SAM retries, and continues with cached/fallback intelligence.
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
@@ -65,7 +65,7 @@ Add this secret locally and in Streamlit Community Cloud to enable official SAM.
 SAM_API_KEY = "your_sam_gov_api_key"
 ```
 
-SAM.gov enrichment is run on demand from the Public Intel tab for the active account. Government points of contact returned by SAM.gov are shown as procurement context, not as SDR targets at the contractor company.
+SAM.gov enrichment runs automatically for the active account. Government points of contact returned by SAM.gov are shown as procurement context, not as SDR targets at the contractor company. If SAM.gov returns a quota or throttle response, Application 0 displays the reset time, pauses additional SAM.gov API calls for the session, and keeps the rest of the workflow running.
 
 ## Hunter Contact Enrichment
 

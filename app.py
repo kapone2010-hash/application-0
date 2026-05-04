@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import re
 from dataclasses import dataclass
@@ -156,6 +157,123 @@ def init_database() -> None:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_crm_activities_company ON crm_activities(company)")
+
+
+def secret_value(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(value).strip()
+
+
+def supabase_config() -> dict[str, str]:
+    return {
+        "url": secret_value("SUPABASE_URL").rstrip("/"),
+        "service_role_key": secret_value("SUPABASE_SERVICE_ROLE_KEY"),
+    }
+
+
+def supabase_enabled() -> bool:
+    config = supabase_config()
+    return bool(config["url"] and config["service_role_key"])
+
+
+def storage_backend_name() -> str:
+    return "Supabase" if supabase_enabled() else "SQLite local"
+
+
+def storage_warning(message: str) -> None:
+    try:
+        st.session_state["storage_warning"] = message
+    except Exception:
+        pass
+
+
+def supabase_headers(prefer: str = "") -> dict[str, str]:
+    config = supabase_config()
+    headers = {
+        "apikey": config["service_role_key"],
+        "Authorization": f"Bearer {config['service_role_key']}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def supabase_endpoint(table: str) -> str:
+    return f"{supabase_config()['url']}/rest/v1/{table}"
+
+
+def supabase_request(method: str, table: str, **kwargs: object) -> object:
+    response = requests.request(
+        method,
+        supabase_endpoint(table),
+        headers=kwargs.pop("headers", supabase_headers()),
+        timeout=12,
+        **kwargs,
+    )
+    response.raise_for_status()
+    if not response.content:
+        return None
+    return response.json()
+
+
+def supabase_select(table: str, params: dict[str, object]) -> list[dict[str, object]]:
+    result = supabase_request("GET", table, params=params)
+    return result if isinstance(result, list) else []
+
+
+def supabase_insert(table: str, payload: dict[str, object]) -> dict[str, object]:
+    result = supabase_request(
+        "POST",
+        table,
+        headers=supabase_headers("return=representation"),
+        json=payload,
+    )
+    return result[0] if isinstance(result, list) and result else {}
+
+
+def supabase_upsert(table: str, payload: dict[str, object], conflict_columns: str) -> dict[str, object]:
+    result = supabase_request(
+        "POST",
+        table,
+        headers=supabase_headers("resolution=merge-duplicates,return=representation"),
+        params={"on_conflict": conflict_columns},
+        json=payload,
+    )
+    return result[0] if isinstance(result, list) and result else {}
+
+
+def supabase_patch(table: str, row_id: int, payload: dict[str, object]) -> None:
+    supabase_request(
+        "PATCH",
+        table,
+        headers=supabase_headers(),
+        params={"id": f"eq.{row_id}"},
+        json=payload,
+    )
+
+
+def supabase_delete(table: str, row_id: int) -> None:
+    supabase_request("DELETE", table, params={"id": f"eq.{row_id}"})
+
+
+def supabase_ping() -> tuple[bool, str]:
+    if not supabase_enabled():
+        return False, "Supabase secrets are not configured. Using local SQLite."
+    try:
+        supabase_select("crm_accounts", {"select": "company", "limit": "1"})
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return False, f"Supabase configured but not ready. HTTP {status}: {exc.response.text[:180] if exc.response is not None else exc}"
+    except requests.RequestException as exc:
+        return False, f"Supabase configured but unreachable: {exc}"
+    return True, "Supabase is configured and reachable."
 
 
 @dataclass(frozen=True)
@@ -553,12 +671,39 @@ def nested_field(row: dict, field: str, child: str) -> str:
 
 
 def load_crm_record(company: str) -> dict[str, object]:
+    if supabase_enabled():
+        try:
+            rows = supabase_select("crm_accounts", {"select": "*", "company": f"eq.{company}", "limit": "1"})
+            return rows[0] if rows else {}
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase CRM read failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         row = connection.execute("SELECT * FROM crm_accounts WHERE company = ?", (company,)).fetchone()
     return dict(row) if row else {}
 
 
 def save_crm_record(company: str, crm: dict[str, object]) -> None:
+    payload = {
+        "company": company,
+        "status": str(crm.get("status", "New")),
+        "owner": str(crm.get("owner", "")),
+        "persona": str(crm.get("persona", "")),
+        "cadence_stage": str(crm.get("cadence_stage", "")),
+        "next_action": str(crm.get("next_action", "")),
+        "next_step": str(crm.get("next_step", "")),
+        "emailed": bool(crm.get("emailed", False)),
+        "called": bool(crm.get("called", False)),
+        "email_outcome": str(crm.get("email_outcome", "")),
+        "call_outcome": str(crm.get("call_outcome", "")),
+        "notes": str(crm.get("notes", "")),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if supabase_enabled():
+        try:
+            supabase_upsert("crm_accounts", payload, "company")
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase CRM save failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         connection.execute(
             """
@@ -582,19 +727,19 @@ def save_crm_record(company: str, crm: dict[str, object]) -> None:
                 updated_at = excluded.updated_at
             """,
             (
-                company,
-                str(crm.get("status", "New")),
-                str(crm.get("owner", "")),
-                str(crm.get("persona", "")),
-                str(crm.get("cadence_stage", "")),
-                str(crm.get("next_action", "")),
-                str(crm.get("next_step", "")),
-                int(bool(crm.get("emailed", False))),
-                int(bool(crm.get("called", False))),
-                str(crm.get("email_outcome", "")),
-                str(crm.get("call_outcome", "")),
-                str(crm.get("notes", "")),
-                datetime.now().isoformat(timespec="seconds"),
+                payload["company"],
+                payload["status"],
+                payload["owner"],
+                payload["persona"],
+                payload["cadence_stage"],
+                payload["next_action"],
+                payload["next_step"],
+                int(bool(payload["emailed"])),
+                int(bool(payload["called"])),
+                payload["email_outcome"],
+                payload["call_outcome"],
+                payload["notes"],
+                payload["updated_at"],
             ),
         )
 
@@ -627,6 +772,55 @@ def save_verified_contact(
         now,
         now,
     )
+    if supabase_enabled():
+        payload = {
+            "company": values[0],
+            "full_name": values[1],
+            "title": values[2],
+            "email": values[3],
+            "phone": values[4],
+            "linkedin_url": values[5],
+            "source_url": values[6],
+            "source_type": values[7],
+            "verification_status": values[8],
+            "verified_at": values[9],
+            "notes": values[10],
+            "created_at": values[11],
+            "updated_at": values[12],
+        }
+        try:
+            rows = supabase_select(
+                "verified_contacts",
+                {
+                    "select": "id",
+                    "company": f"eq.{values[0]}",
+                    "full_name": f"eq.{values[1]}",
+                    "title": f"eq.{values[2]}",
+                    "email": f"eq.{values[3]}",
+                    "linkedin_url": f"eq.{values[5]}",
+                    "order": "id.desc",
+                    "limit": "1",
+                },
+            )
+            if rows:
+                supabase_patch(
+                    "verified_contacts",
+                    int(rows[0]["id"]),
+                    {
+                        "phone": values[4],
+                        "source_url": values[6],
+                        "source_type": values[7],
+                        "verification_status": values[8],
+                        "verified_at": values[9],
+                        "notes": values[10],
+                        "updated_at": values[12],
+                    },
+                )
+            else:
+                supabase_insert("verified_contacts", payload)
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase verified-contact save failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         existing = connection.execute(
             """
@@ -670,6 +864,31 @@ def save_verified_contact(
 
 
 def load_verified_contacts(company: str) -> tuple[VerifiedContact, ...]:
+    if supabase_enabled():
+        try:
+            rows = supabase_select(
+                "verified_contacts",
+                {"select": "*", "company": f"eq.{company}", "order": "verified_at.desc,id.desc"},
+            )
+            return tuple(
+                VerifiedContact(
+                    id=int(row.get("id") or 0),
+                    company=str(row.get("company") or ""),
+                    full_name=str(row.get("full_name") or ""),
+                    title=str(row.get("title") or ""),
+                    email=str(row.get("email") or ""),
+                    phone=str(row.get("phone") or ""),
+                    linkedin_url=str(row.get("linkedin_url") or ""),
+                    source_url=str(row.get("source_url") or ""),
+                    source_type=str(row.get("source_type") or ""),
+                    verification_status=str(row.get("verification_status") or ""),
+                    verified_at=str(row.get("verified_at") or ""),
+                    notes=str(row.get("notes") or ""),
+                )
+                for row in rows
+            )
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase verified-contact read failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         rows = connection.execute(
             """
@@ -699,6 +918,12 @@ def load_verified_contacts(company: str) -> tuple[VerifiedContact, ...]:
 
 
 def delete_verified_contact(contact_id: int) -> None:
+    if supabase_enabled():
+        try:
+            supabase_delete("verified_contacts", contact_id)
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase verified-contact delete failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         connection.execute("DELETE FROM verified_contacts WHERE id = ?", (contact_id,))
 
@@ -789,6 +1014,24 @@ def save_crm_activity(
     completed: bool = False,
 ) -> None:
     now = datetime.now().isoformat(timespec="seconds")
+    payload = {
+        "company": company.strip(),
+        "activity_type": activity_type.strip(),
+        "contact_name": contact_name.strip(),
+        "subject": subject.strip(),
+        "outcome": outcome.strip(),
+        "notes": notes.strip(),
+        "due_date": due_date.strip(),
+        "completed": bool(completed),
+        "created_at": now,
+        "updated_at": now,
+    }
+    if supabase_enabled():
+        try:
+            supabase_insert("crm_activities", payload)
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase activity save failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         connection.execute(
             """
@@ -799,21 +1042,50 @@ def save_crm_activity(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                company.strip(),
-                activity_type.strip(),
-                contact_name.strip(),
-                subject.strip(),
-                outcome.strip(),
-                notes.strip(),
-                due_date.strip(),
-                int(completed),
-                now,
-                now,
+                payload["company"],
+                payload["activity_type"],
+                payload["contact_name"],
+                payload["subject"],
+                payload["outcome"],
+                payload["notes"],
+                payload["due_date"],
+                int(bool(payload["completed"])),
+                payload["created_at"],
+                payload["updated_at"],
             ),
         )
 
 
 def load_crm_activities(company: str, limit: int = 50) -> tuple[CrmActivity, ...]:
+    if supabase_enabled():
+        try:
+            rows = supabase_select(
+                "crm_activities",
+                {
+                    "select": "*",
+                    "company": f"eq.{company}",
+                    "order": "completed.asc,due_date.asc,created_at.desc",
+                    "limit": str(limit),
+                },
+            )
+            return tuple(
+                CrmActivity(
+                    id=int(row.get("id") or 0),
+                    company=str(row.get("company") or ""),
+                    activity_type=str(row.get("activity_type") or ""),
+                    contact_name=str(row.get("contact_name") or ""),
+                    subject=str(row.get("subject") or ""),
+                    outcome=str(row.get("outcome") or ""),
+                    notes=str(row.get("notes") or ""),
+                    due_date=str(row.get("due_date") or ""),
+                    completed=bool(row.get("completed", False)),
+                    created_at=str(row.get("created_at") or ""),
+                    updated_at=str(row.get("updated_at") or ""),
+                )
+                for row in rows
+            )
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase activity read failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         rows = connection.execute(
             """
@@ -843,6 +1115,16 @@ def load_crm_activities(company: str, limit: int = 50) -> tuple[CrmActivity, ...
 
 
 def update_crm_activity_completed(activity_id: int, completed: bool) -> None:
+    if supabase_enabled():
+        try:
+            supabase_patch(
+                "crm_activities",
+                activity_id,
+                {"completed": bool(completed), "updated_at": datetime.now().isoformat(timespec="seconds")},
+            )
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase activity update failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         connection.execute(
             """
@@ -855,6 +1137,12 @@ def update_crm_activity_completed(activity_id: int, completed: bool) -> None:
 
 
 def delete_crm_activity(activity_id: int) -> None:
+    if supabase_enabled():
+        try:
+            supabase_delete("crm_activities", activity_id)
+            return
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase activity delete failed, using SQLite fallback: {exc}")
     with db_connect() as connection:
         connection.execute("DELETE FROM crm_activities WHERE id = ?", (activity_id,))
 
@@ -3183,6 +3471,18 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.header("Storage")
+    storage_ready, storage_message = supabase_ping()
+    if storage_ready:
+        st.success("Using Supabase")
+    elif supabase_enabled():
+        st.warning("Supabase fallback")
+    else:
+        st.info("Using local SQLite")
+    st.caption(storage_message)
+    if st.session_state.get("storage_warning"):
+        st.warning(str(st.session_state["storage_warning"]))
+
     st.header("Lead Filters")
     lookback_days = st.slider("Days back", 7, 90, DEFAULT_LOOKBACK_DAYS)
     result_limit = st.slider("Max awards", 10, 200, 50, step=10)
@@ -4144,6 +4444,11 @@ with tabs[7]:
     st.write(
         "The Contact Readiness Gate scores each row by whether it has a named person, role relevance, source type, visible recency, and business contact data. "
         "Ready means the SDR can verify and add to cadence. Verify first means it is a research lead. Not ready means use manual LinkedIn research or a verified enrichment provider before outreach."
+    )
+    st.markdown("### Storage Backend")
+    st.write(
+        "CRM accounts, verified contacts, and activity history use Supabase when `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are configured and the Supabase schema has been created. "
+        "Without those secrets, Application 0 uses the local SQLite file as a fallback so development still works."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

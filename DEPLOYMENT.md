@@ -41,11 +41,23 @@ app.py
 
 7. Deploy.
 
-## 3. After Deploy
+## 3. Add Supabase Secrets
+
+Before sharing the app, open Supabase and run `supabase_schema.sql` in the SQL Editor. Then add these secrets in Streamlit Community Cloud app settings:
+
+```toml
+SUPABASE_URL = "https://your-project-ref.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
+```
+
+The deployed app will use Supabase for CRM accounts, verified contacts, and activity history when those secrets are configured. Without them, it falls back to local SQLite, which is not durable across cloud redeploys.
+
+## 4. After Deploy
 
 - Open the deployed Streamlit URL.
 - Test the default filters.
 - Confirm recent awards load.
+- Confirm the sidebar says `Using Supabase`.
 - Share the URL with SDR users.
 
 ## Troubleshooting

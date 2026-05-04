@@ -21,7 +21,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Shows "why now" triggers and recommended next best actions.
 - Generates a downloadable call-prep brief with account context, what they won, why they may have won, best contact path, pain points, objections, discovery questions, and GovDash demo angle.
 - Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, notes, and activity/task logging.
-- Persists CRM fields, verified contacts, and activity history in a local SQLite database (`application0_crm.sqlite3`).
+- Persists CRM fields, verified contacts, and activity history in Supabase when configured, with a local SQLite fallback (`application0_crm.sqlite3`).
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
 - Exports account radar, award-level records, public intel, and CRM-ready cadence CSVs.
 - Shows product gaps and recommended next upgrades such as verified enrichment, SAM.gov detail, durable CRM storage, and activity sync.
@@ -37,6 +37,15 @@ A Streamlit prototype for finding government contractors that recently won publi
 ```powershell
 & 'C:\Users\Aniya\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m streamlit run app.py
 ```
+
+## Supabase Storage
+
+1. Create a Supabase project.
+2. Open the Supabase SQL Editor and run `supabase_schema.sql`.
+3. Copy `streamlit-secrets.example.toml` into local `.streamlit/secrets.toml` or Streamlit Community Cloud secrets.
+4. Fill in `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
+
+When those two secrets are present and the schema exists, Application 0 uses Supabase for CRM accounts, verified contacts, and activity history. If Supabase is not configured, the app continues using local SQLite.
 
 ## Deploy
 

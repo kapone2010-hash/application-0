@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from html import escape
+from pathlib import Path
 from time import monotonic, sleep
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
@@ -15,6 +17,7 @@ import streamlit as st
 
 USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
+APP_DB_PATH = Path("application0_crm.sqlite3")
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
 SCAN_BUDGET_SECONDS = 28
@@ -85,6 +88,56 @@ def parse_source_datetime(value: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def db_connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(APP_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_database() -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crm_accounts (
+                company TEXT PRIMARY KEY,
+                status TEXT,
+                owner TEXT,
+                persona TEXT,
+                cadence_stage TEXT,
+                next_action TEXT,
+                next_step TEXT,
+                emailed INTEGER DEFAULT 0,
+                called INTEGER DEFAULT 0,
+                email_outcome TEXT,
+                call_outcome TEXT,
+                notes TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verified_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                title TEXT,
+                email TEXT,
+                phone TEXT,
+                linkedin_url TEXT,
+                source_url TEXT,
+                source_type TEXT,
+                verification_status TEXT,
+                verified_at TEXT,
+                notes TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_verified_contacts_company ON verified_contacts(company)")
 
 
 @dataclass(frozen=True)
@@ -242,6 +295,22 @@ class PublicContact:
     evidence: str
     confidence: int
     recommended_reason: str
+
+
+@dataclass(frozen=True)
+class VerifiedContact:
+    id: int
+    company: str
+    full_name: str
+    title: str
+    email: str
+    phone: str
+    linkedin_url: str
+    source_url: str
+    source_type: str
+    verification_status: str
+    verified_at: str
+    notes: str
 
 
 @dataclass(frozen=True)
@@ -448,6 +517,232 @@ def nested_field(row: dict, field: str, child: str) -> str:
     if isinstance(value, dict):
         return str(value.get(child) or "")
     return ""
+
+
+def load_crm_record(company: str) -> dict[str, object]:
+    with db_connect() as connection:
+        row = connection.execute("SELECT * FROM crm_accounts WHERE company = ?", (company,)).fetchone()
+    return dict(row) if row else {}
+
+
+def save_crm_record(company: str, crm: dict[str, object]) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO crm_accounts (
+                company, status, owner, persona, cadence_stage, next_action, next_step,
+                emailed, called, email_outcome, call_outcome, notes, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company) DO UPDATE SET
+                status = excluded.status,
+                owner = excluded.owner,
+                persona = excluded.persona,
+                cadence_stage = excluded.cadence_stage,
+                next_action = excluded.next_action,
+                next_step = excluded.next_step,
+                emailed = excluded.emailed,
+                called = excluded.called,
+                email_outcome = excluded.email_outcome,
+                call_outcome = excluded.call_outcome,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            """,
+            (
+                company,
+                str(crm.get("status", "New")),
+                str(crm.get("owner", "")),
+                str(crm.get("persona", "")),
+                str(crm.get("cadence_stage", "")),
+                str(crm.get("next_action", "")),
+                str(crm.get("next_step", "")),
+                int(bool(crm.get("emailed", False))),
+                int(bool(crm.get("called", False))),
+                str(crm.get("email_outcome", "")),
+                str(crm.get("call_outcome", "")),
+                str(crm.get("notes", "")),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+
+def save_verified_contact(
+    company: str,
+    full_name: str,
+    title: str,
+    email: str,
+    phone: str,
+    linkedin_url: str,
+    source_url: str,
+    source_type: str,
+    verification_status: str,
+    notes: str,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    values = (
+        company.strip(),
+        full_name.strip(),
+        title.strip(),
+        email.strip(),
+        phone.strip(),
+        linkedin_url.strip(),
+        source_url.strip(),
+        source_type.strip(),
+        verification_status.strip(),
+        now,
+        notes.strip(),
+        now,
+        now,
+    )
+    with db_connect() as connection:
+        existing = connection.execute(
+            """
+            SELECT id FROM verified_contacts
+            WHERE company = ?
+              AND lower(full_name) = lower(?)
+              AND lower(COALESCE(title, '')) = lower(?)
+              AND lower(COALESCE(email, '')) = lower(?)
+              AND COALESCE(linkedin_url, '') = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (values[0], values[1], values[2], values[3], values[5]),
+        ).fetchone()
+        if existing:
+            connection.execute(
+                """
+                UPDATE verified_contacts
+                SET phone = ?,
+                    source_url = ?,
+                    source_type = ?,
+                    verification_status = ?,
+                    verified_at = ?,
+                    notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (values[4], values[6], values[7], values[8], values[9], values[10], values[12], int(existing["id"])),
+            )
+            return
+        connection.execute(
+            """
+            INSERT INTO verified_contacts (
+                company, full_name, title, email, phone, linkedin_url, source_url, source_type,
+                verification_status, verified_at, notes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+
+def load_verified_contacts(company: str) -> tuple[VerifiedContact, ...]:
+    with db_connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM verified_contacts
+            WHERE company = ?
+            ORDER BY verified_at DESC, id DESC
+            """,
+            (company,),
+        ).fetchall()
+    return tuple(
+        VerifiedContact(
+            id=int(row["id"]),
+            company=str(row["company"] or ""),
+            full_name=str(row["full_name"] or ""),
+            title=str(row["title"] or ""),
+            email=str(row["email"] or ""),
+            phone=str(row["phone"] or ""),
+            linkedin_url=str(row["linkedin_url"] or ""),
+            source_url=str(row["source_url"] or ""),
+            source_type=str(row["source_type"] or ""),
+            verification_status=str(row["verification_status"] or ""),
+            verified_at=str(row["verified_at"] or ""),
+            notes=str(row["notes"] or ""),
+        )
+        for row in rows
+    )
+
+
+def delete_verified_contact(contact_id: int) -> None:
+    with db_connect() as connection:
+        connection.execute("DELETE FROM verified_contacts WHERE id = ?", (contact_id,))
+
+
+def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
+    source = contact.linkedin_url or contact.source_url
+    evidence = (
+        f"Verified contact saved in CRM on {contact.verified_at}. "
+        f"Status: {contact.verification_status}. Source type: {contact.source_type}. Notes: {contact.notes}"
+    )
+    return PublicContact(
+        full_name=contact.full_name,
+        title=contact.title or "Verified contact",
+        email=contact.email,
+        phone=contact.phone,
+        source_url=source,
+        evidence=evidence,
+        confidence=98 if contact.verification_status == "Verified current role" else 88,
+        recommended_reason="Saved as a verified contact for this account. Use after confirming fit for the selected persona.",
+    )
+
+
+def verified_contacts_dataframe(company: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ID": contact.id,
+                "Name": contact.full_name,
+                "Title": contact.title,
+                "Email": contact.email,
+                "Phone": contact.phone,
+                "LinkedIn URL": contact.linkedin_url,
+                "Source URL": contact.source_url,
+                "Status": contact.verification_status,
+                "Verified at": contact.verified_at,
+                "Notes": contact.notes,
+            }
+            for contact in load_verified_contacts(company)
+        ]
+    )
+
+
+def clean_import_value(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() == "nan" else text
+
+
+def import_verified_contacts_csv(uploaded_file: object, default_company: str) -> int:
+    df = pd.read_csv(uploaded_file)
+    normalized = {column.lower().strip(): column for column in df.columns}
+    count = 0
+    for _, row in df.iterrows():
+        company = clean_import_value(row.get(normalized.get("company", ""), "")) or default_company
+        full_name = clean_import_value(row.get(normalized.get("full_name", normalized.get("name", "")), ""))
+        if not company or not full_name:
+            continue
+        save_verified_contact(
+            company=company,
+            full_name=full_name,
+            title=clean_import_value(row.get(normalized.get("title", ""), "")),
+            email=clean_import_value(row.get(normalized.get("email", ""), "")),
+            phone=clean_import_value(row.get(normalized.get("phone", ""), "")),
+            linkedin_url=clean_import_value(row.get(normalized.get("linkedin_url", normalized.get("linkedin", "")), "")),
+            source_url=clean_import_value(row.get(normalized.get("source_url", normalized.get("source", "")), "")),
+            source_type=clean_import_value(row.get(normalized.get("source_type", ""), "")) or "CSV import",
+            verification_status=clean_import_value(row.get(normalized.get("verification_status", normalized.get("status", "")), "")) or "Imported for verification",
+            notes=clean_import_value(row.get(normalized.get("notes", ""), "")),
+        )
+        count += 1
+    return count
 
 
 def parse_prospect(row: dict) -> Prospect:
@@ -1471,6 +1766,18 @@ def contact_matches_role(contact: PublicContact, role: str) -> bool:
 
 def contact_source_age(contact: PublicContact) -> str:
     evidence = " ".join([contact.evidence, contact.source_url])
+    if "verified contact saved in crm" in evidence.lower():
+        match = re.search(r"\d{4}-\d{2}-\d{2}", evidence)
+        if match:
+            parsed_dt = parse_source_datetime(match.group(0))
+            if parsed_dt:
+                age_days = (date.today() - parsed_dt.date()).days
+                if age_days <= 180:
+                    return "Fresh"
+                if age_days <= 730:
+                    return "Aging"
+                return "Old"
+        return "Fresh"
     parsed = recency_hint(evidence)
     if parsed == "Verify date":
         return "Date not visible"
@@ -1490,6 +1797,11 @@ def contact_source_age(contact: PublicContact) -> str:
 def quality_for_contact(contact: PublicContact, target_role: str = "") -> ContactQuality:
     score = 0
     reasons: list[str] = []
+    is_verified = "verified contact saved in crm" in contact.evidence.lower()
+
+    if is_verified:
+        score += 35
+        reasons.append("Saved verified contact")
 
     if contact.full_name:
         score += 25
@@ -1534,7 +1846,10 @@ def quality_for_contact(contact: PublicContact, target_role: str = "") -> Contac
         reasons.append("Old source signal")
 
     score = max(0, min(score, 100))
-    if score >= 75 and contact.full_name:
+    if is_verified and score >= 75 and contact.full_name:
+        status = "Verified"
+        next_step = "Use in cadence; re-check role if the verified date is old."
+    elif score >= 75 and contact.full_name:
         status = "Ready to verify"
         next_step = "Open source link, confirm current role, then add to cadence."
     elif score >= 50:
@@ -1548,7 +1863,8 @@ def quality_for_contact(contact: PublicContact, target_role: str = "") -> Contac
 
 
 def contact_quality_summary(account: Account, intel: CompanyIntel | None = None) -> dict[str, object]:
-    if not isinstance(intel, CompanyIntel) or not intel.contacts:
+    verified_contacts = load_verified_contacts(account.company)
+    if (not isinstance(intel, CompanyIntel) or not intel.contacts) and not verified_contacts:
         return {
             "status": "No scanned contacts",
             "ready": 0,
@@ -1559,7 +1875,7 @@ def contact_quality_summary(account: Account, intel: CompanyIntel | None = None)
         }
 
     rows = people_to_contact_dataframe(account, intel)
-    ready = int((rows["Contact status"] == "Ready to verify").sum()) if "Contact status" in rows else 0
+    ready = int(rows["Contact status"].isin(["Verified", "Ready to verify"]).sum()) if "Contact status" in rows else 0
     verify = int((rows["Contact status"] == "Verify first").sum()) if "Contact status" in rows else 0
     not_ready = int((rows["Contact status"] == "Not ready").sum()) if "Contact status" in rows else 0
     best_score = int(pd.to_numeric(rows.get("Contact score", pd.Series([0])), errors="coerce").fillna(0).max()) if not rows.empty else 0
@@ -1639,7 +1955,9 @@ def best_contact_for_target(target: ContactTarget, contacts: tuple[PublicContact
 
 
 def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = None) -> pd.DataFrame:
-    contacts = intel.contacts if isinstance(intel, CompanyIntel) else tuple()
+    verified_contacts = tuple(verified_contact_to_public(contact) for contact in load_verified_contacts(account.company))
+    public_contacts = intel.contacts if isinstance(intel, CompanyIntel) else tuple()
+    contacts = (*verified_contacts, *public_contacts)
     rows = []
     for target in contact_targets(account):
         best = best_contact_for_target(target, contacts)
@@ -2217,16 +2535,17 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
     rows = []
     for account in accounts:
         key = f"crm_{account.company}"
-        crm = st.session_state.get(key, {})
+        crm = st.session_state.get(key, {}) or load_crm_record(account.company)
         intel = st.session_state.get(public_intel_key(account.company))
         best_public_contact = ""
         best_public_email = ""
         best_public_phone = ""
         best_public_source = ""
         best_row: dict[str, object] = {}
-        if isinstance(intel, CompanyIntel) and intel.contacts:
-            best_df = people_to_contact_dataframe(account, intel)
+        best_df = people_to_contact_dataframe(account, intel if isinstance(intel, CompanyIntel) else None)
+        if not best_df.empty:
             best_row = best_df.iloc[0].to_dict() if not best_df.empty else {}
+        if isinstance(intel, CompanyIntel) and intel.contacts:
             best = intel.contacts[0]
             best_public_contact = best.full_name or best.title
             best_public_email = best.email
@@ -2249,13 +2568,13 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Primary persona": crm.get("persona", suggested_personas(account.primary)[0]),
                 "Best contact target": contact_targets(account)[0].title,
                 "Why this contact": contact_targets(account)[0].why,
-                "Best public contact": best_row.get("Best known person", best_public_contact) if isinstance(intel, CompanyIntel) else best_public_contact,
-                "Best public email": best_public_email,
-                "Best public phone": best_public_phone,
-                "Best public source": best_row.get("Source / search URL", best_public_source) if isinstance(intel, CompanyIntel) else best_public_source,
-                "Contact readiness": best_row.get("Contact status", "") if isinstance(intel, CompanyIntel) else "",
-                "Contact score": best_row.get("Contact score", "") if isinstance(intel, CompanyIntel) else "",
-                "Contact verification next step": best_row.get("Verification next step", "") if isinstance(intel, CompanyIntel) else "",
+                "Best public contact": best_row.get("Best known person", best_public_contact),
+                "Best public email": best_row.get("Email", best_public_email),
+                "Best public phone": best_row.get("Phone", best_public_phone),
+                "Best public source": best_row.get("Source / search URL", best_public_source),
+                "Contact readiness": best_row.get("Contact status", ""),
+                "Contact score": best_row.get("Contact score", ""),
+                "Contact verification next step": best_row.get("Verification next step", ""),
                 "Notes": crm.get("notes", ""),
                 "Award": account.primary.award_id,
                 "Amount": money(account.primary.amount),
@@ -2326,6 +2645,7 @@ st.set_page_config(
     page_icon="0",
     layout="wide",
 )
+init_database()
 
 st.markdown(
     """
@@ -2879,6 +3199,76 @@ with tabs[2]:
             link_cols[2].link_button("Email pattern search", search_url(f'"{selected_contact_account.company}" email {target.title}'))
 
         st.markdown("### Actual People To Contact")
+        st.markdown("### Verified Contact Storage")
+        st.caption("Use this for Apollo/ZoomInfo/Hunter/Clay exports or manually verified LinkedIn/business contacts. These records persist in the app database and outrank public web guesses.")
+        verified_df = verified_contacts_dataframe(selected_contact_account.company)
+        if not verified_df.empty:
+            dataframe_with_links(verified_df, width="stretch", hide_index=True)
+            delete_options = {
+                f"{row['Name']} | {row['Title']} | ID {row['ID']}": int(row["ID"])
+                for _, row in verified_df.iterrows()
+            }
+            delete_choice = st.selectbox("Remove saved contact", [""] + list(delete_options.keys()), key=f"delete_verified_{selected_contact_account.company}")
+            if delete_choice and st.button("Delete selected verified contact", key=f"delete_verified_btn_{selected_contact_account.company}"):
+                delete_verified_contact(delete_options[delete_choice])
+                st.success("Verified contact removed.")
+                st.rerun()
+        else:
+            st.info("No verified contacts saved for this account yet.")
+
+        with st.form(f"verified_contact_form_{selected_contact_account.company}"):
+            form_cols = st.columns(2)
+            verified_name = form_cols[0].text_input("Full name")
+            verified_title = form_cols[1].text_input("Current title")
+            contact_cols = st.columns(2)
+            verified_email = contact_cols[0].text_input("Verified business email")
+            verified_phone = contact_cols[1].text_input("Verified business phone")
+            link_cols = st.columns(2)
+            verified_linkedin = link_cols[0].text_input("LinkedIn URL")
+            verified_source = link_cols[1].text_input("Verification source URL")
+            status_cols = st.columns(2)
+            verified_status = status_cols[0].selectbox(
+                "Verification status",
+                ["Verified current role", "Imported for verification", "Needs recheck", "Do not sequence"],
+            )
+            verified_source_type = status_cols[1].selectbox(
+                "Source type",
+                ["Manual verification", "Apollo", "ZoomInfo", "Hunter", "Clay", "People Data Labs", "Clearbit", "LinkedIn", "Other"],
+            )
+            verified_notes = st.text_area("Verification notes", placeholder="Where did this come from? What did you verify?")
+            submitted_verified = st.form_submit_button("Save verified contact")
+            if submitted_verified:
+                if verified_name.strip():
+                    save_verified_contact(
+                        selected_contact_account.company,
+                        verified_name,
+                        verified_title,
+                        verified_email,
+                        verified_phone,
+                        verified_linkedin,
+                        verified_source,
+                        verified_source_type,
+                        verified_status,
+                        verified_notes,
+                    )
+                    st.success("Verified contact saved.")
+                    st.rerun()
+                else:
+                    st.error("Full name is required to save a verified contact.")
+
+        uploaded_contacts = st.file_uploader(
+            "Import verified contacts CSV",
+            type=["csv"],
+            key=f"verified_upload_{selected_contact_account.company}",
+            help="Accepted columns: company, full_name/name, title, email, phone, linkedin_url/linkedin, source_url/source, source_type, verification_status/status, notes.",
+        )
+        if uploaded_contacts is not None:
+            try:
+                imported = import_verified_contacts_csv(uploaded_contacts, selected_contact_account.company)
+                st.success(f"Imported {imported} verified contact(s). Refresh or change tabs to see the updated saved-contact table.")
+            except Exception as exc:
+                st.error(f"Could not import contacts: {exc}")
+
         contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         if st.button("Scan public sources for actual contacts", key=f"contact_scan_{selected_contact_account.company}"):
             with st.spinner("Searching public pages for named contacts, emails, and phone numbers..."):
@@ -2995,7 +3385,7 @@ with tabs[3]:
         with overview_cols[1]:
             st.markdown("### CRM Fields")
             crm_key = f"crm_{selected_account.company}"
-            current = st.session_state.get(crm_key, {})
+            current = st.session_state.get(crm_key, {}) or load_crm_record(selected_account.company)
             status_default = current.get("status", "New")
             status_index = DEFAULT_STATUSES.index(status_default) if status_default in DEFAULT_STATUSES else 0
             status = st.selectbox("Status", DEFAULT_STATUSES, index=status_index)
@@ -3049,6 +3439,8 @@ with tabs[3]:
                 "call_outcome": call_outcome,
                 "notes": notes,
             }
+            save_crm_record(selected_account.company, st.session_state[crm_key])
+            st.caption("CRM fields are saved to the local Application 0 database.")
 
             st.markdown("### Public Contact Research")
             links = public_links(selected)

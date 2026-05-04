@@ -2589,6 +2589,26 @@ def suggested_hubspot_domain(
     return "", "not found yet"
 
 
+def resolve_hubspot_domain(
+    account: Account,
+    intel: CompanyIntel | None,
+    verified_contacts: tuple[VerifiedContact, ...],
+    manual_domain: str = "",
+    allow_public_search: bool = False,
+) -> tuple[str, str, str]:
+    manual = clean_company_domain(manual_domain)
+    if manual:
+        return manual, "manual override", ""
+    suggested_domain, suggested_source = suggested_hubspot_domain(account, intel, verified_contacts)
+    if suggested_domain:
+        return suggested_domain, suggested_source, ""
+    if allow_public_search:
+        discovered_domain, discovered_website = discover_company_domain_from_web(account.company)
+        if discovered_domain:
+            return discovered_domain, "public website search", discovered_website
+    return "", "not found yet", ""
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def search_linkedin_web(query: str, max_results: int = 5) -> tuple[WebSearchResult, ...]:
     return search_web_results(
@@ -5627,10 +5647,12 @@ with tabs[2]:
             st.info("No verified contacts saved for this account yet.")
 
         st.markdown("### HubSpot Sync")
-        st.caption("One click syncs the active company and every verified contact with an email to HubSpot. Notes and tasks stay in Application 0/Supabase until those HubSpot scopes are available.")
+        st.caption(
+            "One click auto-detects the company domain, checks HubSpot for duplicates, and syncs the active company plus every verified contact with an email."
+        )
         hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
-        hubspot_domain, hubspot_domain_source = suggested_hubspot_domain(
+        hubspot_domain, hubspot_domain_source, _ = resolve_hubspot_domain(
             selected_contact_account,
             hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
             verified_contacts_for_sync,
@@ -5640,27 +5662,15 @@ with tabs[2]:
             st.session_state[hubspot_domain_key] = hubspot_domain
         elif hubspot_domain and not st.session_state.get(hubspot_domain_key):
             st.session_state[hubspot_domain_key] = hubspot_domain
-        hubspot_cols = st.columns([0.34, 0.33, 0.33])
-        hubspot_domain_input = hubspot_cols[0].text_input(
-            "HubSpot company domain",
-            placeholder="example.com",
-            key=hubspot_domain_key,
+        hubspot_cols = st.columns([0.58, 0.42])
+        hubspot_cols[0].caption(
+            f"Auto domain: {hubspot_domain or 'will search on click'}"
+            f" | Source: {hubspot_domain_source if hubspot_domain else 'public website search'}"
+            " | Duplicate check: automatic"
         )
-        hubspot_cols[0].caption(f"Suggested from: {hubspot_domain_source}" if hubspot_domain else "If blank, the sync button will search public web for the company site.")
-        if hubspot_cols[2].button(
-            "Check HubSpot duplicates",
-            key=f"check_hubspot_duplicates_{selected_contact_account.company}",
-            disabled=not hubspot_enabled(),
-            use_container_width=True,
-        ):
-            try:
-                hs_matches = hubspot_company_matches(selected_contact_account.company, hubspot_domain_input, limit=5)
-                st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = hs_matches
-            except requests.RequestException as exc:
-                st.error(f"HubSpot duplicate check failed: {exc}")
         hs_matches = st.session_state.get(f"hubspot_duplicate_matches_{selected_contact_account.company}", [])
         if isinstance(hs_matches, list) and hs_matches:
-            st.caption("HubSpot duplicate check results. The sync button will update exact domain/name matches and block likely fuzzy duplicates for review.")
+            st.caption("Latest automatic HubSpot duplicate-check results. Exact matches update; likely fuzzy duplicates are blocked for review.")
             dataframe_with_links(hubspot_company_matches_dataframe(hs_matches), width="stretch", hide_index=True)
         if hubspot_cols[1].button(
             "Sync company + contacts",
@@ -5668,19 +5678,30 @@ with tabs[2]:
             disabled=not hubspot_enabled(),
             use_container_width=True,
         ):
-            resolved_domain = clean_company_domain(hubspot_domain_input)
-            if not resolved_domain:
-                with st.spinner("Finding likely company domain from public sources..."):
-                    resolved_domain, discovered_website = discover_company_domain_from_web(selected_contact_account.company)
+            with st.spinner("Auto-detecting company domain, checking HubSpot duplicates, and syncing..."):
+                resolved_domain, resolved_source, discovered_website = resolve_hubspot_domain(
+                    selected_contact_account,
+                    hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
+                    verified_contacts_for_sync,
+                    allow_public_search=True,
+                )
                 if resolved_domain:
                     st.session_state[hubspot_domain_key] = resolved_domain
-                    if not isinstance(hubspot_intel, CompanyIntel) and discovered_website:
-                        st.caption(f"Found likely company website: {discovered_website}")
+                if discovered_website:
+                    st.caption(f"Found likely company website: {discovered_website}")
+                try:
+                    st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = hubspot_company_matches(
+                        selected_contact_account.company,
+                        resolved_domain,
+                        limit=5,
+                    )
+                except requests.RequestException as exc:
+                    st.warning(f"HubSpot duplicate check could not complete before sync: {exc}")
             company_id, message = hubspot_upsert_company(selected_contact_account, resolved_domain)
             if company_id:
                 st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
                 synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(verified_contacts_for_sync, company_id)
-                sync_summary = f"{message} Company ID: {company_id}. Synced {synced_count} contact(s)"
+                sync_summary = f"{message} Domain source: {resolved_source}. Company ID: {company_id}. Synced {synced_count} contact(s)"
                 if skipped_count:
                     sync_summary += f"; skipped {skipped_count} without email"
                 st.success(sync_summary + ".")
@@ -5694,7 +5715,7 @@ with tabs[2]:
                 else:
                     st.error(message)
         hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
-        hubspot_cols[2].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
+        hubspot_cols[0].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
         if not hubspot_enabled():
             st.warning("Add HUBSPOT_ACCESS_TOKEN to Streamlit secrets to enable HubSpot sync.")
         if verified_contacts_for_sync:
@@ -5718,7 +5739,13 @@ with tabs[2]:
                     st.error("Could not find selected verified contact.")
                 else:
                     if not hubspot_company_id:
-                        hubspot_company_id, _ = hubspot_upsert_company(selected_contact_account, hubspot_domain_input)
+                        resolved_domain, _, _ = resolve_hubspot_domain(
+                            selected_contact_account,
+                            hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
+                            verified_contacts_for_sync,
+                            allow_public_search=True,
+                        )
+                        hubspot_company_id, _ = hubspot_upsert_company(selected_contact_account, resolved_domain)
                         if hubspot_company_id:
                             st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = hubspot_company_id
                     synced_contact_id, message = hubspot_upsert_contact(contact, str(hubspot_company_id or ""))
@@ -6185,7 +6212,7 @@ with tabs[4]:
                 st.success(str(activity_flash))
 
         crm_verified_contacts = load_verified_contacts(selected_account.company)
-        activity_hubspot_domain, activity_hubspot_domain_source = suggested_hubspot_domain(
+        activity_hubspot_domain, activity_hubspot_domain_source, _ = resolve_hubspot_domain(
             selected_account,
             crm_intel if isinstance(crm_intel, CompanyIntel) else None,
             crm_verified_contacts,
@@ -6196,15 +6223,12 @@ with tabs[4]:
         elif activity_hubspot_domain and not st.session_state.get(activity_domain_key):
             st.session_state[activity_domain_key] = activity_hubspot_domain
 
-        hubspot_activity_cols = st.columns([0.38, 0.62])
-        hubspot_activity_domain = hubspot_activity_cols[0].text_input(
-            "HubSpot activity company domain",
-            placeholder="example.com",
-            key=activity_domain_key,
-        )
-        hubspot_activity_cols[1].caption(
+        hubspot_activity_cols = st.columns([1])
+        hubspot_activity_domain = st.session_state.get(activity_domain_key, activity_hubspot_domain)
+        hubspot_activity_cols[0].caption(
             f"HubSpot activity sync is {'ready' if hubspot_enabled() else 'disabled until HUBSPOT_ACCESS_TOKEN is configured'}. "
-            f"Domain suggestion: {activity_hubspot_domain_source if activity_hubspot_domain else 'public search fallback'}."
+            f"Auto domain: {hubspot_activity_domain or 'will search on click'}"
+            f" | Source: {activity_hubspot_domain_source if activity_hubspot_domain else 'public website search'}."
         )
 
         verified_names = [contact.full_name for contact in crm_verified_contacts if contact.full_name]
@@ -6252,7 +6276,13 @@ with tabs[4]:
         ):
             saved_count = save_cadence_activities(cadence_activities)
             if sync_cadence_to_hubspot:
-                synced_count, sync_errors = hubspot_sync_cadence(selected_account, cadence_activities, hubspot_activity_domain)
+                resolved_activity_domain, _, _ = resolve_hubspot_domain(
+                    selected_account,
+                    crm_intel if isinstance(crm_intel, CompanyIntel) else None,
+                    crm_verified_contacts,
+                    allow_public_search=True,
+                )
+                synced_count, sync_errors = hubspot_sync_cadence(selected_account, cadence_activities, resolved_activity_domain)
                 if sync_errors:
                     st.session_state[activity_flash_key] = (
                         f"HubSpot warning: Created {saved_count} Application 0 cadence activities and {synced_count} HubSpot task(s). "
@@ -6311,7 +6341,16 @@ with tabs[4]:
                 if selected_activity is None:
                     st.error("Could not find selected activity.")
                 else:
-                    synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, hubspot_activity_domain)
+                    if not hubspot_activity_domain:
+                        resolved_activity_domain, _, _ = resolve_hubspot_domain(
+                            selected_account,
+                            crm_intel if isinstance(crm_intel, CompanyIntel) else None,
+                            crm_verified_contacts,
+                            allow_public_search=True,
+                        )
+                        synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, resolved_activity_domain)
+                    else:
+                        synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, hubspot_activity_domain)
                     if synced_id:
                         st.success(sync_message)
                     else:
@@ -6358,7 +6397,16 @@ with tabs[4]:
                         created_at=datetime.now().isoformat(timespec="seconds"),
                         updated_at=datetime.now().isoformat(timespec="seconds"),
                     )
-                    synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, hubspot_activity_domain)
+                    if not hubspot_activity_domain:
+                        resolved_activity_domain, _, _ = resolve_hubspot_domain(
+                            selected_account,
+                            crm_intel if isinstance(crm_intel, CompanyIntel) else None,
+                            crm_verified_contacts,
+                            allow_public_search=True,
+                        )
+                        synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, resolved_activity_domain)
+                    else:
+                        synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, hubspot_activity_domain)
                     if synced_id:
                         st.session_state[activity_flash_key] = f"Activity saved and synced to HubSpot. {sync_message}"
                     else:
@@ -6569,8 +6617,8 @@ with tabs[7]:
     st.markdown("### HubSpot Sync")
     st.write(
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
-        "The company domain is pre-filled from company intel or verified-contact email domains, then falls back to public website search if needed. "
-        "Before creating a HubSpot company, the app checks domain, exact name, and fuzzy name-token matches so likely duplicates are blocked for review. "
+        "No domain typing or separate duplicate-check button is needed: the app auto-detects the company domain from company intel, verified-contact email domains, or public website search when the SDR clicks sync. "
+        "During the same click, the app checks HubSpot by domain, exact name, and fuzzy name-token matches so exact matches update and likely duplicates are blocked for review. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."

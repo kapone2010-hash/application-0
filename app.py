@@ -4503,6 +4503,235 @@ def account_brief_markdown(
     return "\n".join(str(line) for line in lines).strip() + "\n"
 
 
+def pursuit_package_dataframe(result: dict[str, object]) -> pd.DataFrame:
+    rows = result.get("steps")
+    if not isinstance(rows, list):
+        rows = []
+    return pd.DataFrame(
+        [
+            {
+                "Step": str(row.get("step", "")) if isinstance(row, dict) else "",
+                "Status": str(row.get("status", "")) if isinstance(row, dict) else "",
+                "Result": str(row.get("result", "")) if isinstance(row, dict) else "",
+                "Next action": str(row.get("next_action", "")) if isinstance(row, dict) else "",
+            }
+            for row in rows
+        ]
+    )
+
+
+def build_full_pursuit_package(account: Account, sync_to_hubspot: bool = True) -> dict[str, object]:
+    steps: list[dict[str, str]] = []
+    started_at = datetime.now().isoformat(timespec="seconds")
+
+    def add_step(step: str, status: str, result: str, next_action: str = "") -> None:
+        steps.append(
+            {
+                "step": step,
+                "status": status,
+                "result": result,
+                "next_action": next_action,
+            }
+        )
+
+    intel: CompanyIntel | None = None
+    sam_opportunities: tuple[SamOpportunity, ...] = tuple()
+    domain = ""
+    domain_source = "not found yet"
+    duplicate_matches: list[dict[str, str]] = []
+    company_id = ""
+    company_message = "HubSpot sync not requested."
+    synced_count = 0
+    skipped_count = 0
+    imported_count = 0
+    sync_errors: list[str] = []
+    enrichment_messages: list[str] = []
+
+    try:
+        intel = enrich_account(account)
+        st.session_state[public_intel_key(account.company)] = intel
+        add_step(
+            "Public Intel",
+            "Complete",
+            f"Scanned {len(intel.scanned_urls)} page(s), found {len(intel.contacts)} public contact candidate(s), {len(intel.pain_points)} pain signal(s), and {len(intel.account_signals)} call signal(s).",
+            "Use the source audit trail before sequencing.",
+        )
+    except Exception as exc:
+        add_step("Public Intel", "Needs review", f"Public scan failed: {exc}", "Run Public Intel manually or broaden the filters.")
+
+    if sam_enabled():
+        try:
+            sam_opportunities, sam_message = fetch_sam_opportunities(account)
+            st.session_state[sam_intel_key(account.company)] = sam_opportunities
+            st.session_state[sam_message_key(account.company)] = sam_message
+            add_step("SAM.gov", "Complete", sam_message, "Use SAM notice context for procurement details, not as contractor contact data.")
+        except Exception as exc:
+            add_step("SAM.gov", "Needs review", f"SAM.gov enrichment failed: {exc}", "Try SAM.gov enrichment again from Public Intel.")
+    else:
+        add_step("SAM.gov", "Skipped", "SAM_API_KEY is not configured.", "Add SAM_API_KEY when notice-level context is needed.")
+
+    verified_contacts = load_verified_contacts(account.company)
+    domain, domain_source, discovered_website = resolve_hubspot_domain(account, intel, verified_contacts, allow_public_search=True)
+    domain_result = domain or "No domain found"
+    if discovered_website:
+        domain_result += f" via {discovered_website}"
+    add_step(
+        "Domain",
+        "Complete" if domain else "Needs review",
+        f"{domain_result}. Source: {domain_source}.",
+        "Confirm official domain before heavy HubSpot dedupe work." if not domain else "Use this domain for duplicate checks and enrichment.",
+    )
+
+    contacts_to_sync, enrichment_messages, imported_count = auto_import_hunter_contacts_for_hubspot(account, domain, verified_contacts)
+    st.session_state[f"hunter_message_{account.company}"] = " ".join(enrichment_messages)
+    if imported_count:
+        add_step(
+            "Hunter",
+            "Complete",
+            f"Auto-imported {imported_count} email-ready contact(s). {' '.join(enrichment_messages[:2])}",
+            "Review imported contacts before broad sequencing.",
+        )
+    elif email_ready_contacts(contacts_to_sync):
+        add_step(
+            "Hunter",
+            "Ready",
+            f"{len(email_ready_contacts(contacts_to_sync))} saved email-ready contact(s) already available.",
+            "Use saved contacts for HubSpot sync and cadence.",
+        )
+    else:
+        add_step(
+            "Hunter",
+            "Needs review",
+            " ".join(enrichment_messages) or "No email-ready contacts found.",
+            "Run Hunter manually or save a verified contact with a business email.",
+        )
+
+    if hubspot_enabled():
+        try:
+            duplicate_matches = hubspot_company_matches(account.company, domain, limit=5)
+            st.session_state[f"hubspot_duplicate_matches_{account.company}"] = duplicate_matches
+            add_step(
+                "HubSpot duplicate check",
+                "Complete",
+                summarize_hubspot_matches(duplicate_matches),
+                "Review fuzzy matches before adding activity under a new company." if duplicate_matches else "No duplicate action needed from this run.",
+            )
+        except requests.RequestException as exc:
+            add_step("HubSpot duplicate check", "Needs review", f"Duplicate check failed: {exc}", "Check HubSpot token/scopes and try again.")
+    else:
+        add_step("HubSpot duplicate check", "Skipped", "HUBSPOT_ACCESS_TOKEN is not configured.", "Add HubSpot token to sync companies and contacts.")
+
+    if sync_to_hubspot and hubspot_enabled():
+        company_id, company_message = hubspot_upsert_company(account, domain)
+        if company_id:
+            st.session_state[f"hubspot_company_id_{account.company}"] = company_id
+            synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(contacts_to_sync, company_id)
+            add_step(
+                "HubSpot sync",
+                "Complete" if not sync_errors else "Partial",
+                f"{company_message} Company ID: {company_id}. Synced {synced_count} contact(s); skipped {skipped_count}.",
+                "Open HubSpot and confirm company/contact associations." if synced_count else "Add or enrich at least one email-ready contact.",
+            )
+        else:
+            sync_errors.append(company_message)
+            add_step("HubSpot sync", "Blocked", company_message, "Review duplicate warning or HubSpot API permissions.")
+    elif sync_to_hubspot:
+        add_step("HubSpot sync", "Skipped", "HubSpot is not configured.", "Add HUBSPOT_ACCESS_TOKEN to enable one-click company/contact sync.")
+    else:
+        add_step("HubSpot sync", "Skipped", "HubSpot sync option was turned off for this package run.", "Use Contact Finder sync when ready.")
+
+    best_contact = best_contact_summary(account, intel)
+    cadence_contact = str(best_contact.get("name") or "")
+    if cadence_contact.lower() in {"research needed", "vp/director of business development", "capture manager", "proposal manager"}:
+        email_contacts = email_ready_contacts(contacts_to_sync)
+        cadence_contact = email_contacts[0].full_name if email_contacts and email_contacts[0].full_name else cadence_contact
+    cadence_preview = build_cadence_activities(account, cadence_contact, date.today())
+    add_step(
+        "Cadence prep",
+        "Complete",
+        f"Prepared {len(cadence_preview)} recommended follow-up step(s) for {cadence_contact or 'the selected account'}.",
+        "Launch the cadence from CRM Cadence after contact verification passes.",
+    )
+
+    brief_markdown = account_brief_markdown(account, intel, sam_opportunities)
+    add_step(
+        "Account Brief",
+        "Complete",
+        "Generated SDR-ready account research brief.",
+        "Download the brief or use the Account Brief tab for live review.",
+    )
+
+    sync_result = {
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "company": account.company,
+        "company_id": company_id,
+        "company_message": company_message,
+        "domain": domain,
+        "domain_source": domain_source,
+        "domain_action": "Use this domain for future duplicate checks." if domain else "Confirm the official company domain.",
+        "duplicate_summary": summarize_hubspot_matches(duplicate_matches),
+        "duplicate_action": "Review likely duplicate company records before heavy sequencing." if duplicate_matches else "No duplicate review needed from this run.",
+        "contacts_before_count": len(verified_contacts),
+        "email_ready_before": len(email_ready_contacts(verified_contacts)),
+        "contacts_after_count": len(contacts_to_sync),
+        "imported_count": imported_count,
+        "synced_count": synced_count,
+        "skipped_count": skipped_count,
+        "enrichment_messages": enrichment_messages,
+        "errors": sync_errors,
+        "contact_reason": f"Ended with {len(contacts_to_sync)} saved contact(s), {len(email_ready_contacts(contacts_to_sync))} email-ready.",
+        "contact_action": "Open HubSpot and start the cadence for synced contacts." if synced_count else "Save or enrich at least one contact with a business email, then sync again.",
+        "company_action": "Use this company record for contacts, notes, calls, and cadence tasks." if company_id else "Review company sync before adding activities.",
+    }
+    st.session_state[hubspot_sync_result_key(account.company)] = sync_result
+
+    result = {
+        "company": account.company,
+        "started_at": started_at,
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "steps": steps,
+        "intel": intel,
+        "sam_opportunities": sam_opportunities,
+        "domain": domain,
+        "domain_source": domain_source,
+        "duplicate_matches": duplicate_matches,
+        "contacts_to_sync": contacts_to_sync,
+        "cadence_preview": cadence_preview,
+        "brief_markdown": brief_markdown,
+        "hubspot_sync_result": sync_result,
+        "ready_score": int(account_fit_assessment(account, intel)["score"]),
+        "next_move": str(account_fit_assessment(account, intel)["next_move"]),
+    }
+    st.session_state[pursuit_package_key(account.company)] = result
+    return result
+
+
+def render_pursuit_package_result(result: dict[str, object]) -> None:
+    st.markdown("### Full Pursuit Package Results")
+    st.caption(f"Started: {result.get('started_at', '')} | Completed: {result.get('completed_at', '')}")
+    package_metrics = st.columns(4)
+    package_metrics[0].metric("Readiness score", int(result.get("ready_score") or 0))
+    package_metrics[1].metric("Domain", str(result.get("domain") or "Not found"))
+    contacts = result.get("contacts_to_sync")
+    package_metrics[2].metric("Saved contacts", len(contacts) if isinstance(contacts, tuple) else 0)
+    cadence = result.get("cadence_preview")
+    package_metrics[3].metric("Cadence steps", len(cadence) if isinstance(cadence, tuple) else 0)
+    dataframe_with_links(pursuit_package_dataframe(result), width="stretch", hide_index=True)
+    st.markdown(f'<div class="score-card"><b>Next move</b>{html_escape(str(result.get("next_move", "")))}</div>', unsafe_allow_html=True)
+    if isinstance(cadence, tuple) and cadence:
+        with st.expander("Cadence preview", expanded=False):
+            dataframe_with_links(cadence_preview_dataframe(cadence), width="stretch", hide_index=True)
+    brief_markdown = str(result.get("brief_markdown") or "")
+    if brief_markdown:
+        st.download_button(
+            "Download generated pursuit package brief",
+            data=brief_markdown,
+            file_name=f"{str(result.get('company', 'account')).lower().replace(' ', '-')}-full-pursuit-package.md",
+            mime="text/markdown",
+            key=f"download_pursuit_package_{result.get('company', 'account')}",
+        )
+
+
 def product_gap_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -4642,6 +4871,10 @@ def sam_intel_key(company: str) -> str:
 
 def sam_message_key(company: str) -> str:
     return f"sam_message_{company}"
+
+
+def pursuit_package_key(company: str) -> str:
+    return f"pursuit_package_{company}"
 
 
 def scan_budget_available(started_at: float) -> bool:
@@ -6988,6 +7221,30 @@ with tabs[7]:
         assessment_brief = brief["assessment"]
 
         st.caption(f"Using active company: {selected_brief_account.company}")
+        package_key = pursuit_package_key(selected_brief_account.company)
+        package_cols = st.columns([0.48, 0.2, 0.32])
+        package_cols[0].caption(
+            "Create the complete SDR pursuit package from one click: public intel, SAM.gov, Hunter, HubSpot duplicate/sync, brief, and cadence prep."
+        )
+        package_sync_hubspot = package_cols[1].checkbox(
+            "Sync HubSpot",
+            value=hubspot_enabled(),
+            disabled=not hubspot_enabled(),
+            key=f"package_sync_hubspot_{selected_brief_account.company}",
+        )
+        if package_cols[2].button(
+            "Create Full Pursuit Package",
+            key=f"create_pursuit_package_{selected_brief_account.company}",
+            use_container_width=True,
+        ):
+            with st.spinner("Creating full pursuit package..."):
+                build_full_pursuit_package(selected_brief_account, package_sync_hubspot)
+            st.rerun()
+
+        existing_package = st.session_state.get(package_key)
+        if isinstance(existing_package, dict):
+            render_pursuit_package_result(existing_package)
+
         st.markdown(
             f"""
             <div class="prospect-card">
@@ -7174,7 +7431,7 @@ with tabs[8]:
     st.write(
         "The Account Brief tab packages the active company into one SDR-ready brief: executive summary, company research, contract trigger, best contact, "
         "pain points to validate, call intel, GovDash demo angle, CRM state, trust gaps, sources, and a downloadable markdown version. "
-        "Run Public Intel, SAM.gov enrichment, Hunter enrichment, and HubSpot sync first when you want the strongest brief."
+        "The Create Full Pursuit Package button can run Public Intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, brief generation, and cadence prep from one workflow."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

@@ -30,6 +30,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, notes, and activity/task logging.
 - Persists CRM fields, verified contacts, and activity history in Supabase when configured, with a local SQLite fallback (`application0_crm.sqlite3`).
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
+- Creates a one-click full pursuit package that runs public intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, account brief generation, and cadence prep for the active company.
 - Exports account radar, award-level records, public intel, and CRM-ready cadence CSVs.
 - Shows product gaps and recommended next upgrades such as verified enrichment, SAM.gov detail, durable CRM storage, and activity sync.
 

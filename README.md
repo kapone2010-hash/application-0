@@ -13,12 +13,14 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
+- Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
 - Shows "why now" triggers and recommended next best actions.
 - Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, and notes.
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
 - Exports account radar, award-level records, public intel, and CRM-ready cadence CSVs.
+- Shows product gaps and recommended next upgrades such as verified enrichment, SAM.gov detail, durable CRM storage, and activity sync.
 
 ## Setup
 
@@ -43,5 +45,7 @@ The current prototype uses USAspending because the public API does not require a
 Freshness labels are based on the newest matching USAspending modification: `Current` is within 7 days, `Aging` is 8 to 14 days, `Stale` is more than 14 days, and `No matching data` means the API responded but the filters found no records.
 
 Public award data usually does not include verified direct emails or phone numbers. The app now performs a best-effort public web scan and records source URLs for any names, emails, phone numbers, LinkedIn result signals, announcements, interviews, podcasts, pain evidence, and other call-intel triggers it finds. It does not bypass LinkedIn login, other logins, or paywalls, and SDRs should verify each contact and pain point before outreach.
+
+The contact list uses a readiness gate. `Ready to verify` means there is a named, relevant contact with enough source evidence for an SDR to manually confirm. `Verify first` means it is a research lead. `Not ready` means the app did not find enough public evidence and the SDR should use manual LinkedIn research or a verified enrichment provider before sequencing.
 
 SAM.gov Contract Awards can be added later with a SAM.gov public API key for deeper award records. Verified enrichment vendors such as CRM/contact-data providers can also be connected later if you want higher-confidence direct dials and emails.

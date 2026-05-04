@@ -279,6 +279,16 @@ class SourceFreshness:
 
 
 @dataclass(frozen=True)
+class ContactQuality:
+    status: str
+    score: int
+    relevance: str
+    freshness: str
+    next_step: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PainPoint:
     industry: str
     pain_point: str
@@ -1459,6 +1469,168 @@ def contact_matches_role(contact: PublicContact, role: str) -> bool:
     return any(alias in haystack for alias in aliases)
 
 
+def contact_source_age(contact: PublicContact) -> str:
+    evidence = " ".join([contact.evidence, contact.source_url])
+    parsed = recency_hint(evidence)
+    if parsed == "Verify date":
+        return "Date not visible"
+    parsed_dt = parse_source_datetime(parsed)
+    if parsed_dt:
+        age_days = (date.today() - parsed_dt.date()).days
+        if age_days <= 180:
+            return "Fresh"
+        if age_days <= 730:
+            return "Aging"
+        return "Old"
+    if parsed in {"Recent wording"}:
+        return "Likely recent"
+    return parsed
+
+
+def quality_for_contact(contact: PublicContact, target_role: str = "") -> ContactQuality:
+    score = 0
+    reasons: list[str] = []
+
+    if contact.full_name:
+        score += 25
+        reasons.append("Named person found")
+    else:
+        reasons.append("No named person")
+
+    if target_role and contact_matches_role(contact, target_role):
+        score += 25
+        relevance = "Role match"
+        reasons.append("Matches target role")
+    elif any(keyword in " ".join([contact.title, contact.evidence]).lower() for keyword in CONTACT_TITLE_KEYWORDS):
+        score += 15
+        relevance = "Relevant govcon/persona signal"
+        reasons.append("Relevant persona terms found")
+    else:
+        relevance = "Weak role signal"
+        reasons.append("Weak role match")
+
+    if contact.email:
+        score += 15
+        reasons.append("Business email found")
+    if contact.phone:
+        score += 10
+        reasons.append("Business phone found")
+
+    if "linkedin.com/in/" in contact.source_url.lower():
+        score += 15
+        reasons.append("LinkedIn profile signal")
+    elif contact.source_url:
+        score += 10
+        reasons.append("Public source URL")
+
+    freshness = contact_source_age(contact)
+    if freshness in {"Fresh", "Likely recent"}:
+        score += 10
+        reasons.append("Recent source signal")
+    elif freshness == "Date not visible":
+        reasons.append("Source date not visible")
+    elif freshness == "Old":
+        score -= 10
+        reasons.append("Old source signal")
+
+    score = max(0, min(score, 100))
+    if score >= 75 and contact.full_name:
+        status = "Ready to verify"
+        next_step = "Open source link, confirm current role, then add to cadence."
+    elif score >= 50:
+        status = "Verify first"
+        next_step = "Use as a research lead; confirm current role/contact path before outreach."
+    else:
+        status = "Not ready"
+        next_step = "Use the role-based search link or enrichment vendor before sequencing."
+
+    return ContactQuality(status, score, relevance, freshness, next_step, tuple(reasons[:5]))
+
+
+def contact_quality_summary(account: Account, intel: CompanyIntel | None = None) -> dict[str, object]:
+    if not isinstance(intel, CompanyIntel) or not intel.contacts:
+        return {
+            "status": "No scanned contacts",
+            "ready": 0,
+            "verify": 0,
+            "not_ready": len(contact_targets(account)),
+            "best_score": 0,
+            "message": "Run the public/contact scan before using the contact list.",
+        }
+
+    rows = people_to_contact_dataframe(account, intel)
+    ready = int((rows["Contact status"] == "Ready to verify").sum()) if "Contact status" in rows else 0
+    verify = int((rows["Contact status"] == "Verify first").sum()) if "Contact status" in rows else 0
+    not_ready = int((rows["Contact status"] == "Not ready").sum()) if "Contact status" in rows else 0
+    best_score = int(pd.to_numeric(rows.get("Contact score", pd.Series([0])), errors="coerce").fillna(0).max()) if not rows.empty else 0
+    if ready >= 2:
+        status = "Good list"
+        message = "There are at least two named, relevant contacts ready for manual verification."
+    elif ready == 1 or verify >= 2:
+        status = "Usable with verification"
+        message = "Use the best contact, but verify roles before sequencing."
+    else:
+        status = "Needs more research"
+        message = "The scan did not find enough current, relevant named people. Use enrichment/manual LinkedIn research before outreach."
+    return {
+        "status": status,
+        "ready": ready,
+        "verify": verify,
+        "not_ready": not_ready,
+        "best_score": best_score,
+        "message": message,
+    }
+
+
+def product_gap_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Gap": "Verified contact enrichment",
+                "Why it matters": "Public search is inconsistent for direct emails, phones, and current titles.",
+                "Recommended update": "Connect Apollo, ZoomInfo, Hunter, People Data Labs, Clearbit, Clay, or a CRM-approved enrichment provider.",
+                "Priority": "High",
+            },
+            {
+                "Gap": "Contact recency confirmation",
+                "Why it matters": "LinkedIn/search snippets may not show whether a person is still in role.",
+                "Recommended update": "Add an enrichment timestamp, profile last-seen date, and a manual verification checkbox before export.",
+                "Priority": "High",
+            },
+            {
+                "Gap": "SAM.gov award detail",
+                "Why it matters": "USAspending is strong for awards, but SAM.gov can add solicitation/notice context and procurement history.",
+                "Recommended update": "Add SAM.gov API key support for notice history, set-aside, place of performance, and solicitation links.",
+                "Priority": "High",
+            },
+            {
+                "Gap": "CRM persistence",
+                "Why it matters": "Streamlit session state is not a durable CRM database.",
+                "Recommended update": "Add Supabase/Airtable/Postgres or HubSpot/Salesforce sync for SDR ownership, activity history, and dedupe.",
+                "Priority": "High",
+            },
+            {
+                "Gap": "Email/call activity automation",
+                "Why it matters": "The app tracks intent but does not send/log email or calls automatically.",
+                "Recommended update": "Integrate HubSpot/Salesforce, Gmail/Outlook, or a sequencing platform with opt-out/compliance controls.",
+                "Priority": "Medium",
+            },
+            {
+                "Gap": "Source audit trail",
+                "Why it matters": "SDRs need to defend why a contact or pain point was selected.",
+                "Recommended update": "Store scan timestamp, source URL, evidence snippet, confidence, and manual verifier name for each row.",
+                "Priority": "Medium",
+            },
+            {
+                "Gap": "Account dedupe and subsidiaries",
+                "Why it matters": "Government award recipients can appear under subsidiaries, DBAs, UEIs, and parent companies.",
+                "Recommended update": "Normalize by UEI/CAGE/domain and add parent-child account mapping.",
+                "Priority": "Medium",
+            },
+        ]
+    )
+
+
 def best_contact_for_target(target: ContactTarget, contacts: tuple[PublicContact, ...]) -> PublicContact | None:
     matches = [contact for contact in contacts if contact_matches_role(contact, target.title)]
     if not matches:
@@ -1471,6 +1643,14 @@ def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = N
     rows = []
     for target in contact_targets(account):
         best = best_contact_for_target(target, contacts)
+        quality = quality_for_contact(best, target.title) if best else ContactQuality(
+            "Not ready",
+            0,
+            "No contact found",
+            "No source",
+            "Use the role-based search link or run a verified enrichment source before sequencing.",
+            ("No named public contact found for this role",),
+        )
         search = search_url(target.search_query)
         rows.append(
             {
@@ -1481,6 +1661,11 @@ def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = N
                 "Email": best.email if best else "",
                 "Phone": best.phone if best else "",
                 "Confidence": best.confidence if best else "",
+                "Contact status": quality.status,
+                "Contact score": quality.score,
+                "Role relevance": quality.relevance,
+                "Source freshness": quality.freshness,
+                "Verification next step": quality.next_step,
                 "Source type": "LinkedIn signal" if best and "linkedin.com" in best.source_url.lower() else ("Public web" if best else "Manual research"),
                 "Source / search URL": best.source_url if best else search,
                 "Why this person": best.recommended_reason if best else target.why,
@@ -1707,10 +1892,34 @@ def public_contacts_dataframe(intel: CompanyIntel) -> pd.DataFrame:
                 "Email": contact.email,
                 "Phone": contact.phone,
                 "Confidence": contact.confidence,
+                "Quality status": quality_for_contact(contact).status,
+                "Quality score": quality_for_contact(contact).score,
+                "Source freshness": quality_for_contact(contact).freshness,
+                "Relevance": quality_for_contact(contact).relevance,
+                "Next verification step": quality_for_contact(contact).next_step,
                 "Source type": "LinkedIn signal" if "linkedin.com" in contact.source_url.lower() else "Public web",
                 "Why contact": contact.recommended_reason,
                 "Source": contact.source_url,
                 "Evidence": contact.evidence,
+            }
+            for contact in intel.contacts
+        ]
+    )
+
+
+def public_contacts_quality_dataframe(intel: CompanyIntel) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Name": contact.full_name or "Not named",
+                "Title/Role": contact.title,
+                "Quality status": quality_for_contact(contact).status,
+                "Quality score": quality_for_contact(contact).score,
+                "Relevance": quality_for_contact(contact).relevance,
+                "Freshness": quality_for_contact(contact).freshness,
+                "Reasons": "; ".join(quality_for_contact(contact).reasons),
+                "Next step": quality_for_contact(contact).next_step,
+                "Source": contact.source_url,
             }
             for contact in intel.contacts
         ]
@@ -2044,6 +2253,9 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Best public email": best_public_email,
                 "Best public phone": best_public_phone,
                 "Best public source": best_row.get("Source / search URL", best_public_source) if isinstance(intel, CompanyIntel) else best_public_source,
+                "Contact readiness": best_row.get("Contact status", "") if isinstance(intel, CompanyIntel) else "",
+                "Contact score": best_row.get("Contact score", "") if isinstance(intel, CompanyIntel) else "",
+                "Contact verification next step": best_row.get("Verification next step", "") if isinstance(intel, CompanyIntel) else "",
                 "Notes": crm.get("notes", ""),
                 "Award": account.primary.award_id,
                 "Amount": money(account.primary.amount),
@@ -2572,6 +2784,20 @@ with tabs[1]:
             with intel_cols[1]:
                 st.markdown("### Public Contacts Found")
                 if existing_intel.contacts:
+                    summary = contact_quality_summary(selected_intel_account, existing_intel)
+                    st.markdown("### Contact Readiness Gate")
+                    gate_cols = st.columns(4)
+                    gate_cols[0].metric("Gate", str(summary["status"]))
+                    gate_cols[1].metric("Ready", int(summary["ready"]))
+                    gate_cols[2].metric("Verify", int(summary["verify"]))
+                    gate_cols[3].metric("Best score", int(summary["best_score"]))
+                    if summary["status"] == "Good list":
+                        st.success(str(summary["message"]))
+                    elif summary["status"] == "Usable with verification":
+                        st.warning(str(summary["message"]))
+                    else:
+                        st.error(str(summary["message"]))
+                    dataframe_with_links(public_contacts_quality_dataframe(existing_intel), width="stretch", hide_index=True)
                     dataframe_with_links(public_contacts_dataframe(existing_intel), width="stretch", hide_index=True)
                     st.download_button(
                         "Download public intel CSV",
@@ -2658,6 +2884,22 @@ with tabs[2]:
             with st.spinner("Searching public pages for named contacts, emails, and phone numbers..."):
                 contact_intel = enrich_account(selected_contact_account)
                 st.session_state[public_intel_key(selected_contact_account.company)] = contact_intel
+
+        if isinstance(contact_intel, CompanyIntel):
+            summary = contact_quality_summary(selected_contact_account, contact_intel)
+            st.markdown("### Contact Readiness Gate")
+            gate_cols = st.columns(5)
+            gate_cols[0].metric("Status", str(summary["status"]))
+            gate_cols[1].metric("Ready", int(summary["ready"]))
+            gate_cols[2].metric("Verify", int(summary["verify"]))
+            gate_cols[3].metric("Not ready", int(summary["not_ready"]))
+            gate_cols[4].metric("Best score", int(summary["best_score"]))
+            if summary["status"] == "Good list":
+                st.success(str(summary["message"]))
+            elif summary["status"] == "Usable with verification":
+                st.warning(str(summary["message"]))
+            else:
+                st.error(str(summary["message"]))
 
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
             st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
@@ -3014,7 +3256,14 @@ with tabs[6]:
         "LinkedIn intelligence uses public search-result signals and source links; it does not scrape protected LinkedIn pages. "
         "Treat those findings as SDR research, verify role and business contact status, and do not store personal or residential information."
     )
+    st.markdown("### Contact List Freshness Rules")
+    st.write(
+        "The Contact Readiness Gate scores each row by whether it has a named person, role relevance, source type, visible recency, and business contact data. "
+        "Ready means the SDR can verify and add to cadence. Verify first means it is a research lead. Not ready means use manual LinkedIn research or a verified enrichment provider before outreach."
+    )
+    st.markdown("### Gaps & Recommended Updates")
+    dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)
     st.markdown("### What To Add Next")
     st.write(
-        "Best next integrations: SAM.gov Contract Awards API, verified contact enrichment, HubSpot/Salesforce sync, account history beyond the current lookback window, and a GovDash demo deck generator."
+        "My strongest recommendation: add verified contact enrichment plus a real CRM database next. The app is now strong for research and SDR prep, but a production SDR workflow needs durable account/contact records, dedupe, verified emails/phones, and activity sync."
     )

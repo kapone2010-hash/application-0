@@ -78,7 +78,7 @@ Add this secret locally and in Streamlit Community Cloud to sync companies and v
 HUBSPOT_ACCESS_TOKEN = "your_hubspot_private_app_token"
 ```
 
-The current HubSpot integration syncs companies and contacts. Application 0 keeps notes, tasks, and cadence activities in Supabase until the HubSpot account exposes the relevant activity scopes.
+The current HubSpot integration syncs companies and verified contacts in one click. The app pre-fills the company domain from public company intel or verified-contact email domains, and falls back to a quick public website search if the field is still blank. Application 0 keeps notes, tasks, and cadence activities in Supabase until the HubSpot account exposes the relevant activity scopes.
 
 ## Deploy
 

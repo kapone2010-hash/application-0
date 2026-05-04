@@ -66,6 +66,33 @@ CONTACT_TITLE_KEYWORDS = [
     "chief technology",
 ]
 GENERIC_EMAIL_PREFIXES = {"info", "support", "sales", "contact", "admin", "hello", "careers", "jobs", "hr"}
+CONSUMER_EMAIL_DOMAINS = {
+    "aol.com",
+    "gmail.com",
+    "hotmail.com",
+    "icloud.com",
+    "live.com",
+    "me.com",
+    "msn.com",
+    "outlook.com",
+    "proton.me",
+    "protonmail.com",
+    "yahoo.com",
+}
+NON_COMPANY_SITE_DOMAINS = {
+    "acquisition.gov",
+    "defense.gov",
+    "facebook.com",
+    "fpds.gov",
+    "govinfo.gov",
+    "instagram.com",
+    "linkedin.com",
+    "prnewswire.com",
+    "sam.gov",
+    "twitter.com",
+    "usaspending.gov",
+    "x.com",
+}
 DEFAULT_CADENCE = [
     ("Day 1", "Email", "Congratulate them on the award, cite the agency/value, and ask who owns capture or proposal operations."),
     ("Day 2", "LinkedIn", "Connect with the named target and reference the award without pitching hard."),
@@ -1099,6 +1126,25 @@ def hubspot_upsert_contact(contact: VerifiedContact, company_id: str = "") -> tu
         return "", f"HubSpot contact sync failed: {exc}"
 
 
+def hubspot_sync_verified_contacts(
+    contacts: tuple[VerifiedContact, ...],
+    company_id: str,
+) -> tuple[int, int, list[str]]:
+    synced = 0
+    skipped = 0
+    errors: list[str] = []
+    for contact in contacts:
+        if not contact.email:
+            skipped += 1
+            continue
+        contact_id, message = hubspot_upsert_contact(contact, company_id)
+        if contact_id:
+            synced += 1
+        else:
+            errors.append(f"{contact.full_name or contact.email}: {message}")
+    return synced, skipped, errors
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def check_usaspending_freshness(start: date, end: date, min_amount: int, keyword: str) -> SourceFreshness:
     payload = build_search_payload(start, end, 1, min_amount, keyword, sort_field="Last Modified Date")
@@ -1542,6 +1588,38 @@ def clean_company_domain(value: str) -> str:
     return domain.split("/")[0]
 
 
+def company_domain_from_email(email: str) -> str:
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return ""
+    domain = clean_company_domain(email.rsplit("@", 1)[-1])
+    if not domain or domain in CONSUMER_EMAIL_DOMAINS:
+        return ""
+    return domain
+
+
+def likely_company_domain_from_contacts(contacts: tuple[VerifiedContact, ...]) -> str:
+    counts: dict[str, int] = {}
+    for contact in contacts:
+        domain = company_domain_from_email(contact.email)
+        if domain:
+            counts[domain] = counts.get(domain, 0) + 1
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda item: (item[1], item[0]), reverse=True)[0][0]
+
+
+def business_domain_candidate(domain: str) -> bool:
+    domain = clean_company_domain(domain)
+    if not domain:
+        return False
+    if domain in CONSUMER_EMAIL_DOMAINS:
+        return False
+    if domain in NON_COMPANY_SITE_DOMAINS:
+        return False
+    return not any(domain.endswith(f".{blocked}") for blocked in NON_COMPANY_SITE_DOMAINS)
+
+
 def split_name(full_name: str) -> tuple[str, str]:
     parts = [part for part in re.split(r"\s+", full_name.strip()) if part]
     if not parts:
@@ -1925,6 +2003,37 @@ def search_web_results(
 def search_public_web(query: str, max_results: int = 5) -> tuple[str, ...]:
     results = search_web_results(query, max_results=max_results, fetchable_only=True)
     return tuple(result.url for result in results)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def discover_company_domain_from_web(company: str) -> tuple[str, str]:
+    queries = [
+        f'"{company}" official website',
+        f'"{company}" company website',
+    ]
+    for query in queries:
+        for result in search_web_results(query, max_results=5, fetchable_only=True):
+            domain = clean_company_domain(result.url)
+            if business_domain_candidate(domain):
+                return domain, domain_root(result.url)
+    return "", ""
+
+
+def suggested_hubspot_domain(
+    account: Account,
+    intel: CompanyIntel | None,
+    verified_contacts: tuple[VerifiedContact, ...],
+) -> tuple[str, str]:
+    if isinstance(intel, CompanyIntel) and intel.website:
+        domain = clean_company_domain(intel.website)
+        if business_domain_candidate(domain):
+            return domain, "company intel website"
+
+    contact_domain = likely_company_domain_from_contacts(verified_contacts)
+    if contact_domain:
+        return contact_domain, "verified contact email"
+
+    return "", "not found yet"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -4574,35 +4683,58 @@ with tabs[2]:
             st.info("No verified contacts saved for this account yet.")
 
         st.markdown("### HubSpot Sync")
-        st.caption("Syncs the active company and selected verified contacts to HubSpot. Notes and tasks stay in Application 0/Supabase until those HubSpot scopes are available.")
+        st.caption("One click syncs the active company and every verified contact with an email to HubSpot. Notes and tasks stay in Application 0/Supabase until those HubSpot scopes are available.")
         hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
-        hubspot_domain = ""
-        if isinstance(hubspot_intel, CompanyIntel) and hubspot_intel.website:
-            hubspot_domain = clean_company_domain(hubspot_intel.website)
+        verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
+        hubspot_domain, hubspot_domain_source = suggested_hubspot_domain(
+            selected_contact_account,
+            hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
+            verified_contacts_for_sync,
+        )
+        hubspot_domain_key = f"hubspot_domain_{selected_contact_account.company}"
+        if hubspot_domain_key not in st.session_state:
+            st.session_state[hubspot_domain_key] = hubspot_domain
+        elif hubspot_domain and not st.session_state.get(hubspot_domain_key):
+            st.session_state[hubspot_domain_key] = hubspot_domain
         hubspot_cols = st.columns([0.34, 0.33, 0.33])
         hubspot_domain_input = hubspot_cols[0].text_input(
             "HubSpot company domain",
-            value=hubspot_domain,
             placeholder="example.com",
-            key=f"hubspot_domain_{selected_contact_account.company}",
+            key=hubspot_domain_key,
         )
+        hubspot_cols[0].caption(f"Suggested from: {hubspot_domain_source}" if hubspot_domain else "If blank, the sync button will search public web for the company site.")
         if hubspot_cols[1].button(
-            "Sync company to HubSpot",
+            "Sync company + contacts",
             key=f"sync_hubspot_company_{selected_contact_account.company}",
             disabled=not hubspot_enabled(),
             use_container_width=True,
         ):
-            company_id, message = hubspot_upsert_company(selected_contact_account, hubspot_domain_input)
+            resolved_domain = clean_company_domain(hubspot_domain_input)
+            if not resolved_domain:
+                with st.spinner("Finding likely company domain from public sources..."):
+                    resolved_domain, discovered_website = discover_company_domain_from_web(selected_contact_account.company)
+                if resolved_domain:
+                    st.session_state[hubspot_domain_key] = resolved_domain
+                    if not isinstance(hubspot_intel, CompanyIntel) and discovered_website:
+                        st.caption(f"Found likely company website: {discovered_website}")
+            company_id, message = hubspot_upsert_company(selected_contact_account, resolved_domain)
             if company_id:
                 st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
-                st.success(f"{message} ID: {company_id}")
+                synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(verified_contacts_for_sync, company_id)
+                sync_summary = f"{message} Company ID: {company_id}. Synced {synced_count} contact(s)"
+                if skipped_count:
+                    sync_summary += f"; skipped {skipped_count} without email"
+                st.success(sync_summary + ".")
+                for error in sync_errors[:3]:
+                    st.warning(error)
+                if len(sync_errors) > 3:
+                    st.warning(f"{len(sync_errors) - 3} additional contact sync error(s) hidden.")
             else:
                 st.error(message)
         hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
         hubspot_cols[2].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
         if not hubspot_enabled():
             st.warning("Add HUBSPOT_ACCESS_TOKEN to Streamlit secrets to enable HubSpot sync.")
-        verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
         if verified_contacts_for_sync:
             sync_options = {
                 f"{contact.full_name or contact.email} | {contact.title or 'No title'} | {contact.email or 'no email'}": contact.id
@@ -5291,7 +5423,8 @@ with tabs[7]:
     )
     st.markdown("### HubSpot Sync")
     st.write(
-        "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and selected verified contacts to HubSpot. "
+        "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
+        "The company domain is pre-filled from company intel or verified-contact email domains, then falls back to public website search if needed. "
         "This first HubSpot integration uses company/contact scopes only; notes, tasks, and cadence activities remain in Application 0 and Supabase until the HubSpot account exposes activity scopes."
     )
     st.markdown("### Gaps & Recommended Updates")

@@ -182,12 +182,22 @@ def init_database() -> None:
                 source_type TEXT,
                 verification_status TEXT,
                 verified_at TEXT,
+                verified_by TEXT,
+                verification_method TEXT,
                 notes TEXT,
                 created_at TEXT,
                 updated_at TEXT
             )
             """
         )
+        existing_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(verified_contacts)").fetchall()
+        }
+        if "verified_by" not in existing_columns:
+            connection.execute("ALTER TABLE verified_contacts ADD COLUMN verified_by TEXT DEFAULT ''")
+        if "verification_method" not in existing_columns:
+            connection.execute("ALTER TABLE verified_contacts ADD COLUMN verification_method TEXT DEFAULT ''")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_verified_contacts_company ON verified_contacts(company)")
         connection.execute(
             """
@@ -207,6 +217,28 @@ def init_database() -> None:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_crm_activities_company ON crm_activities(company)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_audit_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                evidence_type TEXT,
+                item TEXT,
+                evidence_level TEXT,
+                recency_gate TEXT,
+                captured_verified TEXT,
+                source TEXT,
+                source_url TEXT,
+                evidence_snippet TEXT,
+                audit_status TEXT,
+                sdr_action TEXT,
+                reviewer TEXT,
+                review_note TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_source_audit_company ON source_audit_records(company)")
 
 
 def secret_value(name: str) -> str:
@@ -554,6 +586,8 @@ class VerifiedContact:
     source_type: str
     verification_status: str
     verified_at: str
+    verified_by: str
+    verification_method: str
     notes: str
 
 
@@ -570,6 +604,25 @@ class CrmActivity:
     completed: bool
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class SourceAuditRecord:
+    id: int
+    company: str
+    evidence_type: str
+    item: str
+    evidence_level: str
+    recency_gate: str
+    captured_verified: str
+    source: str
+    source_url: str
+    evidence_snippet: str
+    audit_status: str
+    sdr_action: str
+    reviewer: str
+    review_note: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -1688,6 +1741,8 @@ def save_verified_contact(
     source_type: str,
     verification_status: str,
     notes: str,
+    verified_by: str = "",
+    verification_method: str = "",
 ) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     values = (
@@ -1701,6 +1756,8 @@ def save_verified_contact(
         source_type.strip(),
         verification_status.strip(),
         now,
+        verified_by.strip(),
+        verification_method.strip(),
         notes.strip(),
         now,
         now,
@@ -1717,9 +1774,11 @@ def save_verified_contact(
             "source_type": values[7],
             "verification_status": values[8],
             "verified_at": values[9],
-            "notes": values[10],
-            "created_at": values[11],
-            "updated_at": values[12],
+            "verified_by": values[10],
+            "verification_method": values[11],
+            "notes": values[12],
+            "created_at": values[13],
+            "updated_at": values[14],
         }
         try:
             rows = supabase_select(
@@ -1736,21 +1795,30 @@ def save_verified_contact(
                 },
             )
             if rows:
-                supabase_patch(
-                    "verified_contacts",
-                    int(rows[0]["id"]),
-                    {
-                        "phone": values[4],
-                        "source_url": values[6],
-                        "source_type": values[7],
-                        "verification_status": values[8],
-                        "verified_at": values[9],
-                        "notes": values[10],
-                        "updated_at": values[12],
-                    },
-                )
+                patch_payload = {
+                    "phone": values[4],
+                    "source_url": values[6],
+                    "source_type": values[7],
+                    "verification_status": values[8],
+                    "verified_at": values[9],
+                    "verified_by": values[10],
+                    "verification_method": values[11],
+                    "notes": values[12],
+                    "updated_at": values[14],
+                }
+                try:
+                    supabase_patch("verified_contacts", int(rows[0]["id"]), patch_payload)
+                except requests.RequestException:
+                    patch_payload.pop("verified_by", None)
+                    patch_payload.pop("verification_method", None)
+                    supabase_patch("verified_contacts", int(rows[0]["id"]), patch_payload)
             else:
-                supabase_insert("verified_contacts", payload)
+                try:
+                    supabase_insert("verified_contacts", payload)
+                except requests.RequestException:
+                    payload.pop("verified_by", None)
+                    payload.pop("verification_method", None)
+                    supabase_insert("verified_contacts", payload)
             return
         except requests.RequestException as exc:
             storage_warning(f"Supabase verified-contact save failed, using SQLite fallback: {exc}")
@@ -1777,20 +1845,22 @@ def save_verified_contact(
                     source_type = ?,
                     verification_status = ?,
                     verified_at = ?,
+                    verified_by = ?,
+                    verification_method = ?,
                     notes = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (values[4], values[6], values[7], values[8], values[9], values[10], values[12], int(existing["id"])),
+                (values[4], values[6], values[7], values[8], values[9], values[10], values[11], values[12], values[14], int(existing["id"])),
             )
             return
         connection.execute(
             """
             INSERT INTO verified_contacts (
                 company, full_name, title, email, phone, linkedin_url, source_url, source_type,
-                verification_status, verified_at, notes, created_at, updated_at
+                verification_status, verified_at, verified_by, verification_method, notes, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -1816,6 +1886,8 @@ def load_verified_contacts(company: str) -> tuple[VerifiedContact, ...]:
                     source_type=str(row.get("source_type") or ""),
                     verification_status=str(row.get("verification_status") or ""),
                     verified_at=str(row.get("verified_at") or ""),
+                    verified_by=str(row.get("verified_by") or ""),
+                    verification_method=str(row.get("verification_method") or ""),
                     notes=str(row.get("notes") or ""),
                 )
                 for row in rows
@@ -1844,6 +1916,8 @@ def load_verified_contacts(company: str) -> tuple[VerifiedContact, ...]:
             source_type=str(row["source_type"] or ""),
             verification_status=str(row["verification_status"] or ""),
             verified_at=str(row["verified_at"] or ""),
+            verified_by=str(row["verified_by"] or "") if "verified_by" in row.keys() else "",
+            verification_method=str(row["verification_method"] or "") if "verification_method" in row.keys() else "",
             notes=str(row["notes"] or ""),
         )
         for row in rows
@@ -1883,7 +1957,8 @@ def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
     source = contact.linkedin_url or contact.source_url
     evidence = (
         f"Verified contact saved in CRM on {contact.verified_at}. "
-        f"Status: {contact.verification_status}. Source type: {contact.source_type}. Notes: {contact.notes}"
+        f"Status: {contact.verification_status}. Source type: {contact.source_type}. "
+        f"Verified by: {contact.verified_by or 'not recorded'}. Method: {contact.verification_method or 'not recorded'}. Notes: {contact.notes}"
     )
     return PublicContact(
         full_name=contact.full_name,
@@ -1966,6 +2041,8 @@ def verified_contacts_dataframe(company: str) -> pd.DataFrame:
                 "Source URL": contact.source_url,
                 "Status": contact.verification_status,
                 "Verified at": contact.verified_at,
+                "Verified by": contact.verified_by,
+                "Verification method": contact.verification_method,
                 "SDR action": verified_contact_gate(contact)["action"],
                 "Notes": contact.notes,
             }
@@ -2123,6 +2200,8 @@ def import_verified_contacts_csv(uploaded_file: object, default_company: str) ->
             source_type=clean_import_value(row.get(normalized.get("source_type", ""), "")) or "CSV import",
             verification_status=clean_import_value(row.get(normalized.get("verification_status", normalized.get("status", "")), "")) or "Imported for verification",
             notes=clean_import_value(row.get(normalized.get("notes", ""), "")),
+            verified_by=clean_import_value(row.get(normalized.get("verified_by", normalized.get("reviewer", "")), "")),
+            verification_method=clean_import_value(row.get(normalized.get("verification_method", normalized.get("method", "")), "")),
         )
         count += 1
     return count
@@ -3610,6 +3689,161 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
     return pd.DataFrame(rows)
 
 
+def save_source_audit_snapshot(company: str, audit_df: pd.DataFrame, reviewer: str = "", review_note: str = "") -> int:
+    if audit_df.empty:
+        return 0
+    created_at = datetime.now().isoformat(timespec="seconds")
+    payloads = []
+    for _, row in audit_df.iterrows():
+        payloads.append(
+            {
+                "company": company,
+                "evidence_type": clean_import_value(row.get("Evidence type", "")),
+                "item": clean_import_value(row.get("Item", "")),
+                "evidence_level": clean_import_value(row.get("Evidence level", "")),
+                "recency_gate": clean_import_value(row.get("Recency / gate", "")),
+                "captured_verified": clean_import_value(row.get("Captured / verified", "")),
+                "source": clean_import_value(row.get("Source", "")),
+                "source_url": clean_import_value(row.get("Source URL", "")),
+                "evidence_snippet": clean_import_value(row.get("Evidence snippet", "")),
+                "audit_status": clean_import_value(row.get("Audit status", "")),
+                "sdr_action": clean_import_value(row.get("SDR action", "")),
+                "reviewer": reviewer.strip(),
+                "review_note": review_note.strip(),
+                "created_at": created_at,
+            }
+        )
+
+    if supabase_enabled():
+        try:
+            for payload in payloads:
+                supabase_insert("source_audit_records", payload)
+            return len(payloads)
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase source-audit save failed, using SQLite fallback: {exc}")
+
+    with db_connect() as connection:
+        connection.executemany(
+            """
+            INSERT INTO source_audit_records (
+                company, evidence_type, item, evidence_level, recency_gate,
+                captured_verified, source, source_url, evidence_snippet, audit_status,
+                sdr_action, reviewer, review_note, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    payload["company"],
+                    payload["evidence_type"],
+                    payload["item"],
+                    payload["evidence_level"],
+                    payload["recency_gate"],
+                    payload["captured_verified"],
+                    payload["source"],
+                    payload["source_url"],
+                    payload["evidence_snippet"],
+                    payload["audit_status"],
+                    payload["sdr_action"],
+                    payload["reviewer"],
+                    payload["review_note"],
+                    payload["created_at"],
+                )
+                for payload in payloads
+            ],
+        )
+    return len(payloads)
+
+
+def load_source_audit_records(company: str, limit: int = 100) -> tuple[SourceAuditRecord, ...]:
+    if supabase_enabled():
+        try:
+            rows = supabase_select(
+                "source_audit_records",
+                {
+                    "select": "*",
+                    "company": f"eq.{company}",
+                    "order": "created_at.desc,id.desc",
+                    "limit": str(limit),
+                },
+            )
+            return tuple(
+                SourceAuditRecord(
+                    id=int(row.get("id") or 0),
+                    company=str(row.get("company") or ""),
+                    evidence_type=str(row.get("evidence_type") or ""),
+                    item=str(row.get("item") or ""),
+                    evidence_level=str(row.get("evidence_level") or ""),
+                    recency_gate=str(row.get("recency_gate") or ""),
+                    captured_verified=str(row.get("captured_verified") or ""),
+                    source=str(row.get("source") or ""),
+                    source_url=str(row.get("source_url") or ""),
+                    evidence_snippet=str(row.get("evidence_snippet") or ""),
+                    audit_status=str(row.get("audit_status") or ""),
+                    sdr_action=str(row.get("sdr_action") or ""),
+                    reviewer=str(row.get("reviewer") or ""),
+                    review_note=str(row.get("review_note") or ""),
+                    created_at=str(row.get("created_at") or ""),
+                )
+                for row in rows
+            )
+        except requests.RequestException as exc:
+            storage_warning(f"Supabase source-audit read failed, using SQLite fallback: {exc}")
+
+    with db_connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM source_audit_records
+            WHERE company = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (company, limit),
+        ).fetchall()
+    return tuple(
+        SourceAuditRecord(
+            id=int(row["id"]),
+            company=str(row["company"] or ""),
+            evidence_type=str(row["evidence_type"] or ""),
+            item=str(row["item"] or ""),
+            evidence_level=str(row["evidence_level"] or ""),
+            recency_gate=str(row["recency_gate"] or ""),
+            captured_verified=str(row["captured_verified"] or ""),
+            source=str(row["source"] or ""),
+            source_url=str(row["source_url"] or ""),
+            evidence_snippet=str(row["evidence_snippet"] or ""),
+            audit_status=str(row["audit_status"] or ""),
+            sdr_action=str(row["sdr_action"] or ""),
+            reviewer=str(row["reviewer"] or ""),
+            review_note=str(row["review_note"] or ""),
+            created_at=str(row["created_at"] or ""),
+        )
+        for row in rows
+    )
+
+
+def source_audit_history_dataframe(company: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Saved at": record.created_at,
+                "Reviewer": record.reviewer,
+                "Review note": record.review_note,
+                "Evidence type": record.evidence_type,
+                "Item": record.item,
+                "Evidence level": record.evidence_level,
+                "Recency / gate": record.recency_gate,
+                "Source": record.source,
+                "Source URL": record.source_url,
+                "Audit status": record.audit_status,
+                "SDR action": record.sdr_action,
+                "Evidence snippet": record.evidence_snippet,
+            }
+            for record in load_source_audit_records(company)
+        ]
+    )
+
+
 def account_fit_assessment(account: Account, intel: CompanyIntel | None = None) -> dict[str, object]:
     contact_summary = contact_quality_summary(account, intel)
     verified_count = len(load_verified_contacts(account.company))
@@ -4687,6 +4921,27 @@ def dataframe_with_links(data: pd.DataFrame, **kwargs: object) -> None:
     st.dataframe(df, column_config=column_config or None, **kwargs)
 
 
+def render_source_audit_persistence(company: str, audit_df: pd.DataFrame, key_prefix: str) -> None:
+    save_cols = st.columns([0.26, 0.48, 0.26])
+    reviewer = save_cols[0].text_input("Reviewer / owner", key=f"{key_prefix}_audit_reviewer")
+    review_note = save_cols[1].text_input("Review note", key=f"{key_prefix}_audit_note", placeholder="Why this evidence is safe to use now")
+    if save_cols[2].button("Save audit snapshot", key=f"{key_prefix}_save_audit", disabled=audit_df.empty, use_container_width=True):
+        saved = save_source_audit_snapshot(company, audit_df, reviewer, review_note)
+        st.success(f"Saved {saved} source-audit row(s).")
+
+    history_df = source_audit_history_dataframe(company)
+    if not history_df.empty:
+        with st.expander("Saved audit history"):
+            dataframe_with_links(history_df, width="stretch", hide_index=True)
+            st.download_button(
+                "Download saved audit history CSV",
+                data=history_df.to_csv(index=False),
+                file_name=f"{company.lower().replace(' ', '-')}-saved-source-audit.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_audit_history_download",
+            )
+
+
 st.set_page_config(
     page_title="Application 0 | GovDash SDR Prospecting",
     page_icon="0",
@@ -5282,6 +5537,7 @@ with tabs[1]:
                         file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-source-audit.csv",
                         mime="text/csv",
                     )
+                    render_source_audit_persistence(selected_intel_account.company, audit_df, f"public_{selected_intel_account.company}")
 
                 st.markdown("### What SDR Should Verify")
                 for item in [
@@ -5552,6 +5808,12 @@ with tabs[2]:
                 "Source type",
                 ["Manual verification", "Apollo", "ZoomInfo", "Hunter", "Clay", "People Data Labs", "Clearbit", "LinkedIn", "Other"],
             )
+            reviewer_cols = st.columns(2)
+            verified_by = reviewer_cols[0].text_input("Verified by / owner")
+            verification_method = reviewer_cols[1].selectbox(
+                "Verification method",
+                ["Manual source review", "LinkedIn profile checked", "Vendor enrichment checked", "Email domain matched", "Phone/direct dial checked", "Other"],
+            )
             verified_notes = st.text_area("Verification notes", placeholder="Where did this come from? What did you verify?")
             submitted_verified = st.form_submit_button("Save verified contact")
             if submitted_verified:
@@ -5567,6 +5829,8 @@ with tabs[2]:
                         verified_source_type,
                         verified_status,
                         verified_notes,
+                        verified_by,
+                        verification_method,
                     )
                     st.success("Verified contact saved.")
                     st.rerun()
@@ -5577,7 +5841,7 @@ with tabs[2]:
             "Import verified contacts CSV",
             type=["csv"],
             key=f"verified_upload_{selected_contact_account.company}",
-            help="Accepted columns: company, full_name/name, title, email, phone, linkedin_url/linkedin, source_url/source, source_type, verification_status/status, notes.",
+            help="Accepted columns: company, full_name/name, title, email, phone, linkedin_url/linkedin, source_url/source, source_type, verification_status/status, verified_by/reviewer, verification_method/method, notes.",
         )
         if uploaded_contacts is not None:
             try:
@@ -5619,6 +5883,7 @@ with tabs[2]:
                     file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-source-audit.csv",
                     mime="text/csv",
                 )
+                render_source_audit_persistence(selected_contact_account.company, audit_df, f"contact_{selected_contact_account.company}")
 
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
             st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
@@ -5654,6 +5919,18 @@ with tabs[2]:
             st.info("The scan did not find a verified named contact. Use the role-based LinkedIn and company search links above and keep the account in Researching.")
         else:
             st.caption("Run the scan to populate public names, LinkedIn profile signals, business emails, business phones, and source evidence when available.")
+
+        saved_audit_history = source_audit_history_dataframe(selected_contact_account.company)
+        if not saved_audit_history.empty:
+            st.markdown("### Saved Source Audit History")
+            dataframe_with_links(saved_audit_history, width="stretch", hide_index=True)
+            st.download_button(
+                "Download saved source audit history CSV",
+                data=saved_audit_history.to_csv(index=False),
+                file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-saved-source-audit.csv",
+                mime="text/csv",
+                key=f"contact_saved_audit_download_{selected_contact_account.company}",
+            )
 
         st.markdown("### Contact Verification Checklist")
         checklist_cols = st.columns(4)
@@ -5955,14 +6232,22 @@ with tabs[4]:
         )
         cadence_activities = build_cadence_activities(selected_account, cadence_contact, cadence_start)
         cadence_cols[3].metric("Tasks", len(cadence_activities))
+        verified_contact_by_name = {contact.full_name: contact for contact in crm_verified_contacts if contact.full_name}
+        selected_cadence_contact = verified_contact_by_name.get(cadence_contact)
+        cadence_gate = verified_contact_gate(selected_cadence_contact)["gate"] if selected_cadence_contact else "No verified contact selected"
         if not verified_names:
             st.warning("Save at least one verified contact before launching a HubSpot cadence.")
+        elif selected_cadence_contact:
+            if cadence_gate == "Ready to sequence":
+                st.success(f"Compliance gate passed for {selected_cadence_contact.full_name}: {cadence_gate}.")
+            else:
+                st.warning(f"Compliance gate blocked launch for {selected_cadence_contact.full_name}: {cadence_gate}. Update the verified contact before launching cadence.")
         with st.expander("Preview cadence tasks"):
             dataframe_with_links(cadence_preview_dataframe(cadence_activities), width="stretch", hide_index=True)
         if st.button(
             "Launch 14-Day Cadence",
             key=f"launch_cadence_{selected_account.company}",
-            disabled=not bool(cadence_contact.strip()) or not bool(verified_names),
+            disabled=not bool(cadence_contact.strip()) or not bool(verified_names) or cadence_gate != "Ready to sequence",
             use_container_width=True,
         ):
             saved_count = save_cadence_activities(cadence_activities)

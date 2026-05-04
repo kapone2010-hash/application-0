@@ -29,10 +29,18 @@ create table if not exists public.verified_contacts (
     source_type text default '',
     verification_status text default '',
     verified_at timestamptz default now(),
+    verified_by text default '',
+    verification_method text default '',
     notes text default '',
     created_at timestamptz default now(),
     updated_at timestamptz default now()
 );
+
+alter table public.verified_contacts
+    add column if not exists verified_by text default '';
+
+alter table public.verified_contacts
+    add column if not exists verification_method text default '';
 
 create index if not exists idx_verified_contacts_company
     on public.verified_contacts(company);
@@ -60,9 +68,31 @@ create index if not exists idx_crm_activities_company
 create index if not exists idx_crm_activities_company_due
     on public.crm_activities(company, completed, due_date);
 
+create table if not exists public.source_audit_records (
+    id bigint generated always as identity primary key,
+    company text not null,
+    evidence_type text default '',
+    item text default '',
+    evidence_level text default '',
+    recency_gate text default '',
+    captured_verified text default '',
+    source text default '',
+    source_url text default '',
+    evidence_snippet text default '',
+    audit_status text default '',
+    sdr_action text default '',
+    reviewer text default '',
+    review_note text default '',
+    created_at timestamptz default now()
+);
+
+create index if not exists idx_source_audit_records_company
+    on public.source_audit_records(company, created_at desc);
+
 alter table public.crm_accounts enable row level security;
 alter table public.verified_contacts enable row level security;
 alter table public.crm_activities enable row level security;
+alter table public.source_audit_records enable row level security;
 
 -- No anon/authenticated policies are created on purpose.
 -- The Streamlit server uses SUPABASE_SERVICE_ROLE_KEY from secrets.

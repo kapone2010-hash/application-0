@@ -20,6 +20,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Adds a verified-contact Sequence Gate with verified age, evidence grade, and SDR action so reps know whether a person is ready to sequence, needs recheck, or should be blocked.
 - Builds a source audit trail for contacts, pain points, call-intel signals, and scanned pages with source URL, capture/verification timestamp, evidence snippet, audit status, and SDR action.
+- Persists source-audit snapshots with reviewer/owner and review-note fields so evidence can be defended after outreach.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
 - Syncs active companies, verified contacts, individual CRM activities, and one-click 14-day cadence task launches into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured and the private app has the needed activity scopes.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
@@ -51,7 +52,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 3. Copy `streamlit-secrets.example.toml` into local `.streamlit/secrets.toml` or Streamlit Community Cloud secrets.
 4. Fill in `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
 
-When those two secrets are present and the schema exists, Application 0 uses Supabase for CRM accounts, verified contacts, and activity history. If Supabase is not configured, the app continues using local SQLite.
+When those two secrets are present and the schema exists, Application 0 uses Supabase for CRM accounts, verified contacts, activity history, and saved source-audit snapshots. If Supabase is not configured, the app continues using local SQLite.
 
 ## SAM.gov Enrichment
 
@@ -101,12 +102,12 @@ Public award data usually does not include verified direct emails or phone numbe
 
 The contact list uses a readiness gate. `Ready to verify` means there is a named, relevant public contact with enough source evidence for an SDR to manually confirm. `Verify first` means it is a research lead. `Not ready` means the app did not find enough public evidence and the SDR should use manual LinkedIn research or a verified enrichment provider before sequencing.
 
-Verified contacts use a stricter Sequence Gate. `Ready to sequence` requires a verified current role, source evidence, and a usable business email or phone. `Verify before sequence`, `Verify missing fields`, and `Recheck before sequence` tell the SDR exactly what needs to be confirmed before outreach. `Do not sequence` keeps blocked contacts out of cadence.
+Verified contacts use a stricter Sequence Gate. `Ready to sequence` requires a verified current role, source evidence, and a usable business email or phone. `Verify before sequence`, `Verify missing fields`, and `Recheck before sequence` tell the SDR exactly what needs to be confirmed before outreach. `Do not sequence` keeps blocked contacts out of cadence. The 14-day cadence launcher is blocked unless the selected verified contact passes this gate.
 
-The Source Audit Trail is available after public scans and in Contact Finder. It gives SDRs a downloadable evidence table for contacts, pain points, call-intel signals, and scanned pages so they can see where each recommendation came from before calling or emailing.
+The Source Audit Trail is available after public scans and in Contact Finder. It gives SDRs a downloadable evidence table for contacts, pain points, call-intel signals, and scanned pages so they can see where each recommendation came from before calling or emailing. SDRs can also save an audit snapshot with reviewer/owner and review notes.
 
 The Account Radar tab includes an Account Dedupe & Parent/Subsidiary Risk table. It is a review queue, not an automatic merge tool: use it before syncing to HubSpot so activity, contacts, and cadence tasks do not get split across duplicate company records.
 
-Verified contacts can be added manually or imported from CSV enrichment exports. Accepted CSV columns include `company`, `full_name` or `name`, `title`, `email`, `phone`, `linkedin_url` or `linkedin`, `source_url` or `source`, `source_type`, `verification_status` or `status`, and `notes`.
+Verified contacts can be added manually or imported from CSV enrichment exports. Accepted CSV columns include `company`, `full_name` or `name`, `title`, `email`, `phone`, `linkedin_url` or `linkedin`, `source_url` or `source`, `source_type`, `verification_status` or `status`, `verified_by` or `reviewer`, `verification_method` or `method`, and `notes`.
 
 Verified enrichment vendors such as CRM/contact-data providers can also be connected later if you want higher-confidence direct dials and emails.

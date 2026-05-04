@@ -53,7 +53,7 @@ HUNTER_API_KEY = "your-hunter-api-key"
 HUBSPOT_ACCESS_TOKEN = "your-hubspot-private-app-token"
 ```
 
-The deployed app will use Supabase for CRM accounts, verified contacts, and activity history when those secrets are configured. Without them, it falls back to local SQLite, which is not durable across cloud redeploys. `SAM_API_KEY` enables the optional SAM.gov enrichment button in Public Intel. `HUNTER_API_KEY` enables optional Hunter.io contact enrichment in Contact Finder. `HUBSPOT_ACCESS_TOKEN` enables company/contact sync.
+The deployed app will use Supabase for CRM accounts, verified contacts, activity history, and saved source-audit snapshots when those secrets are configured. Without them, it falls back to local SQLite, which is not durable across cloud redeploys. Re-run `supabase_schema.sql` after this update to add reviewer fields and the source-audit table. `SAM_API_KEY` enables the optional SAM.gov enrichment button in Public Intel. `HUNTER_API_KEY` enables optional Hunter.io contact enrichment in Contact Finder. `HUBSPOT_ACCESS_TOKEN` enables company/contact/activity sync.
 
 ## 4. After Deploy
 

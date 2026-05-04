@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import re
+import textwrap
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
@@ -4561,6 +4562,103 @@ def account_brief_markdown(
     return "\n".join(str(line) for line in lines).strip() + "\n"
 
 
+def pdf_safe_text(value: object) -> str:
+    text = str(value or "")
+    text = text.replace("\r", "")
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def pdf_escape(value: object) -> str:
+    text = pdf_safe_text(value)
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def markdown_to_pdf_lines(markdown: str, title: str) -> list[str]:
+    lines = [title, ""]
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^\-\s+", "- ", line)
+        line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        wrapped = textwrap.wrap(line, width=92, replace_whitespace=False, drop_whitespace=True)
+        lines.extend(wrapped or [""])
+    return lines
+
+
+def text_pdf_bytes(title: str, markdown: str) -> bytes:
+    source_lines = markdown_to_pdf_lines(markdown, title)
+    page_lines: list[list[str]] = []
+    current: list[str] = []
+    max_lines = 52
+    for line in source_lines:
+        if len(current) >= max_lines:
+            page_lines.append(current)
+            current = []
+        current.append(line)
+    if current:
+        page_lines.append(current)
+    if not page_lines:
+        page_lines = [[title]]
+
+    objects: list[bytes] = []
+    page_object_numbers: list[int] = []
+    content_object_numbers: list[int] = []
+
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(b"")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    for lines in page_lines:
+        page_number = len(objects) + 1
+        content_number = page_number + 1
+        page_object_numbers.append(page_number)
+        content_object_numbers.append(content_number)
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_number} 0 R >>"
+            ).encode("latin-1")
+        )
+        stream_lines = ["BT", "/F1 10 Tf", "14 TL", "54 744 Td"]
+        for line in lines:
+            stream_lines.append(f"({pdf_escape(line)}) Tj")
+            stream_lines.append("T*")
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines).encode("latin-1", "replace")
+        objects.append(b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream")
+
+    kids = " ".join(f"{number} 0 R" for number in page_object_numbers)
+    objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_numbers)} >>".encode("latin-1")
+
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output.extend(f"{index} 0 obj\n".encode("ascii"))
+        output.extend(obj)
+        output.extend(b"\nendobj\n")
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(output)
+
+
+def brief_pdf_bytes(title: str, markdown: str) -> bytes:
+    return text_pdf_bytes(title, markdown)
+
+
 def pursuit_package_dataframe(result: dict[str, object]) -> pd.DataFrame:
     rows = result.get("steps")
     if not isinstance(rows, list):
@@ -4788,6 +4886,13 @@ def render_pursuit_package_result(result: dict[str, object]) -> None:
             file_name=f"{str(result.get('company', 'account')).lower().replace(' ', '-')}-full-pursuit-package.md",
             mime="text/markdown",
             key=f"download_pursuit_package_{result.get('company', 'account')}",
+        )
+        st.download_button(
+            "Download generated pursuit package PDF",
+            data=brief_pdf_bytes(f"{result.get('company', 'Account')} Full Pursuit Package", brief_markdown),
+            file_name=f"{str(result.get('company', 'account')).lower().replace(' ', '-')}-full-pursuit-package.pdf",
+            mime="application/pdf",
+            key=f"download_pursuit_package_pdf_{result.get('company', 'account')}",
         )
 
 
@@ -6891,6 +6996,16 @@ with tabs[3]:
             mime="text/markdown",
             key=f"call_prep_download_{selected_prep_account.company}",
         )
+        st.download_button(
+            "Download call prep PDF",
+            data=brief_pdf_bytes(
+                f"{selected_prep_account.company} Call Prep Brief",
+                call_prep_markdown(selected_prep_account, prep_intel, prep_sam),
+            ),
+            file_name=f"{selected_prep_account.company.lower().replace(' ', '-')}-call-prep.pdf",
+            mime="application/pdf",
+            key=f"call_prep_pdf_download_{selected_prep_account.company}",
+        )
 
 
 with tabs[4]:
@@ -7553,6 +7668,16 @@ with tabs[7]:
             mime="text/markdown",
             key=f"account_brief_download_{selected_brief_account.company}",
         )
+        st.download_button(
+            "Download account research PDF",
+            data=brief_pdf_bytes(
+                f"{selected_brief_account.company} Account Research Brief",
+                account_brief_markdown(selected_brief_account, brief_intel, brief_sam),
+            ),
+            file_name=f"{selected_brief_account.company.lower().replace(' ', '-')}-account-brief.pdf",
+            mime="application/pdf",
+            key=f"account_brief_pdf_download_{selected_brief_account.company}",
+        )
 
 
 with tabs[8]:
@@ -7624,7 +7749,7 @@ with tabs[8]:
     st.markdown("### Account Brief")
     st.write(
         "The Account Brief tab packages the active company into one SDR-ready brief: executive summary, company research, contract trigger, best contact, "
-        "pain points to validate, call intel, GovDash demo angle, CRM state, trust gaps, sources, and a downloadable markdown version. "
+        "pain points to validate, call intel, GovDash demo angle, CRM state, trust gaps, sources, and downloadable Markdown/PDF versions. "
         "The Create Full Pursuit Package button can run Public Intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, brief generation, and cadence prep from one workflow."
     )
     st.markdown("### Gaps & Recommended Updates")

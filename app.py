@@ -235,6 +235,18 @@ class WebSearchResult:
 
 
 @dataclass(frozen=True)
+class AccountSignal:
+    signal_type: str
+    title: str
+    url: str
+    snippet: str
+    source: str
+    recency_hint: str
+    call_angle: str
+    search_query: str
+
+
+@dataclass(frozen=True)
 class CompanyIntel:
     company: str
     website: str
@@ -243,6 +255,7 @@ class CompanyIntel:
     contacts: tuple[PublicContact, ...]
     linkedin_contacts: tuple[PublicContact, ...]
     linkedin_signals: tuple[WebSearchResult, ...]
+    account_signals: tuple[AccountSignal, ...]
     sources: tuple[str, ...]
     scanned_urls: tuple[str, ...]
 
@@ -802,6 +815,206 @@ def linkedin_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
     )
 
 
+def signal_source(url: str) -> str:
+    domain = url_domain(url)
+    if "linkedin.com" in domain:
+        return "LinkedIn public signal"
+    if "youtube.com" in domain or "youtu.be" in domain:
+        return "YouTube/interview"
+    if "spotify.com" in domain or "apple.com" in domain or "podcasts" in domain:
+        return "Podcast"
+    if any(source in domain for source in ["prnewswire", "globenewswire", "businesswire", "newswire"]):
+        return "Press release wire"
+    if any(source in domain for source in ["defense.gov", "army.mil", "navy.mil", "af.mil", "spaceforce.mil", "sam.gov", "usaspending.gov"]):
+        return "Government source"
+    return domain or "Public web"
+
+
+def classify_signal(title: str, snippet: str, url: str) -> str:
+    text = " ".join([title, snippet, url]).lower()
+    if "linkedin.com" in text and any(term in text for term in ["posts", "feed/update", "activity"]):
+        return "LinkedIn announcement"
+    if "linkedin.com/jobs" in text or any(term in text for term in ["hiring", "job", "careers", "recruiting"]):
+        return "Hiring or growth"
+    if any(term in text for term in ["podcast", "interview", "conversation with", "appeared on", "episode"]):
+        return "Podcast or interview"
+    if any(term in text for term in ["press release", "announces", "announced", "announcement", "launches", "unveils"]):
+        return "Announcement"
+    if any(term in text for term in ["partnership", "partners with", "teaming", "alliance", "collaboration"]):
+        return "Partnership"
+    if any(term in text for term in ["webinar", "conference", "event", "speaking", "panel"]):
+        return "Event or webinar"
+    if any(term in text for term in ["award", "contract", "task order", "idiq", "bpa"]):
+        return "Award or contract"
+    if any(term in text for term in ["ceo", "president", "chief", "appointed", "joins as"]):
+        return "Leadership"
+    return "Account intel"
+
+
+def recency_hint(text: str) -> str:
+    months = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December"
+    month_match = re.search(rf"\b(?:{months})\.?\s+\d{{1,2}},?\s+20\d{{2}}\b", text, flags=re.IGNORECASE)
+    if month_match:
+        return month_match.group(0)
+    year_match = re.search(r"\b20(?:2[4-9]|3[0-9])\b", text)
+    if year_match:
+        return year_match.group(0)
+    if any(term in text.lower() for term in ["today", "yesterday", "this week", "this month", "recent", "new"]):
+        return "Recent wording"
+    return "Verify date"
+
+
+def call_angle_for_signal(signal_type: str, title: str, snippet: str, company: str) -> str:
+    text = " ".join([title, snippet]).lower()
+    if signal_type == "Podcast or interview":
+        return f"Reference the interview and ask how {company} is turning that public thought leadership into repeatable capture/proposal execution."
+    if signal_type == "LinkedIn announcement":
+        return "Use the public LinkedIn update as the personal opener, then connect it to pipeline, proposal, or contract execution priorities."
+    if signal_type == "Hiring or growth":
+        return "Ask whether growth is creating proposal volume, capture handoff, or contract-documentation strain."
+    if signal_type == "Partnership":
+        return "Ask how they coordinate partners, subcontractors, and reusable evidence across pursuits and delivery."
+    if signal_type == "Event or webinar":
+        return "Reference the event topic and ask whether the team has a repeatable workflow for turning market insight into qualified pursuits."
+    if signal_type == "Leadership":
+        return "Use the leadership change as a reason to ask about growth process, proposal operations, and visibility into federal pipeline."
+    if signal_type == "Announcement":
+        return "Reference the announcement and ask what follow-on opportunities or proposal workload it creates."
+    if signal_type == "Award or contract" and "contract" in text:
+        return "Tie the public contract signal to kickoff, past-performance reuse, modifications, option years, and follow-on capture."
+    return "Use this as a relevant business trigger before mentioning the newly reported contract."
+
+
+def account_signal_queries(company: str, award_id: str) -> list[str]:
+    return [
+        f'site:linkedin.com/posts "{company}"',
+        f'site:linkedin.com/feed/update "{company}"',
+        f'site:linkedin.com/company "{company}" "posts"',
+        f'"{company}" "podcast"',
+        f'"{company}" "interview"',
+        f'"{company}" "CEO" "podcast"',
+        f'"{company}" "press release"',
+        f'"{company}" announcement',
+        f'"{company}" partnership',
+        f'"{company}" webinar OR conference',
+        f'"{company}" hiring government contracts',
+        f'"{company}" "{award_id}"',
+    ]
+
+
+def signal_from_search_result(result: WebSearchResult, company: str) -> AccountSignal:
+    signal_type = classify_signal(result.title, result.snippet, result.url)
+    return AccountSignal(
+        signal_type=signal_type,
+        title=result.title or result.url,
+        url=result.url,
+        snippet=result.snippet,
+        source=signal_source(result.url),
+        recency_hint=recency_hint(" ".join([result.title, result.snippet])),
+        call_angle=call_angle_for_signal(signal_type, result.title, result.snippet, company),
+        search_query=result.query,
+    )
+
+
+def account_signals_from_page_text(company: str, page_text: str, source_url: str) -> list[AccountSignal]:
+    signals: list[AccountSignal] = []
+    lines = [re.sub(r"\s+", " ", line).strip() for line in page_text.splitlines()]
+    keywords = [
+        "announces",
+        "announced",
+        "press release",
+        "podcast",
+        "interview",
+        "webinar",
+        "conference",
+        "partnership",
+        "hiring",
+        "award",
+        "contract",
+        "appointed",
+    ]
+    for line in lines:
+        if len(line) < 45 or len(line) > 260:
+            continue
+        lower = line.lower()
+        if not any(keyword in lower for keyword in keywords):
+            continue
+        signal_type = classify_signal(line, "", source_url)
+        signals.append(
+            AccountSignal(
+                signal_type=signal_type,
+                title=line[:110],
+                url=source_url,
+                snippet=line,
+                source=signal_source(source_url),
+                recency_hint=recency_hint(line),
+                call_angle=call_angle_for_signal(signal_type, line, "", company),
+                search_query=f"Signal extracted from {source_url}",
+            )
+        )
+        if len(signals) >= 4:
+            break
+    return signals
+
+
+def dedupe_account_signals(signals: list[AccountSignal]) -> tuple[AccountSignal, ...]:
+    priority = {
+        "LinkedIn announcement": 95,
+        "Podcast or interview": 92,
+        "Announcement": 88,
+        "Partnership": 82,
+        "Leadership": 78,
+        "Hiring or growth": 74,
+        "Event or webinar": 72,
+        "Award or contract": 70,
+        "Account intel": 50,
+    }
+    best: dict[str, AccountSignal] = {}
+    for signal in signals:
+        key = signal.url.lower() or signal.title.lower()
+        if key not in best or priority.get(signal.signal_type, 0) > priority.get(best[key].signal_type, 0):
+            best[key] = signal
+    return tuple(
+        sorted(
+            best.values(),
+            key=lambda item: (priority.get(item.signal_type, 0), item.recency_hint != "Verify date"),
+            reverse=True,
+        )[:12]
+    )
+
+
+def account_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Type": signal.signal_type,
+                "Title": signal.title,
+                "Source": signal.source,
+                "Recency": signal.recency_hint,
+                "Call angle": signal.call_angle,
+                "URL": signal.url,
+                "Snippet": signal.snippet,
+            }
+            for signal in getattr(intel, "account_signals", tuple())
+        ]
+    )
+
+
+def fallback_call_intel_links(company: str) -> pd.DataFrame:
+    rows = []
+    for label, query in [
+        ("LinkedIn posts", f'site:linkedin.com/posts "{company}"'),
+        ("LinkedIn company updates", f'site:linkedin.com/company "{company}" posts'),
+        ("Podcast interviews", f'"{company}" podcast interview'),
+        ("Executive interviews", f'"{company}" CEO interview podcast'),
+        ("Press releases", f'"{company}" press release announcement'),
+        ("Events/webinars", f'"{company}" webinar conference government'),
+        ("Hiring/growth", f'"{company}" hiring government contracts'),
+    ]:
+        rows.append({"Intel path": label, "Search URL": search_url(query)})
+    return pd.DataFrame(rows)
+
+
 def contact_matches_role(contact: PublicContact, role: str) -> bool:
     haystack = " ".join([contact.title, contact.evidence, contact.recommended_reason]).lower()
     role_text = role.lower()
@@ -936,6 +1149,7 @@ def build_public_intel(
     contacts: list[PublicContact] = []
     page_linkedin_contacts: list[PublicContact] = []
     linkedin_signals: list[WebSearchResult] = []
+    account_signals: list[AccountSignal] = []
 
     index = 0
     while index < len(scan_urls) and len(scanned_urls) < 6 and scan_budget_available(scan_started_at):
@@ -952,6 +1166,7 @@ def build_public_intel(
         page_text = clean_text_from_html(html)
         page_texts.append(page_text[:20_000])
         contacts.extend(extract_contacts_from_text(page_text[:35_000], final_url))
+        account_signals.extend(account_signals_from_page_text(company, page_text[:35_000], final_url))
         page_contacts, page_signals = linkedin_contacts_from_page(html, final_url)
         page_linkedin_contacts.extend(page_contacts)
         for signal in page_signals:
@@ -970,6 +1185,18 @@ def build_public_intel(
             if result.url not in [signal.url for signal in linkedin_signals]:
                 linkedin_signals.append(result)
         if len(linkedin_signals) >= 10:
+            break
+
+    for query in account_signal_queries(company, award_id)[:8]:
+        if not scan_budget_available(scan_started_at):
+            break
+        for result in search_web_results(query, max_results=2, fetchable_only=False):
+            account_signal = signal_from_search_result(result, company)
+            if account_signal.url not in [signal.url for signal in account_signals]:
+                account_signals.append(account_signal)
+            if "linkedin.com" in result.url.lower() and result.url not in [signal.url for signal in linkedin_signals]:
+                linkedin_signals.append(result)
+        if len(account_signals) >= 12:
             break
 
     linkedin_contacts = dedupe_contacts([*page_linkedin_contacts, *linkedin_contacts_from_results(tuple(linkedin_signals))])
@@ -1006,6 +1233,7 @@ def build_public_intel(
         contacts=all_contacts,
         linkedin_contacts=linkedin_contacts,
         linkedin_signals=tuple(linkedin_signals[:10]),
+        account_signals=dedupe_account_signals(account_signals),
         sources=tuple(source_urls[:12]),
         scanned_urls=tuple(scanned_urls[:12]),
     )
@@ -1756,6 +1984,32 @@ with tabs[1]:
                 st.session_state[public_intel_key(selected_intel_account.company)] = existing_intel
 
         if isinstance(existing_intel, CompanyIntel):
+            signals = getattr(existing_intel, "account_signals", tuple())
+            if signals:
+                st.markdown("### Call Intel Beyond The Award")
+                st.caption("Use these public signals to make the first call relevant before you pivot into GovDash.")
+                st.dataframe(account_signals_dataframe(existing_intel), width="stretch", hide_index=True)
+                top_signal = signals[0]
+                st.markdown(
+                    f"""
+                    <div class="intel-card">
+                      <b>Best call opener angle</b>
+                      {html_escape(top_signal.call_angle)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.download_button(
+                    "Download call intel CSV",
+                    data=account_signals_dataframe(existing_intel).to_csv(index=False),
+                    file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-call-intel.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.markdown("### Call Intel Beyond The Award")
+                st.caption("No announcement/interview signals were found in the quick scan. Use these live research links to manually check public sources.")
+                st.dataframe(fallback_call_intel_links(selected_intel_account.company), width="stretch", hide_index=True)
+
             intel_cols = st.columns([0.55, 0.45])
             with intel_cols[0]:
                 st.markdown("### Company Intel")
@@ -2161,6 +2415,24 @@ with tabs[5]:
         selected_sequence_account = active_account(accounts)
         selected_sequence = selected_sequence_account.primary
         st.caption(f"Using active company: {selected_sequence_account.company}")
+        sequence_intel = st.session_state.get(public_intel_key(selected_sequence_account.company))
+        sequence_signals = getattr(sequence_intel, "account_signals", tuple()) if isinstance(sequence_intel, CompanyIntel) else tuple()
+
+        st.markdown("### Relevant Call Intel")
+        if sequence_signals:
+            for signal in sequence_signals[:3]:
+                st.markdown(
+                    f"""
+                    <div class="cadence-row">
+                      <b>{html_escape(signal.signal_type)}: {html_escape(signal.title)}</b><br>
+                      <span class="muted">{html_escape(signal.call_angle)}</span><br>
+                      <span class="muted">{html_escape(signal.source)} | {html_escape(signal.recency_hint)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("Run Public Intel scan first to populate announcements, LinkedIn updates, podcasts, interviews, and other call triggers.")
 
         st.markdown("### First-Touch Email")
         st.code(outreach_copy(selected_sequence), language="text")

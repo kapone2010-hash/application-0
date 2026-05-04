@@ -1059,6 +1059,7 @@ def hunter_contacts_dataframe(contacts: tuple[HunterContact, ...]) -> pd.DataFra
         [
             {
                 "Rank score": hunter_rank(contact),
+                "Confidence label": confidence_label("Hunter contact", contact.verification_status or contact.result, "Hunter", contact.source_url),
                 "Name": contact.full_name or "Name not returned",
                 "Title": contact.title,
                 "Email": contact.email,
@@ -1187,6 +1188,7 @@ def hubspot_company_matches_dataframe(matches: list[dict[str, str]]) -> pd.DataF
         [
             {
                 "HubSpot ID": match.get("id", ""),
+                "Confidence label": "Verified source" if "domain match" in str(match.get("reason", "")).lower() or "exact name match" in str(match.get("reason", "")).lower() else "Needs verification",
                 "Name": match.get("name", ""),
                 "Domain": match.get("domain", ""),
                 "Similarity": match.get("similarity", ""),
@@ -2033,24 +2035,28 @@ def hubspot_sync_result_dataframe(result: dict[str, object]) -> pd.DataFrame:
     rows = [
         {
             "Step": "Domain",
+            "Confidence label": confidence_label("Domain", str(result.get("domain_source") or ""), "Public web", str(result.get("domain") or "")),
             "Result": str(result.get("domain") or "Not found"),
             "Why": str(result.get("domain_source") or "No source returned"),
             "Next action": str(result.get("domain_action") or ""),
         },
         {
             "Step": "Duplicate check",
+            "Confidence label": "Verified source" if "exact" in str(result.get("duplicate_summary") or "").lower() else "Needs verification",
             "Result": str(result.get("duplicate_summary") or ""),
             "Why": "HubSpot search ran before the company sync.",
             "Next action": str(result.get("duplicate_action") or ""),
         },
         {
             "Step": "Company sync",
+            "Confidence label": "Verified source" if result.get("company_id") else "Needs verification",
             "Result": str(result.get("company_message") or ""),
             "Why": f"HubSpot company ID: {result.get('company_id') or 'not created'}",
             "Next action": str(result.get("company_action") or ""),
         },
         {
             "Step": "Contact sync",
+            "Confidence label": "Verified source" if int(result.get("synced_count") or 0) else ("Vendor enrichment" if int(result.get("imported_count") or 0) else "Needs verification"),
             "Result": (
                 f"{int(result.get('synced_count') or 0)} synced, "
                 f"{int(result.get('imported_count') or 0)} auto-imported, "
@@ -2065,6 +2071,7 @@ def hubspot_sync_result_dataframe(result: dict[str, object]) -> pd.DataFrame:
         rows.append(
             {
                 "Step": "Errors",
+                "Confidence label": "Needs verification",
                 "Result": f"{len(errors)} issue(s)",
                 "Why": "; ".join(str(error) for error in errors[:3]),
                 "Next action": "Open the source contact, fix the email/permission issue, and sync again.",
@@ -2168,6 +2175,7 @@ def verified_contacts_dataframe(company: str) -> pd.DataFrame:
         [
             {
                 "ID": contact.id,
+                "Confidence label": confidence_label_for_verified_contact(contact),
                 "Sequence gate": verified_contact_gate(contact)["gate"],
                 "Verified age": verified_contact_gate(contact)["age"],
                 "Evidence grade": verified_contact_gate(contact)["evidence_grade"],
@@ -3516,6 +3524,7 @@ def pain_points_dataframe(intel: CompanyIntel) -> pd.DataFrame:
         [
             {
                 "Industry": point.industry,
+                "Confidence label": confidence_label_for_pain(point),
                 "Pain point": point.pain_point,
                 "Evidence level": point.evidence_level,
                 "Severity": point.severity,
@@ -3535,6 +3544,7 @@ def account_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
         [
             {
                 "Type": signal.signal_type,
+                "Confidence label": confidence_label_for_signal(signal),
                 "Title": signal.title,
                 "Source": signal.source,
                 "Recency": signal.recency_hint,
@@ -3552,6 +3562,7 @@ def sam_opportunities_dataframe(opportunities: tuple[SamOpportunity, ...]) -> pd
         [
             {
                 "Match": sam_match_score(opportunity),
+                "Confidence label": "Official source",
                 "Title": opportunity.title,
                 "Notice type": opportunity.notice_type,
                 "Posted": opportunity.posted_date,
@@ -3757,6 +3768,44 @@ def source_audit_status(evidence_type: str, evidence_level: str, recency: str) -
     return "Review"
 
 
+def confidence_label(evidence_type: str = "", evidence_level: str = "", source: str = "", recency: str = "") -> str:
+    combined = f"{evidence_type} {evidence_level} {source} {recency}".lower()
+    if any(term in combined for term in ["usa spending", "usaspending", "sam.gov", "official", "source page scanned"]):
+        return "Official source"
+    if any(term in combined for term in ["verified current role", "ready to sequence", "a - current", "saved verified contact"]):
+        return "Verified source"
+    if any(term in combined for term in ["hunter", "apollo", "zoominfo", "people data labs", "clearbit", "clay", "vendor enrichment"]):
+        return "Vendor enrichment"
+    if any(term in combined for term in ["public web", "linkedin", "company-specific", "company signal", "source-backed"]):
+        return "Public source"
+    if any(term in combined for term in ["old", "stale", "recheck", "date not visible", "verify date"]):
+        return "Stale or needs recheck"
+    if any(term in combined for term in ["industry benchmark", "hypothesis", "not found", "research needed", "no source"]):
+        return "Hypothesis"
+    return "Needs verification"
+
+
+def confidence_label_for_contact(contact: PublicContact, quality: ContactQuality | None = None) -> str:
+    evidence = " ".join([contact.evidence, contact.source_url, contact.recommended_reason])
+    quality = quality or quality_for_contact(contact)
+    if "verified contact saved in crm" in evidence.lower():
+        return "Verified source"
+    return confidence_label("Public contact", quality.status, "LinkedIn signal" if "linkedin.com" in contact.source_url.lower() else "Public web", quality.freshness)
+
+
+def confidence_label_for_verified_contact(contact: VerifiedContact) -> str:
+    gate = verified_contact_gate(contact)
+    return confidence_label("Verified contact", f"{contact.verification_status} {gate['evidence_grade']}", contact.source_type, gate["gate"])
+
+
+def confidence_label_for_pain(point: PainPoint) -> str:
+    return confidence_label("Pain point", point.evidence_level, point.source, recency_hint(" ".join([point.evidence_title, point.snippet, point.source_url])))
+
+
+def confidence_label_for_signal(signal: AccountSignal) -> str:
+    return confidence_label(signal.signal_type, "Company signal", signal.source, signal.recency_hint)
+
+
 def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     scanned_at = getattr(intel, "scanned_at", "") if isinstance(intel, CompanyIntel) else ""
@@ -3766,6 +3815,7 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
         rows.append(
             {
                 "Evidence type": "Verified contact",
+                "Confidence label": confidence_label_for_verified_contact(contact),
                 "Item": contact.full_name,
                 "Evidence level": gate["evidence_grade"],
                 "Recency / gate": gate["gate"],
@@ -3784,6 +3834,7 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
             rows.append(
                 {
                     "Evidence type": "Public contact",
+                    "Confidence label": confidence_label_for_contact(contact, quality),
                     "Item": contact.full_name or contact.title or "Unnamed contact",
                     "Evidence level": quality.relevance,
                     "Recency / gate": quality.freshness,
@@ -3800,6 +3851,7 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
             rows.append(
                 {
                     "Evidence type": "Pain point",
+                    "Confidence label": confidence_label_for_pain(point),
                     "Item": point.pain_point,
                     "Evidence level": point.evidence_level,
                     "Recency / gate": recency_hint(" ".join([point.evidence_title, point.snippet, point.source_url])),
@@ -3816,6 +3868,7 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
             rows.append(
                 {
                     "Evidence type": signal.signal_type,
+                    "Confidence label": confidence_label_for_signal(signal),
                     "Item": signal.title,
                     "Evidence level": "Company signal",
                     "Recency / gate": signal.recency_hint,
@@ -3832,6 +3885,7 @@ def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) 
             rows.append(
                 {
                     "Evidence type": "Scanned source",
+                    "Confidence label": confidence_label("Scanned source", "Source page scanned", signal_source(url), "Captured"),
                     "Item": url_domain(url) or url,
                     "Evidence level": "Source page scanned",
                     "Recency / gate": "Captured",
@@ -4512,6 +4566,7 @@ def pursuit_package_dataframe(result: dict[str, object]) -> pd.DataFrame:
             {
                 "Step": str(row.get("step", "")) if isinstance(row, dict) else "",
                 "Status": str(row.get("status", "")) if isinstance(row, dict) else "",
+                "Confidence label": confidence_label(str(row.get("step", "")), str(row.get("status", "")), str(row.get("result", ""))) if isinstance(row, dict) else "",
                 "Result": str(row.get("result", "")) if isinstance(row, dict) else "",
                 "Next action": str(row.get("next_action", "")) if isinstance(row, dict) else "",
             }
@@ -4807,6 +4862,7 @@ def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = N
         rows.append(
             {
                 "Rank": target.rank,
+                "Confidence label": confidence_label_for_contact(best, quality) if best else "Needs verification",
                 "Target role": target.title,
                 "Best known person": best.full_name if best and best.full_name else "Research needed",
                 "Likely title": best.title if best else target.title,
@@ -5055,6 +5111,7 @@ def public_contacts_dataframe(intel: CompanyIntel) -> pd.DataFrame:
         [
             {
                 "Name": contact.full_name or "Not named",
+                "Confidence label": confidence_label_for_contact(contact),
                 "Title/Role": contact.title,
                 "Email": contact.email,
                 "Phone": contact.phone,
@@ -5079,6 +5136,7 @@ def public_contacts_quality_dataframe(intel: CompanyIntel) -> pd.DataFrame:
         [
             {
                 "Name": contact.full_name or "Not named",
+                "Confidence label": confidence_label_for_contact(contact, quality_for_contact(contact)),
                 "Title/Role": contact.title,
                 "Quality status": quality_for_contact(contact).status,
                 "Quality score": quality_for_contact(contact).score,
@@ -5339,6 +5397,7 @@ def to_dataframe(prospects: list[Prospect]) -> pd.DataFrame:
         [
             {
                 "Fit": p.govdash_fit_score,
+                "Confidence label": "Official source",
                 "Company": p.company,
                 "Award": p.award_id,
                 "Amount": money(p.amount),
@@ -5361,6 +5420,7 @@ def account_dataframe(accounts: list[Account]) -> pd.DataFrame:
             {
                 "Tier": account.tier,
                 "Score": account.priority_score,
+                "Confidence label": "Official source",
                 "Company": account.company,
                 "Normalized name": normalize_company_name(account.company),
                 "UEI(s)": ", ".join(account_uei_values(account)),
@@ -5406,6 +5466,7 @@ def crm_dataframe(accounts: list[Account]) -> pd.DataFrame:
         rows.append(
             {
                 "Company": account.company,
+                "Confidence label": confidence_label("CRM account", str(best_row.get("Contact readiness", "")), str(best_row.get("Best public source", ""))),
                 "Tier": account.tier,
                 "Score": account.priority_score,
                 "Status": crm.get("status", "New"),
@@ -5490,6 +5551,53 @@ def dataframe_with_links(data: pd.DataFrame, **kwargs: object) -> None:
                 help=f"Open {column} in a new browser tab.",
             )
     st.dataframe(df, column_config=column_config or None, **kwargs)
+
+
+def render_sales_cockpit(account: Account) -> None:
+    intel = st.session_state.get(public_intel_key(account.company))
+    intel = intel if isinstance(intel, CompanyIntel) else None
+    assessment = account_fit_assessment(account, intel)
+    contact_summary = contact_quality_summary(account, intel)
+    verified_contacts = load_verified_contacts(account.company)
+    domain, domain_source = suggested_hubspot_domain(account, intel, verified_contacts)
+    package_ready = isinstance(st.session_state.get(pursuit_package_key(account.company)), dict)
+    hubspot_company_id = st.session_state.get(f"hubspot_company_id_{account.company}", "")
+    primary = account.primary
+    cockpit_state = "Package ready" if package_ready else ("Research ready" if intel else "Needs research")
+    confidence = "Public source" if intel else "Official source"
+    if contact_summary.get("status") == "Good list":
+        confidence = "Verified source"
+
+    st.markdown(
+        f"""
+        <div class="cockpit-shell">
+          <div>
+            <div class="cockpit-kicker">{html_escape(cockpit_state)} | {html_escape(str(assessment['tier']))} | {html_escape(confidence)}</div>
+            <h2>{html_escape(account.company)}</h2>
+            <div class="cockpit-subtitle">{html_escape(primary.award_id)} | {money(primary.amount)} | {html_escape(primary.funding_sub_agency or primary.awarding_sub_agency or primary.awarding_agency)}</div>
+            <div class="cockpit-next"><b>Next best action:</b> {html_escape(str(assessment['next_move']))}</div>
+          </div>
+          <div class="cockpit-pill-grid">
+            <span>Action score {int(assessment['score'])}</span>
+            <span>{html_escape(str(contact_summary.get('status', 'No contacts')))}</span>
+            <span>{html_escape(domain or 'Domain needed')}</span>
+            <span>{'HubSpot linked' if hubspot_company_id else 'HubSpot not linked'}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cockpit_cols = st.columns(5)
+    cockpit_cols[0].metric("Award value", money(account.total_amount))
+    cockpit_cols[1].metric("Verified contacts", len(verified_contacts))
+    cockpit_cols[2].metric("Email-ready", len(email_ready_contacts(verified_contacts)))
+    cockpit_cols[3].metric("Call signals", int(assessment["signal_count"]))
+    cockpit_cols[4].metric("Pain signals", int(assessment["pain_count"]))
+    st.caption(
+        f"Confidence guide: {confidence}. Domain source: {domain_source}. "
+        "Use Account Brief for the full package, Contact Finder for people, and CRM Cadence for execution."
+    )
 
 
 def render_source_audit_persistence(company: str, audit_df: pd.DataFrame, key_prefix: str) -> None:
@@ -5686,6 +5794,60 @@ st.markdown(
         padding: .7rem .8rem;
         margin-bottom: .5rem;
     }
+    .cockpit-shell {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) minmax(260px, .65fr);
+        gap: 1rem;
+        align-items: stretch;
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: .6rem 0 1rem 0;
+    }
+    .cockpit-shell h2 {
+        margin: .12rem 0 .35rem 0;
+        font-size: 1.45rem;
+        line-height: 1.15;
+    }
+    .cockpit-kicker {
+        color: var(--blue);
+        font-size: .78rem;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+    .cockpit-subtitle,
+    .cockpit-next {
+        color: var(--muted);
+        font-size: .94rem;
+        margin-top: .25rem;
+    }
+    .cockpit-pill-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: .45rem;
+        align-content: center;
+    }
+    .cockpit-pill-grid span {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: .48rem .55rem;
+        background: var(--wash);
+        font-size: .83rem;
+        font-weight: 700;
+        color: #344054;
+        min-height: 2.25rem;
+        display: flex;
+        align-items: center;
+    }
+    @media (max-width: 800px) {
+        .cockpit-shell {
+            grid-template-columns: 1fr;
+        }
+        .cockpit-pill-grid {
+            grid-template-columns: 1fr;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -5835,6 +5997,7 @@ if selected_global_account:
     selected_global_account = active_account(accounts)
     with selector_cols[1]:
         st.metric("Selected company score", selected_global_account.priority_score, selected_global_account.tier)
+    render_sales_cockpit(selected_global_account)
 
 if api_messages or freshness.api_messages:
     with st.expander("API notes"):
@@ -7394,6 +7557,16 @@ with tabs[8]:
         "The Contact Readiness Gate scores each row by whether it has a named person, role relevance, source type, visible recency, and business contact data. "
         "Verified contacts now also show a Sequence Gate, Verified Age, Evidence Grade, and SDR action. "
         "Ready to sequence means the person has a current-role verification, a source, and a usable business contact path. Verify first or Recheck before sequence means the SDR should confirm role and source recency before outreach."
+    )
+    st.markdown("### Confidence Labels")
+    st.write(
+        "Major account, contact, pain-point, call-intel, source-audit, HubSpot, Hunter, SAM.gov, and pursuit-package tables now include a Confidence label. "
+        "Labels distinguish Official source, Verified source, Vendor enrichment, Public source, Hypothesis, Stale or needs recheck, and Needs verification so SDRs know what can be used directly and what needs review."
+    )
+    st.markdown("### Sales Cockpit")
+    st.write(
+        "The selected-account cockpit at the top of the app shows account state, action score, contact readiness, domain status, HubSpot link status, award value, call signals, pain signals, and the next best action. "
+        "Use it as the command center, then open Account Brief for the full package, Contact Finder for people, and CRM Cadence for execution."
     )
     st.markdown("### Source Audit Trail")
     st.write(

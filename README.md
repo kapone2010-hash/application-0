@@ -19,6 +19,8 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Uses Hunter.io contact enrichment when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Adds a verified-contact Sequence Gate with verified age, evidence grade, and SDR action so reps know whether a person is ready to sequence, needs recheck, or should be blocked.
+- Adds confidence labels across major account, contact, pain-point, call-intel, source-audit, Hunter, HubSpot, SAM.gov, and pursuit-package tables so SDRs can distinguish official sources, verified sources, vendor enrichment, public sources, hypotheses, stale data, and items needing review.
+- Adds a selected-account sales cockpit with readiness state, action score, contact readiness, domain status, HubSpot link status, award value, call signals, pain signals, and next best action.
 - Builds a source audit trail for contacts, pain points, call-intel signals, and scanned pages with source URL, capture/verification timestamp, evidence snippet, audit status, and SDR action.
 - Persists source-audit snapshots with reviewer/owner and review-note fields so evidence can be defended after outreach.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.

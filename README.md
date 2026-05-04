@@ -8,6 +8,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Checks USAspending source freshness before the full lead pull using the newest `Last Modified Date` for the current filters.
 - Groups award winners into account-level views.
 - Ranks accounts by GovDash fit, recent award value, number of awards, agencies, NAICS/PSC, and follow-on signals.
+- Adds a dynamic SDR action queue that blends award fit, verified contacts, public call-intel signals, pain evidence, open tasks, and contact readiness.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
 - Scans public web sources for company descriptions, likely website, source pages, public business emails/phones, named contacts, call-intel signals, evidence-backed pain points, and public LinkedIn result signals when available.
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
@@ -18,8 +19,9 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
 - Shows "why now" triggers and recommended next best actions.
-- Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, and notes.
-- Persists CRM fields and verified contacts in a local SQLite database (`application0_crm.sqlite3`).
+- Generates a downloadable call-prep brief with account context, what they won, why they may have won, best contact path, pain points, objections, discovery questions, and GovDash demo angle.
+- Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, notes, and activity/task logging.
+- Persists CRM fields, verified contacts, and activity history in a local SQLite database (`application0_crm.sqlite3`).
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
 - Exports account radar, award-level records, public intel, and CRM-ready cadence CSVs.
 - Shows product gaps and recommended next upgrades such as verified enrichment, SAM.gov detail, durable CRM storage, and activity sync.

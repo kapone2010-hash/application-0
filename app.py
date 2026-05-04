@@ -138,6 +138,24 @@ def init_database() -> None:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_verified_contacts_company ON verified_contacts(company)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crm_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                contact_name TEXT,
+                subject TEXT,
+                outcome TEXT,
+                notes TEXT,
+                due_date TEXT,
+                completed INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_crm_activities_company ON crm_activities(company)")
 
 
 @dataclass(frozen=True)
@@ -311,6 +329,21 @@ class VerifiedContact:
     verification_status: str
     verified_at: str
     notes: str
+
+
+@dataclass(frozen=True)
+class CrmActivity:
+    id: int
+    company: str
+    activity_type: str
+    contact_name: str
+    subject: str
+    outcome: str
+    notes: str
+    due_date: str
+    completed: bool
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -743,6 +776,106 @@ def import_verified_contacts_csv(uploaded_file: object, default_company: str) ->
         )
         count += 1
     return count
+
+
+def save_crm_activity(
+    company: str,
+    activity_type: str,
+    contact_name: str,
+    subject: str,
+    outcome: str,
+    notes: str,
+    due_date: str,
+    completed: bool = False,
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO crm_activities (
+                company, activity_type, contact_name, subject, outcome, notes,
+                due_date, completed, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                company.strip(),
+                activity_type.strip(),
+                contact_name.strip(),
+                subject.strip(),
+                outcome.strip(),
+                notes.strip(),
+                due_date.strip(),
+                int(completed),
+                now,
+                now,
+            ),
+        )
+
+
+def load_crm_activities(company: str, limit: int = 50) -> tuple[CrmActivity, ...]:
+    with db_connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM crm_activities
+            WHERE company = ?
+            ORDER BY completed ASC, COALESCE(due_date, '') ASC, created_at DESC
+            LIMIT ?
+            """,
+            (company, limit),
+        ).fetchall()
+    return tuple(
+        CrmActivity(
+            id=int(row["id"]),
+            company=str(row["company"] or ""),
+            activity_type=str(row["activity_type"] or ""),
+            contact_name=str(row["contact_name"] or ""),
+            subject=str(row["subject"] or ""),
+            outcome=str(row["outcome"] or ""),
+            notes=str(row["notes"] or ""),
+            due_date=str(row["due_date"] or ""),
+            completed=bool(row["completed"]),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+        )
+        for row in rows
+    )
+
+
+def update_crm_activity_completed(activity_id: int, completed: bool) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            UPDATE crm_activities
+            SET completed = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (int(completed), datetime.now().isoformat(timespec="seconds"), activity_id),
+        )
+
+
+def delete_crm_activity(activity_id: int) -> None:
+    with db_connect() as connection:
+        connection.execute("DELETE FROM crm_activities WHERE id = ?", (activity_id,))
+
+
+def crm_activities_dataframe(company: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ID": activity.id,
+                "Done": activity.completed,
+                "Due date": activity.due_date,
+                "Type": activity.activity_type,
+                "Contact": activity.contact_name,
+                "Subject": activity.subject,
+                "Outcome": activity.outcome,
+                "Notes": activity.notes,
+                "Created": activity.created_at,
+            }
+            for activity in load_crm_activities(company)
+        ]
+    )
 
 
 def parse_prospect(row: dict) -> Prospect:
@@ -1898,6 +2031,220 @@ def contact_quality_summary(account: Account, intel: CompanyIntel | None = None)
     }
 
 
+def account_fit_assessment(account: Account, intel: CompanyIntel | None = None) -> dict[str, object]:
+    contact_summary = contact_quality_summary(account, intel)
+    verified_count = len(load_verified_contacts(account.company))
+    activities = load_crm_activities(account.company, limit=20)
+    open_tasks = [activity for activity in activities if not activity.completed]
+    signals = getattr(intel, "account_signals", tuple()) if isinstance(intel, CompanyIntel) else tuple()
+    pain_points = getattr(intel, "pain_points", tuple()) if isinstance(intel, CompanyIntel) else tuple()
+
+    score = account.priority_score
+    reasons = score_breakdown(account)
+    blockers: list[str] = []
+
+    best_contact_score = int(contact_summary.get("best_score", 0))
+    if verified_count >= 2:
+        score += 12
+        reasons.append("Two or more saved verified contacts make this account ready for live outreach.")
+    elif verified_count == 1:
+        score += 8
+        reasons.append("One saved verified contact gives SDRs a real person to sequence.")
+    elif best_contact_score >= 75:
+        score += 6
+        reasons.append("Public scan found at least one named contact worth manual verification.")
+    else:
+        score -= 10
+        blockers.append("No verified contact is saved yet.")
+
+    if signals:
+        score += min(8, 3 + len(signals))
+        reasons.append("Public call-intel signals create a more relevant reason to call than the award alone.")
+    else:
+        blockers.append("Run Public Intel to add recent announcements, interviews, podcasts, hiring, or LinkedIn-style public signals.")
+
+    if pain_points:
+        score += 5
+        reasons.append("Pain points are backed by public evidence or industry benchmark research prompts.")
+    else:
+        blockers.append("Pain points are still generic until Public Intel finds company or industry evidence.")
+
+    if open_tasks:
+        score += 3
+        reasons.append("There is already a next CRM task queued for this account.")
+
+    score = max(0, min(score, 100))
+    if score >= 88 and verified_count:
+        tier = "Work today"
+        next_move = "Use the saved contact, open the Call Prep tab, and execute the next cadence step."
+    elif score >= 78:
+        tier = "High priority"
+        next_move = "Verify one named contact, then send a tailored first-touch using the call prep brief."
+    elif score >= 65:
+        tier = "Research first"
+        next_move = "Run Public Intel and add a verified contact before sequencing."
+    else:
+        tier = "Nurture"
+        next_move = "Keep in nurture unless the agency, NAICS, or award value is strategically important."
+
+    if not blockers:
+        blockers.append("No major blocker. Re-check role/current contact status before outreach.")
+
+    return {
+        "score": score,
+        "tier": tier,
+        "reasons": reasons[:6],
+        "blockers": blockers[:4],
+        "next_move": next_move,
+        "contact_gate": contact_summary.get("status", ""),
+        "verified_contacts": verified_count,
+        "best_contact_score": best_contact_score,
+        "open_tasks": len(open_tasks),
+        "signal_count": len(signals),
+        "pain_count": len(pain_points),
+    }
+
+
+def account_action_queue_dataframe(accounts: list[Account]) -> pd.DataFrame:
+    rows = []
+    for account in accounts:
+        intel = st.session_state.get(public_intel_key(account.company))
+        if not isinstance(intel, CompanyIntel):
+            intel = None
+        assessment = account_fit_assessment(account, intel)
+        rows.append(
+            {
+                "_sort_score": assessment["score"],
+                "_sort_value": account.total_amount,
+                "Action score": assessment["score"],
+                "Priority": assessment["tier"],
+                "Company": account.company,
+                "Base tier": account.tier,
+                "Award value": money(account.total_amount),
+                "Latest award": account.latest_award_date,
+                "Verified contacts": assessment["verified_contacts"],
+                "Contact gate": assessment["contact_gate"],
+                "Call signals": assessment["signal_count"],
+                "Pain signals": assessment["pain_count"],
+                "Open tasks": assessment["open_tasks"],
+                "Why priority": " ".join(str(reason) for reason in assessment["reasons"][:3]),
+                "Blockers": " ".join(str(blocker) for blocker in assessment["blockers"]),
+                "Next move": assessment["next_move"],
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["_sort_score", "_sort_value"], ascending=[False, False]).drop(columns=["_sort_score", "_sort_value"])
+
+
+def best_contact_summary(account: Account, intel: CompanyIntel | None = None) -> dict[str, str]:
+    people = people_to_contact_dataframe(account, intel)
+    if people.empty:
+        target = contact_targets(account)[0]
+        return {
+            "name": target.title,
+            "title": target.title,
+            "email": "",
+            "phone": "",
+            "source": search_url(target.search_query),
+            "reason": target.why,
+            "status": "Research needed",
+        }
+    row = people.iloc[0].to_dict()
+    return {
+        "name": str(row.get("Best known person", "")) or str(row.get("Target role", "")),
+        "title": str(row.get("Target role", "")),
+        "email": str(row.get("Email", "")),
+        "phone": str(row.get("Phone", "")),
+        "source": str(row.get("Source / search URL", "")),
+        "reason": str(row.get("Why this contact", "")),
+        "status": str(row.get("Contact status", "")),
+    }
+
+
+def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> dict[str, list[str] | str]:
+    primary = account.primary
+    agency = primary.funding_sub_agency or primary.awarding_sub_agency or primary.awarding_agency
+    contact = best_contact_summary(account, intel)
+    assessment = account_fit_assessment(account, intel)
+    signals = list(getattr(intel, "account_signals", tuple())) if isinstance(intel, CompanyIntel) else []
+    pains = list(getattr(intel, "pain_points", tuple())) if isinstance(intel, CompanyIntel) else []
+    if not pains:
+        pains = industry_benchmark_pain_points(
+            industry_category(primary.naics_description, primary.psc_description, primary.description, primary.psc_code),
+            account.company,
+        )[:3]
+
+    if isinstance(intel, CompanyIntel):
+        company_summary = intel.what_they_do
+        why_won = intel.why_they_may_have_won
+    else:
+        company_summary = (
+            f"{account.company} recently won work tied to {primary.naics_description or primary.psc_description or 'federal contracting'}. "
+            "Run Public Intel to replace this with source-backed company research."
+        )
+        why_won = (
+            f"The award record points to fit around {primary.contract_focus}. USAspending does not expose evaluation rationale, "
+            "so treat this as a hypothesis to validate."
+        )
+
+    return {
+        "headline": f"{account.company} | {assessment['tier']} | action score {assessment['score']}/100",
+        "account_summary": company_summary,
+        "what_they_won": (
+            f"{primary.award_id} for {money(primary.amount)} with {agency or 'the buying agency'}. "
+            f"{primary.description or 'No public description was included in the award result.'}"
+        ),
+        "why_they_may_have_won": why_won,
+        "why_now": why_now_triggers(primary)[:4],
+        "best_contact": (
+            f"{contact['name']} | {contact['title']} | {contact['status']}. "
+            f"{contact['reason']}"
+        ),
+        "contact_path": [
+            f"Email: {contact['email'] or 'not verified yet'}",
+            f"Phone: {contact['phone'] or 'not verified yet'}",
+            f"Source/search: {contact['source'] or 'use Contact Finder search links'}",
+        ],
+        "call_intel": [
+            f"{signal.signal_type}: {signal.call_angle}"
+            for signal in signals[:4]
+        ]
+        or ["No public call-intel signals are saved yet. Run Public Intel before using this as a live call brief."],
+        "pain_points": [
+            f"{point.pain_point} - ask: {point.recommended_question}"
+            for point in pains[:4]
+        ],
+        "talk_track": (
+            f"Congrats on {primary.award_id}. I saw the work with {agency or 'the agency'} and wanted to share a quick way "
+            f"{account.company} could turn this win into reusable capture, proposal, and contract evidence inside GovDash."
+        ),
+        "discovery_questions": discovery_questions(primary),
+        "objections": [
+            "We already have tools: ask where award kickoff, proposal reuse, compliance matrices, and delivery proof live today.",
+            "Timing is bad: anchor to the award kickoff, option-year, or follow-on pursuit window.",
+            "Not my role: ask who owns capture/proposal operations, contracts, or program evidence for this award.",
+        ],
+        "demo_angle": list(demo_asset_pack(primary, intel).values())[:4],
+        "next_move": str(assessment["next_move"]),
+    }
+
+
+def call_prep_markdown(account: Account, intel: CompanyIntel | None = None) -> str:
+    sections = call_prep_sections(account, intel)
+    lines = [f"# Call Prep: {sections['headline']}", ""]
+    for label in ["account_summary", "what_they_won", "why_they_may_have_won", "best_contact", "talk_track", "next_move"]:
+        title = label.replace("_", " ").title()
+        lines.extend([f"## {title}", str(sections[label]), ""])
+    for label in ["why_now", "contact_path", "call_intel", "pain_points", "discovery_questions", "objections", "demo_angle"]:
+        title = label.replace("_", " ").title()
+        lines.append(f"## {title}")
+        for item in sections[label]:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
 def product_gap_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -1920,9 +2267,9 @@ def product_gap_dataframe() -> pd.DataFrame:
                 "Priority": "High",
             },
             {
-                "Gap": "CRM persistence",
-                "Why it matters": "Streamlit session state is not a durable CRM database.",
-                "Recommended update": "Add Supabase/Airtable/Postgres or HubSpot/Salesforce sync for SDR ownership, activity history, and dedupe.",
+                "Gap": "Production CRM sync",
+                "Why it matters": "Local SQLite works for the prototype, but multi-user SDR teams need shared durable records and ownership.",
+                "Recommended update": "Add Supabase/Airtable/Postgres or HubSpot/Salesforce sync for shared accounts, activities, dedupe, and reporting.",
                 "Priority": "High",
             },
             {
@@ -2934,7 +3281,7 @@ if api_messages or freshness.api_messages:
         for message in api_messages:
             st.write(message)
 
-tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "CRM Cadence", "Demo Builder", "Outreach Sequence", "Data Notes"])
+tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "Call Prep", "CRM Cadence", "Demo Builder", "Outreach Sequence", "Data Notes"])
 
 with tabs[0]:
     st.subheader("Account Radar")
@@ -2956,6 +3303,11 @@ with tabs[0]:
 
         dataframe_with_links(account_dataframe(accounts), width="stretch", hide_index=True)
 
+        st.markdown("### SDR Action Queue")
+        st.caption("This dynamic score combines award fit, contact readiness, verified contacts, public call intel, pain evidence, and open CRM tasks.")
+        action_queue = account_action_queue_dataframe(accounts)
+        dataframe_with_links(action_queue, width="stretch", hide_index=True)
+
         export_cols = st.columns(3)
         export_cols[0].download_button(
             "Download account radar CSV",
@@ -2973,6 +3325,12 @@ with tabs[0]:
             "Download CRM CSV",
             data=crm_dataframe(accounts).to_csv(index=False),
             file_name="application-0-crm-export.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download SDR action queue CSV",
+            data=action_queue.to_csv(index=False),
+            file_name="application-0-sdr-action-queue.csv",
             mime="text/csv",
         )
 
@@ -3354,6 +3712,93 @@ with tabs[2]:
 
 with tabs[3]:
     if not accounts:
+        st.info("No accounts to prep. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_prep_account = active_account(accounts)
+        prep_intel = st.session_state.get(public_intel_key(selected_prep_account.company))
+        if not isinstance(prep_intel, CompanyIntel):
+            prep_intel = None
+        sections = call_prep_sections(selected_prep_account, prep_intel)
+        assessment = account_fit_assessment(selected_prep_account, prep_intel)
+
+        st.caption(f"Using active company: {selected_prep_account.company}")
+        st.markdown(
+            f"""
+            <div class="prospect-card">
+              <span class="tier-pill">{html_escape(str(sections['headline']))}</span>
+              <h3>SDR Call Prep Brief</h3>
+              <div class="muted">{html_escape(str(sections['what_they_won']))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        prep_metrics = st.columns(5)
+        prep_metrics[0].metric("Action score", int(assessment["score"]))
+        prep_metrics[1].metric("Priority", str(assessment["tier"]))
+        prep_metrics[2].metric("Verified contacts", int(assessment["verified_contacts"]))
+        prep_metrics[3].metric("Call signals", int(assessment["signal_count"]))
+        prep_metrics[4].metric("Pain signals", int(assessment["pain_count"]))
+
+        if prep_intel is None:
+            st.warning("Run Public Intel for this account to replace generic hypotheses with source-backed company signals before a live call.")
+
+        prep_cols = st.columns([0.55, 0.45])
+        with prep_cols[0]:
+            st.markdown("### Account Context")
+            for label in ["account_summary", "why_they_may_have_won", "best_contact", "talk_track", "next_move"]:
+                title = label.replace("_", " ").title()
+                st.markdown(
+                    f"""
+                    <div class="score-card">
+                      <b>{html_escape(title)}</b>
+                      {html_escape(str(sections[label]))}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("### Why Now")
+            for item in sections["why_now"]:
+                st.markdown(f'<div class="trigger">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+            st.markdown("### Contact Path")
+            for item in sections["contact_path"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+        with prep_cols[1]:
+            st.markdown("### Pain Points To Validate")
+            for item in sections["pain_points"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+            st.markdown("### Call Intel")
+            for item in sections["call_intel"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+            st.markdown("### Likely Objections")
+            for item in sections["objections"]:
+                st.markdown(f'<div class="score-card">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+        st.markdown("### Discovery Questions")
+        question_cols = st.columns(2)
+        for index, question in enumerate(sections["discovery_questions"]):
+            with question_cols[index % 2]:
+                st.markdown(f'<div class="score-card">{html_escape(str(question))}</div>', unsafe_allow_html=True)
+
+        st.markdown("### GovDash Demo Angle")
+        for item in sections["demo_angle"]:
+            st.markdown(f'<div class="demo-step">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+        st.download_button(
+            "Download call prep brief",
+            data=call_prep_markdown(selected_prep_account, prep_intel),
+            file_name=f"{selected_prep_account.company.lower().replace(' ', '-')}-call-prep.md",
+            mime="text/markdown",
+        )
+
+
+with tabs[4]:
+    if not accounts:
         st.info("No accounts to work. Adjust filters on the left to load recent award winners.")
     else:
         selected_account = active_account(accounts)
@@ -3454,15 +3899,13 @@ with tabs[3]:
             st.markdown("### Best Contact")
             best_target = contact_targets(selected_account)[0]
             crm_intel = st.session_state.get(public_intel_key(selected_account.company))
-            if isinstance(crm_intel, CompanyIntel) and crm_intel.contacts:
-                best_public = crm_intel.contacts[0]
-                best_contact_body = (
-                    f"{best_public.full_name or best_public.title}"
-                    f"{' | ' + best_public.email if best_public.email else ''}"
-                    f"{' | ' + best_public.phone if best_public.phone else ''}"
-                )
-            else:
-                best_contact_body = f"{best_target.title} - {best_target.why}"
+            best_contact = best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)
+            best_contact_body = (
+                f"{best_contact['name']}"
+                f"{' | ' + best_contact['email'] if best_contact['email'] else ''}"
+                f"{' | ' + best_contact['phone'] if best_contact['phone'] else ''}"
+                f" | {best_contact['status']}"
+            )
             st.markdown(
                 f"""
                 <div class="target-card">
@@ -3475,6 +3918,55 @@ with tabs[3]:
 
         st.markdown("### Account Award History")
         dataframe_with_links(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
+
+        st.markdown("### Activity Timeline & Tasks")
+        st.caption("Log calls, emails, LinkedIn touches, research tasks, and demo follow-ups. These activity rows are saved in the local CRM database.")
+        activity_df = crm_activities_dataframe(selected_account.company)
+        if activity_df.empty:
+            st.info("No activities logged for this account yet.")
+        else:
+            dataframe_with_links(activity_df, width="stretch", hide_index=True)
+            activity_options = {
+                f"{row['Type']} | {row['Due date'] or 'no due date'} | {row['Subject']} | ID {row['ID']}": int(row["ID"])
+                for _, row in activity_df.iterrows()
+            }
+            activity_cols = st.columns(2)
+            complete_choice = activity_cols[0].selectbox("Mark activity complete", [""] + list(activity_options.keys()), key=f"complete_activity_{selected_account.company}")
+            if complete_choice and activity_cols[0].button("Complete selected activity", key=f"complete_activity_btn_{selected_account.company}"):
+                update_crm_activity_completed(activity_options[complete_choice], True)
+                st.success("Activity marked complete.")
+                st.rerun()
+            delete_choice = activity_cols[1].selectbox("Delete activity", [""] + list(activity_options.keys()), key=f"delete_activity_{selected_account.company}")
+            if delete_choice and activity_cols[1].button("Delete selected activity", key=f"delete_activity_btn_{selected_account.company}"):
+                delete_crm_activity(activity_options[delete_choice])
+                st.success("Activity deleted.")
+                st.rerun()
+
+        verified_names = [contact.full_name for contact in load_verified_contacts(selected_account.company) if contact.full_name]
+        default_contact = verified_names[0] if verified_names else best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)["name"]
+        with st.form(f"activity_form_{selected_account.company}"):
+            activity_form_cols = st.columns(3)
+            activity_type = activity_form_cols[0].selectbox("Activity type", ["Email", "Call", "LinkedIn", "Research", "Demo follow-up", "Task", "Note"])
+            activity_due = activity_form_cols[1].date_input("Activity due date", value=next_step)
+            activity_completed = activity_form_cols[2].checkbox("Already complete")
+            activity_contact = st.text_input("Contact", value=default_contact)
+            activity_subject = st.text_input("Subject", value=f"{next_action}: {selected_account.company}")
+            activity_outcome = st.selectbox("Outcome", ["", "Planned", "Completed", "No answer", "Left voicemail", "Replied", "Meeting booked", "Needs research", "Disqualified"])
+            activity_notes = st.text_area("Activity notes", placeholder="What happened, what did they say, or what should happen next?")
+            submitted_activity = st.form_submit_button("Log activity")
+            if submitted_activity:
+                save_crm_activity(
+                    selected_account.company,
+                    activity_type,
+                    activity_contact,
+                    activity_subject,
+                    activity_outcome,
+                    activity_notes,
+                    activity_due.isoformat(),
+                    activity_completed,
+                )
+                st.success("Activity saved.")
+                st.rerun()
 
         st.markdown("### Recommended Cadence")
         cadence_cols = st.columns(2)
@@ -3497,7 +3989,7 @@ with tabs[3]:
             mime="text/csv",
         )
 
-with tabs[4]:
+with tabs[5]:
     if not accounts:
         st.info("No accounts to demo. Adjust filters on the left to load recent award winners.")
     else:
@@ -3569,7 +4061,7 @@ with tabs[4]:
             f"at {selected_demo.awarding_agency or 'the buying agency'}.\""
         )
 
-with tabs[5]:
+with tabs[6]:
     if not accounts:
         st.info("No accounts to sequence. Adjust filters on the left to load recent award winners.")
     else:
@@ -3630,7 +4122,7 @@ with tabs[5]:
                 unsafe_allow_html=True,
             )
 
-with tabs[6]:
+with tabs[7]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "
@@ -3657,5 +4149,6 @@ with tabs[6]:
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)
     st.markdown("### What To Add Next")
     st.write(
-        "My strongest recommendation: add verified contact enrichment plus a real CRM database next. The app is now strong for research and SDR prep, but a production SDR workflow needs durable account/contact records, dedupe, verified emails/phones, and activity sync."
+        "My strongest recommendation: move the local SQLite CRM to a shared production database and connect an approved contact-enrichment or CRM provider. "
+        "The app now has account scoring, call prep, verified contacts, and activity logging, but a team workflow needs shared permissions, dedupe, sync, and reporting."
     )

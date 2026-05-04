@@ -1303,6 +1303,82 @@ def hubspot_sync_activity(account: Account, activity: CrmActivity, domain: str =
     return activity_id, f"{activity_message} ID: {activity_id}. {details}"
 
 
+def cadence_day_offset(day_label: str) -> int:
+    match = re.search(r"\d+", day_label or "")
+    if not match:
+        return 0
+    return max(int(match.group(0)) - 1, 0)
+
+
+def cadence_activity_subject(account: Account, day_label: str, action: str) -> str:
+    return f"{day_label} {action}: {account.company} GovDash follow-up"
+
+
+def build_cadence_activities(account: Account, contact_name: str, start: date) -> tuple[CrmActivity, ...]:
+    now = datetime.now().isoformat(timespec="seconds")
+    activities: list[CrmActivity] = []
+    for day_label, action, detail in DEFAULT_CADENCE:
+        due = start + timedelta(days=cadence_day_offset(day_label))
+        activities.append(
+            CrmActivity(
+                id=0,
+                company=account.company,
+                activity_type=action,
+                contact_name=contact_name,
+                subject=cadence_activity_subject(account, day_label, action),
+                outcome="Planned",
+                notes=detail,
+                due_date=due.isoformat(),
+                completed=False,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return tuple(activities)
+
+
+def cadence_preview_dataframe(activities: tuple[CrmActivity, ...]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Due date": activity.due_date,
+                "Type": activity.activity_type,
+                "Contact": activity.contact_name,
+                "Subject": activity.subject,
+                "Notes": activity.notes,
+            }
+            for activity in activities
+        ]
+    )
+
+
+def save_cadence_activities(activities: tuple[CrmActivity, ...]) -> int:
+    for activity in activities:
+        save_crm_activity(
+            activity.company,
+            activity.activity_type,
+            activity.contact_name,
+            activity.subject,
+            activity.outcome,
+            activity.notes,
+            activity.due_date,
+            activity.completed,
+        )
+    return len(activities)
+
+
+def hubspot_sync_cadence(account: Account, activities: tuple[CrmActivity, ...], domain: str = "") -> tuple[int, list[str]]:
+    synced = 0
+    errors: list[str] = []
+    for activity in activities:
+        activity_id, message = hubspot_sync_activity(account, activity, domain)
+        if activity_id:
+            synced += 1
+        else:
+            errors.append(f"{activity.subject}: {message}")
+    return synced, errors
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def check_usaspending_freshness(start: date, end: date, min_amount: int, keyword: str) -> SourceFreshness:
     payload = build_search_payload(start, end, 1, min_amount, keyword, sort_field="Last Modified Date")
@@ -3653,8 +3729,8 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Email/call activity automation",
-                "Why it matters": "The app can create HubSpot tasks, notes, and calls from CRM Cadence when the private app has activity scopes, but it does not send email or run a compliant outbound sequence.",
-                "Recommended update": "Connect Gmail/Outlook or a sequencing tool with opt-out handling, consent/compliance controls, and reply tracking.",
+                "Why it matters": "The app can launch a 14-day HubSpot task cadence and create HubSpot tasks, notes, and calls, but it does not send emails or place calls.",
+                "Recommended update": "Connect Gmail/Outlook or a sequencing tool with opt-out handling, consent/compliance controls, and reply/call tracking.",
                 "Priority": "Medium",
             },
             {
@@ -5588,6 +5664,55 @@ with tabs[4]:
             f"Domain suggestion: {activity_hubspot_domain_source if activity_hubspot_domain else 'public search fallback'}."
         )
 
+        verified_names = [contact.full_name for contact in crm_verified_contacts if contact.full_name]
+        default_contact = verified_names[0] if verified_names else best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)["name"]
+
+        st.markdown("### Launch 14-Day HubSpot Cadence")
+        st.caption("Creates the six recommended follow-up activities in Application 0 and, when enabled, creates matching HubSpot tasks associated to the company and selected verified contact.")
+        cadence_cols = st.columns([0.34, 0.22, 0.22, 0.22])
+        cadence_contact = cadence_cols[0].selectbox(
+            "Cadence contact",
+            [""] + verified_names,
+            key=f"cadence_contact_{selected_account.company}",
+            help="Save a verified contact first so the cadence can associate to the right HubSpot contact.",
+        )
+        cadence_start = cadence_cols[1].date_input(
+            "Cadence start",
+            value=date.today(),
+            key=f"cadence_start_{selected_account.company}",
+        )
+        sync_cadence_to_hubspot = cadence_cols[2].checkbox(
+            "Create HubSpot tasks",
+            value=hubspot_enabled(),
+            disabled=not hubspot_enabled(),
+            key=f"sync_cadence_to_hubspot_{selected_account.company}",
+        )
+        cadence_activities = build_cadence_activities(selected_account, cadence_contact, cadence_start)
+        cadence_cols[3].metric("Tasks", len(cadence_activities))
+        if not verified_names:
+            st.warning("Save at least one verified contact before launching a HubSpot cadence.")
+        with st.expander("Preview cadence tasks"):
+            dataframe_with_links(cadence_preview_dataframe(cadence_activities), width="stretch", hide_index=True)
+        if st.button(
+            "Launch 14-Day Cadence",
+            key=f"launch_cadence_{selected_account.company}",
+            disabled=not bool(cadence_contact.strip()) or not bool(verified_names),
+            use_container_width=True,
+        ):
+            saved_count = save_cadence_activities(cadence_activities)
+            if sync_cadence_to_hubspot:
+                synced_count, sync_errors = hubspot_sync_cadence(selected_account, cadence_activities, hubspot_activity_domain)
+                if sync_errors:
+                    st.session_state[activity_flash_key] = (
+                        f"HubSpot warning: Created {saved_count} Application 0 cadence activities and {synced_count} HubSpot task(s). "
+                        f"First HubSpot issue: {sync_errors[0]}"
+                    )
+                else:
+                    st.session_state[activity_flash_key] = f"Launched cadence: created {saved_count} Application 0 activities and {synced_count} HubSpot tasks."
+            else:
+                st.session_state[activity_flash_key] = f"Launched cadence: created {saved_count} Application 0 activities."
+            st.rerun()
+
         loaded_activities = load_crm_activities(selected_account.company)
         activity_df = pd.DataFrame(
             [
@@ -5641,8 +5766,6 @@ with tabs[4]:
                     else:
                         st.error(sync_message)
 
-        verified_names = [contact.full_name for contact in crm_verified_contacts if contact.full_name]
-        default_contact = verified_names[0] if verified_names else best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)["name"]
         with st.form(f"activity_form_{selected_account.company}"):
             activity_form_cols = st.columns(3)
             activity_type = activity_form_cols[0].selectbox("Activity type", ["Email", "Call", "LinkedIn", "Research", "Demo follow-up", "Task", "Note"])
@@ -5897,6 +6020,7 @@ with tabs[7]:
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
         "The company domain is pre-filled from company intel or verified-contact email domains, then falls back to public website search if needed. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
+        "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."
     )
     st.markdown("### Gaps & Recommended Updates")

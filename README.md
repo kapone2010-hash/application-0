@@ -20,7 +20,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Adds a verified-contact Sequence Gate with verified age, evidence grade, and SDR action so reps know whether a person is ready to sequence, needs recheck, or should be blocked.
 - Builds a source audit trail for contacts, pain points, call-intel signals, and scanned pages with source URL, capture/verification timestamp, evidence snippet, audit status, and SDR action.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
-- Syncs active companies, verified contacts, and CRM cadence activities into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured and the private app has the needed activity scopes.
+- Syncs active companies, verified contacts, individual CRM activities, and one-click 14-day cadence task launches into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured and the private app has the needed activity scopes.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
 - Shows "why now" triggers and recommended next best actions.
@@ -82,7 +82,7 @@ HUBSPOT_ACCESS_TOKEN = "your_hubspot_private_app_token"
 
 The current HubSpot integration syncs companies and verified contacts in one click. The app pre-fills the company domain from public company intel or verified-contact email domains, and falls back to a quick public website search if the field is still blank.
 
-The CRM Cadence tab can also create HubSpot timeline activities. Planned follow-ups become HubSpot tasks, notes become HubSpot notes, and completed or outcome-based calls become HubSpot calls. If HubSpot denies a specific activity object because the private app is missing that scope, Application 0 still saves the activity locally/Supabase and shows a warning.
+The CRM Cadence tab can also create HubSpot timeline activities. Planned follow-ups become HubSpot tasks, notes become HubSpot notes, and completed or outcome-based calls become HubSpot calls. The 14-day cadence launcher creates six dated follow-up activities in Application 0 and can create the matching HubSpot tasks in one click. If HubSpot denies a specific activity object because the private app is missing that scope, Application 0 still saves the activity locally/Supabase and shows a warning.
 
 ## Deploy
 

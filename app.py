@@ -21,6 +21,7 @@ PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
 SAM_OPPORTUNITIES_SEARCH_URL = "https://api.sam.gov/opportunities/v2/search"
 HUNTER_DOMAIN_SEARCH_URL = "https://api.hunter.io/v2/domain-search"
 HUNTER_EMAIL_VERIFIER_URL = "https://api.hunter.io/v2/email-verifier"
+HUBSPOT_API_BASE_URL = "https://api.hubapi.com"
 APP_DB_PATH = Path("application0_crm.sqlite3")
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
@@ -293,6 +294,48 @@ def hunter_api_key() -> str:
 
 def hunter_enabled() -> bool:
     return bool(hunter_api_key())
+
+
+def hubspot_access_token() -> str:
+    return secret_value("HUBSPOT_ACCESS_TOKEN")
+
+
+def hubspot_enabled() -> bool:
+    return bool(hubspot_access_token())
+
+
+def hubspot_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {hubspot_access_token()}",
+        "Content-Type": "application/json",
+        "User-Agent": REQUEST_HEADERS["User-Agent"],
+    }
+
+
+def hubspot_request(method: str, path: str, **kwargs: object) -> dict[str, object]:
+    response = requests.request(
+        method,
+        f"{HUBSPOT_API_BASE_URL}{path}",
+        headers=hubspot_headers(),
+        timeout=30,
+        **kwargs,
+    )
+    response.raise_for_status()
+    return response.json() if response.content else {}
+
+
+def hubspot_ping() -> tuple[bool, str]:
+    if not hubspot_enabled():
+        return False, "HUBSPOT_ACCESS_TOKEN is not configured."
+    try:
+        hubspot_request("GET", "/crm/v3/objects/companies", params={"limit": "1", "properties": "name,domain"})
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        return False, f"HubSpot configured but not ready. HTTP {status}: {body}"
+    except requests.RequestException as exc:
+        return False, f"HubSpot configured but unreachable: {exc}"
+    return True, "HubSpot is configured for company/contact sync."
 
 
 @dataclass(frozen=True)
@@ -944,6 +987,118 @@ def hunter_contact_options(contacts: tuple[HunterContact, ...]) -> dict[str, int
     }
 
 
+def hubspot_search_company(company: str, domain: str = "") -> str:
+    filters = []
+    clean_domain = clean_company_domain(domain)
+    if clean_domain:
+        filters.append({"propertyName": "domain", "operator": "EQ", "value": clean_domain})
+    filters.append({"propertyName": "name", "operator": "EQ", "value": company})
+    for filter_item in filters:
+        result = hubspot_request(
+            "POST",
+            "/crm/v3/objects/companies/search",
+            json={
+                "filterGroups": [{"filters": [filter_item]}],
+                "properties": ["name", "domain"],
+                "limit": 1,
+            },
+        )
+        rows = result.get("results") if isinstance(result.get("results"), list) else []
+        if rows:
+            return str(rows[0].get("id") or "")
+    return ""
+
+
+def hubspot_upsert_company(account: Account, domain: str = "") -> tuple[str, str]:
+    if not hubspot_enabled():
+        return "", "HubSpot token is not configured."
+    clean_domain = clean_company_domain(domain)
+    properties = {"name": account.company}
+    if clean_domain:
+        properties["domain"] = clean_domain
+    try:
+        company_id = hubspot_search_company(account.company, clean_domain)
+        if company_id:
+            hubspot_request("PATCH", f"/crm/v3/objects/companies/{company_id}", json={"properties": properties})
+            return company_id, "HubSpot company updated."
+        created = hubspot_request("POST", "/crm/v3/objects/companies", json={"properties": properties})
+        return str(created.get("id") or ""), "HubSpot company created."
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        return "", f"HubSpot company sync failed. HTTP {status}: {body}"
+    except requests.RequestException as exc:
+        return "", f"HubSpot company sync failed: {exc}"
+
+
+def hubspot_search_contact(email: str) -> str:
+    if not email:
+        return ""
+    result = hubspot_request(
+        "POST",
+        "/crm/v3/objects/contacts/search",
+        json={
+            "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
+            "properties": ["email", "firstname", "lastname"],
+            "limit": 1,
+        },
+    )
+    rows = result.get("results") if isinstance(result.get("results"), list) else []
+    return str(rows[0].get("id") or "") if rows else ""
+
+
+def hubspot_contact_properties(contact: VerifiedContact) -> dict[str, str]:
+    first_name, last_name = split_name(contact.full_name)
+    properties = {
+        "email": contact.email,
+        "firstname": first_name,
+        "lastname": last_name,
+        "jobtitle": contact.title,
+        "phone": contact.phone,
+    }
+    return {key: value for key, value in properties.items() if value}
+
+
+def hubspot_associate_contact_to_company(contact_id: str, company_id: str) -> str:
+    if not contact_id or not company_id:
+        return "No association attempted."
+    for association_type in ("contact_to_company", "1"):
+        try:
+            hubspot_request(
+                "PUT",
+                f"/crm/v3/objects/contacts/{contact_id}/associations/companies/{company_id}/{association_type}",
+            )
+            return "Contact associated to company."
+        except requests.RequestException:
+            continue
+    return "Contact synced, but automatic company association was not available."
+
+
+def hubspot_upsert_contact(contact: VerifiedContact, company_id: str = "") -> tuple[str, str]:
+    if not hubspot_enabled():
+        return "", "HubSpot token is not configured."
+    if not contact.email:
+        return "", "HubSpot contact sync requires an email address."
+    properties = hubspot_contact_properties(contact)
+    try:
+        contact_id = hubspot_search_contact(contact.email)
+        if contact_id:
+            hubspot_request("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": properties})
+            action = "HubSpot contact updated."
+        else:
+            created = hubspot_request("POST", "/crm/v3/objects/contacts", json={"properties": properties})
+            contact_id = str(created.get("id") or "")
+            action = "HubSpot contact created."
+        association_message = hubspot_associate_contact_to_company(contact_id, company_id) if company_id else "No company association requested."
+        return contact_id, f"{action} {association_message}"
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        return "", f"HubSpot contact sync failed. HTTP {status}: {body}"
+    except requests.RequestException as exc:
+        return "", f"HubSpot contact sync failed: {exc}"
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def check_usaspending_freshness(start: date, end: date, min_amount: int, keyword: str) -> SourceFreshness:
     payload = build_search_payload(start, end, 1, min_amount, keyword, sort_field="Last Modified Date")
@@ -1385,6 +1540,15 @@ def clean_company_domain(value: str) -> str:
     if not domain or "." not in domain:
         return ""
     return domain.split("/")[0]
+
+
+def split_name(full_name: str) -> tuple[str, str]:
+    parts = [part for part in re.split(r"\s+", full_name.strip()) if part]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
 
 
 def import_verified_contacts_csv(uploaded_file: object, default_company: str) -> int:
@@ -3037,8 +3201,8 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Email/call activity automation",
-                "Why it matters": "The app tracks intent but does not send/log email or calls automatically.",
-                "Recommended update": "Integrate HubSpot/Salesforce, Gmail/Outlook, or a sequencing platform with opt-out/compliance controls.",
+                "Why it matters": "The app syncs companies/contacts to HubSpot but does not yet send emails, log calls, or sync tasks/notes automatically.",
+                "Recommended update": "Add HubSpot activity scopes when available, or connect Gmail/Outlook/sequencing tools with opt-out/compliance controls.",
                 "Priority": "Medium",
             },
             {
@@ -3980,6 +4144,16 @@ with st.sidebar:
         st.info("Hunter API key missing")
     st.caption("Hunter enrichment runs on demand in Contact Finder.")
 
+    st.header("HubSpot")
+    hubspot_ready, hubspot_message = hubspot_ping()
+    if hubspot_ready:
+        st.success("HubSpot connected")
+    elif hubspot_enabled():
+        st.warning("HubSpot token issue")
+    else:
+        st.info("HubSpot token missing")
+    st.caption(hubspot_message)
+
     st.header("Lead Filters")
     lookback_days = st.slider("Days back", 7, 90, DEFAULT_LOOKBACK_DAYS)
     result_limit = st.slider("Max awards", 10, 200, 50, step=10)
@@ -4398,6 +4572,68 @@ with tabs[2]:
                 st.rerun()
         else:
             st.info("No verified contacts saved for this account yet.")
+
+        st.markdown("### HubSpot Sync")
+        st.caption("Syncs the active company and selected verified contacts to HubSpot. Notes and tasks stay in Application 0/Supabase until those HubSpot scopes are available.")
+        hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
+        hubspot_domain = ""
+        if isinstance(hubspot_intel, CompanyIntel) and hubspot_intel.website:
+            hubspot_domain = clean_company_domain(hubspot_intel.website)
+        hubspot_cols = st.columns([0.34, 0.33, 0.33])
+        hubspot_domain_input = hubspot_cols[0].text_input(
+            "HubSpot company domain",
+            value=hubspot_domain,
+            placeholder="example.com",
+            key=f"hubspot_domain_{selected_contact_account.company}",
+        )
+        if hubspot_cols[1].button(
+            "Sync company to HubSpot",
+            key=f"sync_hubspot_company_{selected_contact_account.company}",
+            disabled=not hubspot_enabled(),
+            use_container_width=True,
+        ):
+            company_id, message = hubspot_upsert_company(selected_contact_account, hubspot_domain_input)
+            if company_id:
+                st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
+                st.success(f"{message} ID: {company_id}")
+            else:
+                st.error(message)
+        hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
+        hubspot_cols[2].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
+        if not hubspot_enabled():
+            st.warning("Add HUBSPOT_ACCESS_TOKEN to Streamlit secrets to enable HubSpot sync.")
+        verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
+        if verified_contacts_for_sync:
+            sync_options = {
+                f"{contact.full_name or contact.email} | {contact.title or 'No title'} | {contact.email or 'no email'}": contact.id
+                for contact in verified_contacts_for_sync
+            }
+            sync_choice = st.selectbox(
+                "Verified contact to sync",
+                [""] + list(sync_options.keys()),
+                key=f"hubspot_contact_choice_{selected_contact_account.company}",
+            )
+            if sync_choice and st.button(
+                "Sync selected contact to HubSpot",
+                key=f"sync_hubspot_contact_{selected_contact_account.company}",
+                disabled=not hubspot_enabled(),
+            ):
+                contact_id = sync_options[sync_choice]
+                contact = next((item for item in verified_contacts_for_sync if item.id == contact_id), None)
+                if contact is None:
+                    st.error("Could not find selected verified contact.")
+                else:
+                    if not hubspot_company_id:
+                        hubspot_company_id, _ = hubspot_upsert_company(selected_contact_account, hubspot_domain_input)
+                        if hubspot_company_id:
+                            st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = hubspot_company_id
+                    synced_contact_id, message = hubspot_upsert_contact(contact, str(hubspot_company_id or ""))
+                    if synced_contact_id:
+                        st.success(f"{message} Contact ID: {synced_contact_id}")
+                    else:
+                        st.error(message)
+        else:
+            st.caption("Save or import at least one verified contact before syncing contacts to HubSpot.")
 
         st.markdown("### Hunter Contact Enrichment")
         st.caption("Uses Hunter Domain Search to find professional email addresses for the company domain/name. Review before saving to verified contacts.")
@@ -5052,6 +5288,11 @@ with tabs[7]:
     st.write(
         "When `HUNTER_API_KEY` is configured, Contact Finder can run Hunter Domain Search for the active company. "
         "Hunter rows are treated as review-first enrichment leads and can be saved into verified contacts after the SDR checks role fit and source evidence."
+    )
+    st.markdown("### HubSpot Sync")
+    st.write(
+        "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and selected verified contacts to HubSpot. "
+        "This first HubSpot integration uses company/contact scopes only; notes, tasks, and cadence activities remain in Application 0 and Supabase until the HubSpot account exposes activity scopes."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

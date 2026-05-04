@@ -18,6 +18,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Uses Hunter.io contact enrichment when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
+- Syncs active companies and selected verified contacts into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
 - Shows "why now" triggers and recommended next best actions.
@@ -68,6 +69,16 @@ HUNTER_API_KEY = "your_hunter_api_key"
 ```
 
 Hunter results are review-first. The app shows Hunter confidence, verification status, role signals, source URLs, and lets the SDR save selected people into verified contacts.
+
+## HubSpot Sync
+
+Add this secret locally and in Streamlit Community Cloud to sync companies and verified contacts:
+
+```toml
+HUBSPOT_ACCESS_TOKEN = "your_hubspot_private_app_token"
+```
+
+The current HubSpot integration syncs companies and contacts. Application 0 keeps notes, tasks, and cadence activities in Supabase until the HubSpot account exposes the relevant activity scopes.
 
 ## Deploy
 

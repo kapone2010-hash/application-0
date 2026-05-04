@@ -7,6 +7,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Pulls recent federal contract awards from the USAspending public API.
 - Checks USAspending source freshness before the full lead pull using the newest `Last Modified Date` for the current filters.
 - Groups award winners into account-level views.
+- Flags duplicate or parent/subsidiary account risk using UEI, company domain, normalized-name similarity, address, and state overlap before HubSpot sync.
 - Ranks accounts by GovDash fit, recent award value, number of awards, agencies, NAICS/PSC, and follow-on signals.
 - Adds a dynamic SDR action queue that blends award fit, verified contacts, public call-intel signals, pain evidence, open tasks, and contact readiness.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
@@ -84,6 +85,8 @@ The current HubSpot integration syncs companies and verified contacts in one cli
 
 The CRM Cadence tab can also create HubSpot timeline activities. Planned follow-ups become HubSpot tasks, notes become HubSpot notes, and completed or outcome-based calls become HubSpot calls. The 14-day cadence launcher creates six dated follow-up activities in Application 0 and can create the matching HubSpot tasks in one click. If HubSpot denies a specific activity object because the private app is missing that scope, Application 0 still saves the activity locally/Supabase and shows a warning.
 
+Before creating a HubSpot company, Application 0 searches HubSpot by domain, exact name, and fuzzy name token match. Exact matches update the existing company. Likely fuzzy duplicates are blocked for manual review instead of creating another company record.
+
 ## Deploy
 
 Use [DEPLOYMENT.md](DEPLOYMENT.md) for the GitHub and Streamlit Community Cloud deployment checklist.
@@ -101,6 +104,8 @@ The contact list uses a readiness gate. `Ready to verify` means there is a named
 Verified contacts use a stricter Sequence Gate. `Ready to sequence` requires a verified current role, source evidence, and a usable business email or phone. `Verify before sequence`, `Verify missing fields`, and `Recheck before sequence` tell the SDR exactly what needs to be confirmed before outreach. `Do not sequence` keeps blocked contacts out of cadence.
 
 The Source Audit Trail is available after public scans and in Contact Finder. It gives SDRs a downloadable evidence table for contacts, pain points, call-intel signals, and scanned pages so they can see where each recommendation came from before calling or emailing.
+
+The Account Radar tab includes an Account Dedupe & Parent/Subsidiary Risk table. It is a review queue, not an automatic merge tool: use it before syncing to HubSpot so activity, contacts, and cadence tasks do not get split across duplicate company records.
 
 Verified contacts can be added manually or imported from CSV enrichment exports. Accepted CSV columns include `company`, `full_name` or `name`, `title`, `email`, `phone`, `linkedin_url` or `linkedin`, `source_url` or `source`, `source_type`, `verification_status` or `status`, and `notes`.
 

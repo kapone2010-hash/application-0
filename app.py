@@ -4,6 +4,7 @@ import os
 import sqlite3
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -92,6 +93,24 @@ NON_COMPANY_SITE_DOMAINS = {
     "twitter.com",
     "usaspending.gov",
     "x.com",
+}
+COMPANY_LEGAL_SUFFIXES = {
+    "and",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "dba",
+    "inc",
+    "incorporated",
+    "llc",
+    "llp",
+    "lp",
+    "ltd",
+    "pllc",
+    "services",
+    "solutions",
+    "the",
 }
 DEFAULT_CADENCE = [
     ("Day 1", "Email", "Congratulate them on the award, cite the agency/value, and ask who owns capture or proposal operations."),
@@ -1015,25 +1034,128 @@ def hunter_contact_options(contacts: tuple[HunterContact, ...]) -> dict[str, int
     }
 
 
-def hubspot_search_company(company: str, domain: str = "") -> str:
-    filters = []
+def company_name_similarity(left: str, right: str) -> int:
+    left_norm = normalize_company_name(left)
+    right_norm = normalize_company_name(right)
+    if not left_norm or not right_norm:
+        return 0
+    return int(SequenceMatcher(None, left_norm, right_norm).ratio() * 100)
+
+
+def hubspot_company_search_payload(filter_item: dict[str, str], limit: int = 5) -> dict[str, object]:
+    return {
+        "filterGroups": [{"filters": [filter_item]}],
+        "properties": ["name", "domain"],
+        "limit": limit,
+    }
+
+
+def hubspot_company_matches(company: str, domain: str = "", limit: int = 5) -> list[dict[str, str]]:
+    filters: list[dict[str, str]] = []
     clean_domain = clean_company_domain(domain)
     if clean_domain:
         filters.append({"propertyName": "domain", "operator": "EQ", "value": clean_domain})
     filters.append({"propertyName": "name", "operator": "EQ", "value": company})
+    if company:
+        filters.append({"propertyName": "name", "operator": "CONTAINS_TOKEN", "value": company})
+
+    matches: list[dict[str, str]] = []
+    seen: set[str] = set()
     for filter_item in filters:
-        result = hubspot_request(
-            "POST",
-            "/crm/v3/objects/companies/search",
-            json={
-                "filterGroups": [{"filters": [filter_item]}],
-                "properties": ["name", "domain"],
-                "limit": 1,
-            },
-        )
+        try:
+            result = hubspot_request(
+                "POST",
+                "/crm/v3/objects/companies/search",
+                json=hubspot_company_search_payload(filter_item, limit),
+            )
+        except requests.HTTPError:
+            if filter_item.get("operator") == "CONTAINS_TOKEN":
+                continue
+            raise
         rows = result.get("results") if isinstance(result.get("results"), list) else []
-        if rows:
-            return str(rows[0].get("id") or "")
+        for row in rows:
+            company_id = str(row.get("id") or "")
+            if not company_id or company_id in seen:
+                continue
+            properties = row.get("properties") if isinstance(row.get("properties"), dict) else {}
+            match_name = str(properties.get("name") or "")
+            match_domain = clean_company_domain(str(properties.get("domain") or ""))
+            reason_parts = []
+            if clean_domain and match_domain == clean_domain:
+                reason_parts.append("domain match")
+            if match_name.lower() == company.lower():
+                reason_parts.append("exact name")
+            similarity = company_name_similarity(company, match_name)
+            if similarity >= 82:
+                reason_parts.append(f"name similarity {similarity}")
+            matches.append(
+                {
+                    "id": company_id,
+                    "name": match_name,
+                    "domain": match_domain,
+                    "similarity": str(similarity),
+                    "reason": ", ".join(reason_parts) or "HubSpot search result",
+                }
+            )
+            seen.add(company_id)
+    matches.sort(
+        key=lambda item: (
+            item.get("domain") == clean_domain and bool(clean_domain),
+            int(item.get("similarity") or 0),
+        ),
+        reverse=True,
+    )
+    return matches[:limit]
+
+
+def hubspot_company_duplicate_warning(company: str, domain: str, matches: list[dict[str, str]]) -> str:
+    clean_domain = clean_company_domain(domain)
+    warning_matches = []
+    for match in matches:
+        similarity = int(match.get("similarity") or 0)
+        same_domain = clean_domain and match.get("domain") == clean_domain
+        same_name = match.get("name", "").lower() == company.lower()
+        if same_domain or same_name or similarity >= 90:
+            continue
+        if similarity >= 65:
+            warning_matches.append(match)
+    if not warning_matches:
+        return ""
+    preview = "; ".join(
+        f"{match.get('name') or 'Unnamed'}"
+        f"{' (' + match.get('domain', '') + ')' if match.get('domain') else ''}"
+        for match in warning_matches[:3]
+    )
+    return f"Potential HubSpot duplicate found before create: {preview}. Verify before creating a new company."
+
+
+def hubspot_company_matches_dataframe(matches: list[dict[str, str]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "HubSpot ID": match.get("id", ""),
+                "Name": match.get("name", ""),
+                "Domain": match.get("domain", ""),
+                "Similarity": match.get("similarity", ""),
+                "Match reason": match.get("reason", ""),
+            }
+            for match in matches
+        ]
+    )
+
+
+def hubspot_search_company(company: str, domain: str = "") -> str:
+    matches = hubspot_company_matches(company, domain, limit=5)
+    clean_domain = clean_company_domain(domain)
+    for match in matches:
+        if clean_domain and match.get("domain") == clean_domain:
+            return str(match.get("id") or "")
+    for match in matches:
+        if match.get("name", "").lower() == company.lower():
+            return str(match.get("id") or "")
+    for match in matches:
+        if int(match.get("similarity") or 0) >= 90:
+            return str(match.get("id") or "")
     return ""
 
 
@@ -1045,6 +1167,10 @@ def hubspot_upsert_company(account: Account, domain: str = "") -> tuple[str, str
     if clean_domain:
         properties["domain"] = clean_domain
     try:
+        matches = hubspot_company_matches(account.company, clean_domain, limit=5)
+        duplicate_warning = hubspot_company_duplicate_warning(account.company, clean_domain, matches)
+        if duplicate_warning:
+            return "", duplicate_warning
         company_id = hubspot_search_company(account.company, clean_domain)
         if company_id:
             hubspot_request("PATCH", f"/crm/v3/objects/companies/{company_id}", json={"properties": properties})
@@ -1934,6 +2060,38 @@ def business_domain_candidate(domain: str) -> bool:
     if domain in NON_COMPANY_SITE_DOMAINS:
         return False
     return not any(domain.endswith(f".{blocked}") for blocked in NON_COMPANY_SITE_DOMAINS)
+
+
+def normalize_company_name(company: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", (company or "").lower())
+    words = [word for word in text.split() if word not in COMPANY_LEGAL_SUFFIXES]
+    return " ".join(words)
+
+
+def account_uei_values(account: Account) -> tuple[str, ...]:
+    values = sorted({prospect.uei.strip().upper() for prospect in account.prospects if prospect.uei.strip()})
+    return tuple(values)
+
+
+def account_state_values(account: Account) -> tuple[str, ...]:
+    values = sorted({prospect.state.strip().upper() for prospect in account.prospects if prospect.state.strip()})
+    return tuple(values)
+
+
+def account_address_values(account: Account) -> tuple[str, ...]:
+    values = sorted({prospect.address.strip().lower() for prospect in account.prospects if prospect.address.strip()})
+    return tuple(values)
+
+
+def account_known_domain(account: Account, include_verified_contacts: bool = True) -> str:
+    intel = st.session_state.get(public_intel_key(account.company))
+    if isinstance(intel, CompanyIntel) and intel.website:
+        domain = clean_company_domain(intel.website)
+        if business_domain_candidate(domain):
+            return domain
+    if not include_verified_contacts:
+        return ""
+    return likely_company_domain_from_contacts(load_verified_contacts(account.company))
 
 
 def split_name(full_name: str) -> tuple[str, str]:
@@ -3558,6 +3716,79 @@ def account_action_queue_dataframe(accounts: list[Account]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["_sort_score", "_sort_value"], ascending=[False, False]).drop(columns=["_sort_score", "_sort_value"])
 
 
+def account_duplicate_score(left: Account, right: Account, domain_by_company: dict[str, str] | None = None) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+
+    left_uei = set(account_uei_values(left))
+    right_uei = set(account_uei_values(right))
+    shared_uei = sorted(left_uei & right_uei)
+    if shared_uei:
+        score += 70
+        reasons.append(f"Shared UEI: {', '.join(shared_uei[:2])}")
+
+    domain_by_company = domain_by_company or {}
+    left_domain = domain_by_company.get(left.company, "")
+    right_domain = domain_by_company.get(right.company, "")
+    if left_domain and right_domain and left_domain == right_domain:
+        score += 60
+        reasons.append(f"Shared domain: {left_domain}")
+
+    name_similarity = company_name_similarity(left.company, right.company)
+    if name_similarity >= 92:
+        score += 35
+        reasons.append(f"Very similar names ({name_similarity})")
+    elif name_similarity >= 82:
+        score += 22
+        reasons.append(f"Similar names ({name_similarity})")
+    elif normalize_company_name(left.company) in normalize_company_name(right.company) or normalize_company_name(right.company) in normalize_company_name(left.company):
+        score += 18
+        reasons.append("Parent/subsidiary style name overlap")
+
+    shared_states = sorted(set(account_state_values(left)) & set(account_state_values(right)))
+    if shared_states:
+        score += 8
+        reasons.append(f"Shared state: {', '.join(shared_states[:2])}")
+
+    shared_addresses = sorted(set(account_address_values(left)) & set(account_address_values(right)))
+    if shared_addresses:
+        score += 12
+        reasons.append("Shared address")
+
+    return min(score, 100), reasons
+
+
+def account_duplicate_risk_dataframe(accounts: list[Account], threshold: int = 45) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    domain_by_company = {account.company: account_known_domain(account, include_verified_contacts=False) for account in accounts}
+    for left_index, left in enumerate(accounts):
+        for right in accounts[left_index + 1 :]:
+            score, reasons = account_duplicate_score(left, right, domain_by_company)
+            if score < threshold:
+                continue
+            keep = left if (left.total_amount, left.award_count, left.latest_award_date) >= (right.total_amount, right.award_count, right.latest_award_date) else right
+            duplicate = right if keep is left else left
+            rows.append(
+                {
+                    "_score": score,
+                    "Confidence": score,
+                    "Keep account": keep.company,
+                    "Possible duplicate": duplicate.company,
+                    "Match reason": "; ".join(reasons),
+                    "Keep UEI(s)": ", ".join(account_uei_values(keep)),
+                    "Duplicate UEI(s)": ", ".join(account_uei_values(duplicate)),
+                    "Keep domain": domain_by_company.get(keep.company, ""),
+                    "Duplicate domain": domain_by_company.get(duplicate.company, ""),
+                    "Keep value": money(keep.total_amount),
+                    "Duplicate value": money(duplicate.total_amount),
+                    "Recommended action": "Review before HubSpot sync; merge CRM activity under the keep account if this is the same entity.",
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("_score", ascending=False).drop(columns=["_score"])
+
+
 def best_contact_summary(account: Account, intel: CompanyIntel | None = None) -> dict[str, str]:
     people = people_to_contact_dataframe(account, intel)
     if people.empty:
@@ -3741,9 +3972,9 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Account dedupe and subsidiaries",
-                "Why it matters": "Government award recipients can appear under subsidiaries, DBAs, UEIs, and parent companies.",
-                "Recommended update": "Normalize by UEI/CAGE/domain and add parent-child account mapping.",
-                "Priority": "Medium",
+                "Why it matters": "The app now flags likely duplicates by UEI, domain, normalized-name similarity, state, and address, but it does not perform automated merge writes.",
+                "Recommended update": "Add explicit parent-child account records, manual merge workflow, and HubSpot merge/de-dupe review queues.",
+                "Priority": "Low",
             },
         ]
     )
@@ -4326,6 +4557,9 @@ def account_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Tier": account.tier,
                 "Score": account.priority_score,
                 "Company": account.company,
+                "Normalized name": normalize_company_name(account.company),
+                "UEI(s)": ", ".join(account_uei_values(account)),
+                "Known domain": account_known_domain(account, include_verified_contacts=False),
                 "Awards": account.award_count,
                 "Total recent value": money(account.total_amount),
                 "Largest award": money(account.largest_award),
@@ -4810,6 +5044,20 @@ with tabs[0]:
         action_queue = account_action_queue_dataframe(accounts)
         dataframe_with_links(action_queue, width="stretch", hide_index=True)
 
+        st.markdown("### Account Dedupe & Parent/Subsidiary Risk")
+        duplicate_risk = account_duplicate_risk_dataframe(accounts)
+        if duplicate_risk.empty:
+            st.success("No high-confidence duplicate account risks found in the current pull.")
+        else:
+            st.caption("Review these before syncing to HubSpot. Matches use UEI, domain, normalized-name similarity, state, and address overlap.")
+            dataframe_with_links(duplicate_risk, width="stretch", hide_index=True)
+            st.download_button(
+                "Download duplicate-risk CSV",
+                data=duplicate_risk.to_csv(index=False),
+                file_name="application-0-account-duplicate-risk.csv",
+                mime="text/csv",
+            )
+
         export_cols = st.columns(3)
         export_cols[0].download_button(
             "Download account radar CSV",
@@ -5143,6 +5391,21 @@ with tabs[2]:
             key=hubspot_domain_key,
         )
         hubspot_cols[0].caption(f"Suggested from: {hubspot_domain_source}" if hubspot_domain else "If blank, the sync button will search public web for the company site.")
+        if hubspot_cols[2].button(
+            "Check HubSpot duplicates",
+            key=f"check_hubspot_duplicates_{selected_contact_account.company}",
+            disabled=not hubspot_enabled(),
+            use_container_width=True,
+        ):
+            try:
+                hs_matches = hubspot_company_matches(selected_contact_account.company, hubspot_domain_input, limit=5)
+                st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = hs_matches
+            except requests.RequestException as exc:
+                st.error(f"HubSpot duplicate check failed: {exc}")
+        hs_matches = st.session_state.get(f"hubspot_duplicate_matches_{selected_contact_account.company}", [])
+        if isinstance(hs_matches, list) and hs_matches:
+            st.caption("HubSpot duplicate check results. The sync button will update exact domain/name matches and block likely fuzzy duplicates for review.")
+            dataframe_with_links(hubspot_company_matches_dataframe(hs_matches), width="stretch", hide_index=True)
         if hubspot_cols[1].button(
             "Sync company + contacts",
             key=f"sync_hubspot_company_{selected_contact_account.company}",
@@ -5170,7 +5433,10 @@ with tabs[2]:
                 if len(sync_errors) > 3:
                     st.warning(f"{len(sync_errors) - 3} additional contact sync error(s) hidden.")
             else:
-                st.error(message)
+                if "Potential HubSpot duplicate" in message:
+                    st.warning(message)
+                else:
+                    st.error(message)
         hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
         hubspot_cols[2].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
         if not hubspot_enabled():
@@ -6019,6 +6285,7 @@ with tabs[7]:
     st.write(
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
         "The company domain is pre-filled from company intel or verified-contact email domains, then falls back to public website search if needed. "
+        "Before creating a HubSpot company, the app checks domain, exact name, and fuzzy name-token matches so likely duplicates are blocked for review. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."

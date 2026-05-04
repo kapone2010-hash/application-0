@@ -15,6 +15,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
+- Uses Hunter.io contact enrichment when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
@@ -57,6 +58,16 @@ SAM_API_KEY = "your_sam_gov_api_key"
 ```
 
 SAM.gov enrichment is run on demand from the Public Intel tab for the active account. Government points of contact returned by SAM.gov are shown as procurement context, not as SDR targets at the contractor company.
+
+## Hunter Contact Enrichment
+
+Add this secret locally and in Streamlit Community Cloud to enable Hunter.io Domain Search in Contact Finder:
+
+```toml
+HUNTER_API_KEY = "your_hunter_api_key"
+```
+
+Hunter results are review-first. The app shows Hunter confidence, verification status, role signals, source URLs, and lets the SDR save selected people into verified contacts.
 
 ## Deploy
 

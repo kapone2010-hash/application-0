@@ -49,9 +49,10 @@ Before sharing the app, open Supabase and run `supabase_schema.sql` in the SQL E
 SUPABASE_URL = "https://your-project-ref.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
 SAM_API_KEY = "your-sam-gov-api-key"
+HUNTER_API_KEY = "your-hunter-api-key"
 ```
 
-The deployed app will use Supabase for CRM accounts, verified contacts, and activity history when those secrets are configured. Without them, it falls back to local SQLite, which is not durable across cloud redeploys. `SAM_API_KEY` enables the optional SAM.gov enrichment button in Public Intel.
+The deployed app will use Supabase for CRM accounts, verified contacts, and activity history when those secrets are configured. Without them, it falls back to local SQLite, which is not durable across cloud redeploys. `SAM_API_KEY` enables the optional SAM.gov enrichment button in Public Intel. `HUNTER_API_KEY` enables optional Hunter.io contact enrichment in Contact Finder.
 
 ## 4. After Deploy
 

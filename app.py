@@ -19,6 +19,8 @@ import streamlit as st
 USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
 SAM_OPPORTUNITIES_SEARCH_URL = "https://api.sam.gov/opportunities/v2/search"
+HUNTER_DOMAIN_SEARCH_URL = "https://api.hunter.io/v2/domain-search"
+HUNTER_EMAIL_VERIFIER_URL = "https://api.hunter.io/v2/email-verifier"
 APP_DB_PATH = Path("application0_crm.sqlite3")
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
@@ -285,6 +287,14 @@ def sam_enabled() -> bool:
     return bool(sam_api_key())
 
 
+def hunter_api_key() -> str:
+    return secret_value("HUNTER_API_KEY")
+
+
+def hunter_enabled() -> bool:
+    return bool(hunter_api_key())
+
+
 @dataclass(frozen=True)
 class Prospect:
     award_id: str
@@ -471,6 +481,27 @@ class CrmActivity:
     completed: bool
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class HunterContact:
+    full_name: str
+    first_name: str
+    last_name: str
+    title: str
+    email: str
+    phone: str
+    linkedin_url: str
+    department: str
+    seniority: str
+    confidence: int
+    verification_status: str
+    result: str
+    score: int
+    domain: str
+    company: str
+    source_url: str
+    sources: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -775,6 +806,142 @@ def fetch_sam_opportunities(account: Account, limit: int = 50) -> tuple[tuple[Sa
         f"Total API records reported: {payload.get('totalRecords', 'unknown')}."
     )
     return tuple(parsed[:20]), message
+
+
+def hunter_source_urls(row: dict[str, object]) -> tuple[str, ...]:
+    sources = row.get("sources") if isinstance(row.get("sources"), list) else []
+    urls = []
+    for source in sources:
+        if isinstance(source, dict):
+            url = str(source.get("uri") or source.get("domain") or "")
+            if url and url not in urls:
+                urls.append(url)
+    return tuple(urls[:5])
+
+
+def parse_hunter_contact(row: dict[str, object], domain: str, company: str) -> HunterContact:
+    first_name = str(row.get("first_name") or "")
+    last_name = str(row.get("last_name") or "")
+    full_name = str(row.get("value") or "")
+    if not full_name or "@" in full_name:
+        full_name = " ".join(part for part in [first_name, last_name] if part)
+    email = str(row.get("value") or row.get("email") or "")
+    linkedin_url = str(row.get("linkedin") or "")
+    sources = hunter_source_urls(row)
+    verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
+    return HunterContact(
+        full_name=full_name,
+        first_name=first_name,
+        last_name=last_name,
+        title=str(row.get("position") or ""),
+        email=email,
+        phone=str(row.get("phone_number") or ""),
+        linkedin_url=linkedin_url,
+        department=str(row.get("department") or ""),
+        seniority=str(row.get("seniority") or ""),
+        confidence=int(row.get("confidence") or 0),
+        verification_status=str(verification.get("status") or row.get("verification_status") or ""),
+        result=str(verification.get("result") or row.get("result") or ""),
+        score=int(verification.get("score") or row.get("score") or 0),
+        domain=domain,
+        company=company,
+        source_url=sources[0] if sources else linkedin_url,
+        sources=sources,
+    )
+
+
+def hunter_rank(contact: HunterContact) -> int:
+    haystack = " ".join([contact.title, contact.department, contact.seniority]).lower()
+    score = contact.confidence
+    if contact.full_name:
+        score += 20
+    if contact.verification_status == "valid" or contact.result == "deliverable":
+        score += 25
+    elif contact.verification_status in {"accept_all", "unknown"}:
+        score += 8
+    if contact.phone:
+        score += 10
+    if any(keyword in haystack for keyword in CONTACT_TITLE_KEYWORDS):
+        score += 25
+    if any(term in haystack for term in ["business development", "capture", "proposal", "contracts", "executive", "management", "sales", "operations"]):
+        score += 15
+    return score
+
+
+def fetch_hunter_contacts(company: str, domain: str = "", limit: int = 25) -> tuple[tuple[HunterContact, ...], str]:
+    if not hunter_enabled():
+        return tuple(), "HUNTER_API_KEY is not configured."
+    clean_domain = clean_company_domain(domain)
+    params: dict[str, object] = {
+        "api_key": hunter_api_key(),
+        "limit": min(max(limit, 1), 100),
+        "type": "personal",
+        "department": "executive,management,sales,operations,legal,it",
+    }
+    if clean_domain:
+        params["domain"] = clean_domain
+    else:
+        params["company"] = company
+    try:
+        response = requests.get(
+            HUNTER_DOMAIN_SEARCH_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        return tuple(), f"Hunter returned HTTP {status}: {body}"
+    except requests.RequestException as exc:
+        return tuple(), f"Hunter request failed: {exc}"
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    result_domain = str(data.get("domain") or clean_domain)
+    result_company = str(data.get("organization") or company)
+    emails = data.get("emails") if isinstance(data.get("emails"), list) else []
+    contacts = [parse_hunter_contact(row, result_domain, result_company) for row in emails if isinstance(row, dict)]
+    contacts.sort(key=hunter_rank, reverse=True)
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return tuple(contacts), (
+        f"Hunter returned {len(contacts)} personal contact(s)"
+        f"{' for ' + result_domain if result_domain else ''}. "
+        f"Results reported: {meta.get('results', len(contacts))}."
+    )
+
+
+def hunter_contacts_dataframe(contacts: tuple[HunterContact, ...]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Rank score": hunter_rank(contact),
+                "Name": contact.full_name or "Name not returned",
+                "Title": contact.title,
+                "Email": contact.email,
+                "Phone": contact.phone,
+                "LinkedIn URL": contact.linkedin_url,
+                "Department": contact.department,
+                "Seniority": contact.seniority,
+                "Hunter confidence": contact.confidence,
+                "Verification": contact.verification_status,
+                "Verifier result": contact.result,
+                "Verifier score": contact.score,
+                "Domain": contact.domain,
+                "Company": contact.company,
+                "Source URL": contact.source_url,
+                "Sources": ", ".join(contact.sources),
+            }
+            for contact in contacts
+        ]
+    )
+
+
+def hunter_contact_options(contacts: tuple[HunterContact, ...]) -> dict[str, int]:
+    return {
+        f"{contact.full_name or contact.email} | {contact.title or 'No title'} | {contact.email}": index
+        for index, contact in enumerate(contacts)
+    }
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1133,6 +1300,24 @@ def delete_verified_contact(contact_id: int) -> None:
         connection.execute("DELETE FROM verified_contacts WHERE id = ?", (contact_id,))
 
 
+def save_hunter_contact(company: str, contact: HunterContact) -> None:
+    save_verified_contact(
+        company=company,
+        full_name=contact.full_name or contact.email,
+        title=contact.title,
+        email=contact.email,
+        phone=contact.phone,
+        linkedin_url=contact.linkedin_url,
+        source_url=contact.source_url or (contact.sources[0] if contact.sources else ""),
+        source_type="Hunter",
+        verification_status=f"Hunter {contact.verification_status or contact.result or 'enriched'}".strip(),
+        notes=(
+            f"Hunter confidence {contact.confidence}; result {contact.result}; department {contact.department}; "
+            f"seniority {contact.seniority}; domain {contact.domain}; sources {', '.join(contact.sources[:3])}"
+        ),
+    )
+
+
 def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
     source = contact.linkedin_url or contact.source_url
     evidence = (
@@ -1187,6 +1372,19 @@ def clean_sam_url(url: str) -> str:
     if not url or url.lower() == "null":
         return ""
     return url
+
+
+def clean_company_domain(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urlparse(value)
+    domain = parsed.netloc.lower().replace("www.", "")
+    if not domain or "." not in domain:
+        return ""
+    return domain.split("/")[0]
 
 
 def import_verified_contacts_csv(uploaded_file: object, default_company: str) -> int:
@@ -2815,9 +3013,9 @@ def product_gap_dataframe() -> pd.DataFrame:
         [
             {
                 "Gap": "Verified contact enrichment",
-                "Why it matters": "Public search is inconsistent for direct emails, phones, and current titles.",
-                "Recommended update": "Connect Apollo, ZoomInfo, Hunter, People Data Labs, Clearbit, Clay, or a CRM-approved enrichment provider.",
-                "Priority": "High",
+                "Why it matters": "Hunter is connected for professional emails, but some govcon accounts need direct dials, mobile phones, and richer org charts.",
+                "Recommended update": "Add Apollo, ZoomInfo, People Data Labs, Clay, or CRM-approved enrichment as optional second-source providers.",
+                "Priority": "Medium",
             },
             {
                 "Gap": "Contact recency confirmation",
@@ -3775,6 +3973,13 @@ with st.sidebar:
         st.info("SAM API key missing")
     st.caption("SAM.gov enrichment runs on demand for the active account.")
 
+    st.header("Hunter")
+    if hunter_enabled():
+        st.success("Hunter API key configured")
+    else:
+        st.info("Hunter API key missing")
+    st.caption("Hunter enrichment runs on demand in Contact Finder.")
+
     st.header("Lead Filters")
     lookback_days = st.slider("Days back", 7, 90, DEFAULT_LOOKBACK_DAYS)
     result_limit = st.slider("Max awards", 10, 200, 50, step=10)
@@ -4193,6 +4398,66 @@ with tabs[2]:
                 st.rerun()
         else:
             st.info("No verified contacts saved for this account yet.")
+
+        st.markdown("### Hunter Contact Enrichment")
+        st.caption("Uses Hunter Domain Search to find professional email addresses for the company domain/name. Review before saving to verified contacts.")
+        hunter_key = f"hunter_contacts_{selected_contact_account.company}"
+        hunter_message_key = f"hunter_message_{selected_contact_account.company}"
+        hunter_contacts = st.session_state.get(hunter_key, tuple())
+        if not isinstance(hunter_contacts, tuple):
+            hunter_contacts = tuple()
+        hunter_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
+        likely_domain = ""
+        if isinstance(hunter_intel, CompanyIntel) and hunter_intel.website:
+            likely_domain = clean_company_domain(hunter_intel.website)
+        hunter_cols = st.columns([0.34, 0.33, 0.33])
+        hunter_domain = hunter_cols[0].text_input(
+            "Company domain",
+            value=likely_domain,
+            placeholder="example.com",
+            key=f"hunter_domain_{selected_contact_account.company}",
+            help="Domain is best. Leave blank to let Hunter search by company name.",
+        )
+        hunter_limit = hunter_cols[1].number_input("Max Hunter contacts", min_value=5, max_value=50, value=25, step=5)
+        run_hunter = hunter_cols[2].button(
+            "Run Hunter enrichment",
+            key=f"run_hunter_{selected_contact_account.company}",
+            disabled=not hunter_enabled(),
+            use_container_width=True,
+        )
+        if run_hunter:
+            with st.spinner("Searching Hunter for professional contacts..."):
+                hunter_contacts, hunter_message = fetch_hunter_contacts(
+                    selected_contact_account.company,
+                    hunter_domain,
+                    int(hunter_limit),
+                )
+                st.session_state[hunter_key] = hunter_contacts
+                st.session_state[hunter_message_key] = hunter_message
+        if not hunter_enabled():
+            st.warning("Add HUNTER_API_KEY to Streamlit secrets to enable Hunter enrichment.")
+        else:
+            st.caption(st.session_state.get(hunter_message_key, "Hunter is ready. Run enrichment for this active account."))
+        if hunter_contacts:
+            dataframe_with_links(hunter_contacts_dataframe(hunter_contacts), width="stretch", hide_index=True)
+            save_options = hunter_contact_options(hunter_contacts)
+            save_choice = st.selectbox(
+                "Save Hunter contact as verified",
+                [""] + list(save_options.keys()),
+                key=f"save_hunter_choice_{selected_contact_account.company}",
+            )
+            if save_choice and st.button("Save selected Hunter contact", key=f"save_hunter_btn_{selected_contact_account.company}"):
+                save_hunter_contact(selected_contact_account.company, hunter_contacts[save_options[save_choice]])
+                st.success("Hunter contact saved to verified contacts.")
+                st.rerun()
+            st.download_button(
+                "Download Hunter contacts CSV",
+                data=hunter_contacts_dataframe(hunter_contacts).to_csv(index=False),
+                file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-hunter-contacts.csv",
+                mime="text/csv",
+            )
+        elif st.session_state.get(hunter_message_key):
+            st.info(str(st.session_state[hunter_message_key]))
 
         with st.form(f"verified_contact_form_{selected_contact_account.company}"):
             form_cols = st.columns(2)
@@ -4782,6 +5047,11 @@ with tabs[7]:
         "When `SAM_API_KEY` is configured, Public Intel can pull official SAM.gov award-notice candidates for the active account. "
         "These rows add procurement context such as solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, and government point of contact. "
         "Government POCs are shown as notice context, not contractor SDR targets."
+    )
+    st.markdown("### Hunter Enrichment")
+    st.write(
+        "When `HUNTER_API_KEY` is configured, Contact Finder can run Hunter Domain Search for the active company. "
+        "Hunter rows are treated as review-first enrichment leads and can be saved into verified contacts after the SDR checks role fit and source evidence."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

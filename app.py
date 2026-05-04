@@ -247,6 +247,20 @@ class AccountSignal:
 
 
 @dataclass(frozen=True)
+class PainPoint:
+    industry: str
+    pain_point: str
+    evidence_level: str
+    evidence_title: str
+    source_url: str
+    source: str
+    snippet: str
+    severity: str
+    govdash_angle: str
+    recommended_question: str
+
+
+@dataclass(frozen=True)
 class CompanyIntel:
     company: str
     website: str
@@ -256,6 +270,7 @@ class CompanyIntel:
     linkedin_contacts: tuple[PublicContact, ...]
     linkedin_signals: tuple[WebSearchResult, ...]
     account_signals: tuple[AccountSignal, ...]
+    pain_points: tuple[PainPoint, ...]
     sources: tuple[str, ...]
     scanned_urls: tuple[str, ...]
 
@@ -983,6 +998,317 @@ def dedupe_account_signals(signals: list[AccountSignal]) -> tuple[AccountSignal,
     )
 
 
+def industry_category(naics_description: str, psc_description: str, description: str, psc_code: str = "") -> str:
+    text = " ".join([naics_description, psc_description, description, psc_code]).lower()
+    if any(term in text for term in ["cyber", "software", "cloud", "data", "network", "telecom", "information technology", "computer", "digital"]):
+        return "IT, cyber, and digital services"
+    if any(term in text for term in ["construction", "architect", "engineering", "facilities", "maintenance", "repair", "utilities"]):
+        return "Construction, engineering, and facilities"
+    if any(term in text for term in ["aircraft", "missile", "weapon", "defense", "aerospace", "satellite", "ship", "tactical"]):
+        return "Defense, aerospace, and mission systems"
+    if any(term in text for term in ["medical", "health", "pharma", "laboratory", "clinical", "hospital", "biolog"]):
+        return "Healthcare, life sciences, and labs"
+    if any(term in text for term in ["logistics", "transport", "warehouse", "supply", "freight", "material", "equipment"]):
+        return "Logistics, supply chain, and products"
+    if any(term in text for term in ["research", "development", "scientific", "analysis", "professional", "management", "consulting"]):
+        return "Professional, research, and advisory services"
+    if any(term in text for term in ["security", "guard", "protective", "investigation"]):
+        return "Security and protective services"
+    return "General government contractor"
+
+
+def pain_point_from_signal(signal: AccountSignal, industry: str) -> PainPoint | None:
+    text = " ".join([signal.signal_type, signal.title, signal.snippet]).lower()
+    if any(term in text for term in ["hiring", "recruiting", "jobs", "talent", "staffing"]):
+        return PainPoint(
+            industry,
+            "Staffing or delivery capacity pressure",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "High",
+            "Use GovDash to standardize capture/proposal handoffs and reduce ramp time for new staff or distributed teams.",
+            "How are you keeping capture, proposal, and delivery process consistent as the team grows or shifts resources?",
+        )
+    if any(term in text for term in ["partnership", "teaming", "subcontract", "alliance", "collaboration"]):
+        return PainPoint(
+            industry,
+            "Partner and subcontractor coordination complexity",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "Medium",
+            "Position GovDash as the shared workspace for partner evidence, requirements, assignments, and reusable proposal material.",
+            "When partners or subs are involved, where do requirements, evidence, and proposal inputs usually get tracked?",
+        )
+    if any(term in text for term in ["webinar", "conference", "event", "speaking", "panel", "thought leadership"]):
+        return PainPoint(
+            industry,
+            "Market knowledge is not automatically converted into capture action",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "Medium",
+            "Use GovDash to turn market signals into qualified opportunities, capture notes, proposal outlines, and reusable evidence.",
+            "How does your team turn event or market insight into actual capture plans and proposal assets?",
+        )
+    if any(term in text for term in ["podcast", "interview", "conversation", "episode"]):
+        return PainPoint(
+            industry,
+            "Executive priorities may not be translated into repeatable operating process",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "Medium",
+            "Connect the public executive narrative to repeatable capture/proposal workflows inside GovDash.",
+            "I heard the public discussion around this priority; how is that showing up in your pursuit and proposal process?",
+        )
+    if any(term in text for term in ["cyber", "cmmc", "security", "compliance", "audit", "certification", "authorization"]):
+        return PainPoint(
+            industry,
+            "Compliance, security, or audit evidence burden",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "High",
+            "Show GovDash organizing compliance evidence, owner assignments, proposal requirements, and reusable security language.",
+            "Where do compliance evidence, security narratives, and proposal requirements live today?",
+        )
+    if any(term in text for term in ["modernization", "digital", "cloud", "data", "ai", "automation", "software"]):
+        return PainPoint(
+            industry,
+            "Modernization work creates fast-changing requirements and evidence needs",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "High",
+            "Show GovDash as a way to keep requirements, technical narratives, and proof points synchronized across pursuits.",
+            "How do capture and delivery teams keep technical proof points reusable as requirements evolve?",
+        )
+    if any(term in text for term in ["award", "contract", "task order", "idiq", "bpa", "option"]):
+        return PainPoint(
+            industry,
+            "Multiple awards or vehicles can create follow-on capture and contract-evidence sprawl",
+            "Company/public signal",
+            signal.title,
+            signal.url,
+            signal.source,
+            signal.snippet,
+            "Medium",
+            "Use GovDash to connect award records, past performance, option-year evidence, and follow-on opportunity research.",
+            "How are you reusing this work as past performance and evidence for similar opportunities?",
+        )
+    return None
+
+
+def pain_points_from_page_text(company: str, industry: str, page_text: str, source_url: str) -> list[PainPoint]:
+    pain_keywords = [
+        "challenge",
+        "challenges",
+        "compliance",
+        "audit",
+        "cmmc",
+        "cybersecurity",
+        "staffing",
+        "hiring",
+        "supply chain",
+        "quality",
+        "modernization",
+        "transition",
+        "implementation",
+        "delivery",
+        "subcontractor",
+        "partner",
+        "proposal",
+        "capture",
+        "contract management",
+        "risk",
+    ]
+    points: list[PainPoint] = []
+    for line in [re.sub(r"\s+", " ", item).strip() for item in page_text.splitlines()]:
+        if len(line) < 55 or len(line) > 280:
+            continue
+        lower = line.lower()
+        if not any(keyword in lower for keyword in pain_keywords):
+            continue
+        pseudo_signal = AccountSignal(
+            "Account intel",
+            line[:120],
+            source_url,
+            line,
+            signal_source(source_url),
+            recency_hint(line),
+            call_angle_for_signal("Account intel", line, "", company),
+            f"Pain evidence extracted from {source_url}",
+        )
+        point = pain_point_from_signal(pseudo_signal, industry)
+        if point is None:
+            point = PainPoint(
+                industry,
+                "Operational complexity surfaced in public company content",
+                "Company/public page",
+                line[:120],
+                source_url,
+                signal_source(source_url),
+                line,
+                "Medium",
+                "Use GovDash to organize requirements, ownership, source evidence, proposal inputs, and delivery proof in one account workspace.",
+                "Where is this workflow managed today, and what still depends on spreadsheets, shared drives, or ad hoc notes?",
+            )
+        points.append(point)
+        if len(points) >= 5:
+            break
+    return points
+
+
+def industry_benchmark_pain_points(industry: str, company: str) -> list[PainPoint]:
+    benchmarks = {
+        "IT, cyber, and digital services": [
+            (
+                "Security/compliance evidence and technical narrative reuse",
+                "CMMC cybersecurity compliance government contractors proposal evidence",
+                "How much time does the team spend recreating security, compliance, or technical evidence for each pursuit?",
+            ),
+            (
+                "Fast-changing cloud/data/AI requirements across capture and delivery",
+                "federal IT modernization contractor proposal requirements cloud data AI challenges",
+                "How do capture and delivery teams keep technical win themes and proof points current?",
+            ),
+        ],
+        "Construction, engineering, and facilities": [
+            (
+                "Field documentation, subcontractor coordination, and modification evidence",
+                "federal construction contractor subcontractor documentation modifications compliance challenges",
+                "How are field notes, subcontractor inputs, modifications, and option-year evidence organized?",
+            ),
+            (
+                "Past-performance proof scattered across projects",
+                "federal construction past performance documentation proposal challenges",
+                "How quickly can the team turn project proof into proposal-ready past performance?",
+            ),
+        ],
+        "Defense, aerospace, and mission systems": [
+            (
+                "Complex technical requirements and mission evidence reuse",
+                "defense contractor technical proposal requirements past performance evidence challenges",
+                "Where do technical proof points, mission outcomes, and compliance evidence live today?",
+            ),
+            (
+                "Partner/team coordination on complex pursuits",
+                "defense contractor teaming subcontractor proposal coordination challenges",
+                "How do primes, subs, and internal teams coordinate proposal inputs and delivery evidence?",
+            ),
+        ],
+        "Healthcare, life sciences, and labs": [
+            (
+                "Regulated documentation and audit-ready evidence",
+                "federal healthcare contractor compliance documentation audit evidence challenges",
+                "How are regulated requirements and audit evidence tracked across proposal and delivery?",
+            ),
+            (
+                "Specialized staffing and continuity pressure",
+                "healthcare government contractor staffing continuity contract delivery challenges",
+                "How does the team preserve continuity when specialized staff or sites change?",
+            ),
+        ],
+        "Logistics, supply chain, and products": [
+            (
+                "Supply chain, delivery proof, and modification tracking",
+                "government contractor supply chain delivery documentation modification challenges",
+                "How are delivery proof, supplier issues, and contract modifications captured for follow-on work?",
+            ),
+            (
+                "Price, availability, and compliance pressure",
+                "federal contractor supply availability pricing compliance proposal challenges",
+                "How does the team keep price/availability assumptions and compliance evidence reusable?",
+            ),
+        ],
+        "Professional, research, and advisory services": [
+            (
+                "Knowledge capture and reusable proposal content",
+                "professional services government contractor proposal knowledge management capture challenges",
+                "How does the team reuse expertise, resumes, case studies, and win themes across proposals?",
+            ),
+            (
+                "Capture handoff and volume management",
+                "federal consulting contractor capture proposal operations challenges",
+                "Where do capture notes become proposal outlines, matrices, and review tasks?",
+            ),
+        ],
+    }
+    rows = benchmarks.get(industry, benchmarks["Professional, research, and advisory services"])
+    return [
+        PainPoint(
+            industry,
+            pain,
+            "Industry benchmark to verify",
+            f"Research this public industry pattern for {company}",
+            search_url(query),
+            "Live public-source search",
+            "No company-specific pain evidence was found in the quick scan. Use this as a researched hypothesis and verify on the call.",
+            "Medium",
+            "Use GovDash to centralize capture intelligence, proposal artifacts, compliance evidence, and contract proof around the account.",
+            question,
+        )
+        for pain, query, question in rows
+    ]
+
+
+def dedupe_pain_points(points: list[PainPoint]) -> tuple[PainPoint, ...]:
+    severity_rank = {"High": 3, "Medium": 2, "Low": 1}
+    evidence_rank = {"Company/public signal": 4, "Company/public page": 3, "Industry benchmark to verify": 1}
+    best: dict[str, PainPoint] = {}
+    for point in points:
+        key = point.pain_point.lower()
+        if key not in best:
+            best[key] = point
+            continue
+        current = best[key]
+        if (evidence_rank.get(point.evidence_level, 0), severity_rank.get(point.severity, 0)) > (
+            evidence_rank.get(current.evidence_level, 0),
+            severity_rank.get(current.severity, 0),
+        ):
+            best[key] = point
+    return tuple(
+        sorted(
+            best.values(),
+            key=lambda point: (evidence_rank.get(point.evidence_level, 0), severity_rank.get(point.severity, 0)),
+            reverse=True,
+        )[:8]
+    )
+
+
+def pain_points_dataframe(intel: CompanyIntel) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Industry": point.industry,
+                "Pain point": point.pain_point,
+                "Evidence level": point.evidence_level,
+                "Severity": point.severity,
+                "Source": point.source,
+                "Source URL": point.source_url,
+                "Evidence": point.snippet,
+                "GovDash angle": point.govdash_angle,
+                "Discovery question": point.recommended_question,
+            }
+            for point in getattr(intel, "pain_points", tuple())
+        ]
+    )
+
+
 def account_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -1114,12 +1440,16 @@ def build_public_intel(
     psc_code: str,
 ) -> CompanyIntel:
     scan_started_at = monotonic()
+    industry = industry_category(naics_description, psc_description, description, psc_code)
     queries = [
         f'"{company}" official website',
         f'"{company}" leadership',
         f'"{company}" "business development"',
         f'"{company}" "contracts manager"',
         f'"{company}" "{award_id}" contract award',
+        f'"{company}" compliance challenge',
+        f'"{company}" hiring government contract',
+        f'"{company}" proposal capture',
     ]
 
     candidate_urls: list[str] = []
@@ -1150,6 +1480,7 @@ def build_public_intel(
     page_linkedin_contacts: list[PublicContact] = []
     linkedin_signals: list[WebSearchResult] = []
     account_signals: list[AccountSignal] = []
+    pain_points: list[PainPoint] = []
 
     index = 0
     while index < len(scan_urls) and len(scanned_urls) < 6 and scan_budget_available(scan_started_at):
@@ -1167,6 +1498,7 @@ def build_public_intel(
         page_texts.append(page_text[:20_000])
         contacts.extend(extract_contacts_from_text(page_text[:35_000], final_url))
         account_signals.extend(account_signals_from_page_text(company, page_text[:35_000], final_url))
+        pain_points.extend(pain_points_from_page_text(company, industry, page_text[:35_000], final_url))
         page_contacts, page_signals = linkedin_contacts_from_page(html, final_url)
         page_linkedin_contacts.extend(page_contacts)
         for signal in page_signals:
@@ -1198,6 +1530,14 @@ def build_public_intel(
                 linkedin_signals.append(result)
         if len(account_signals) >= 12:
             break
+
+    for signal in account_signals:
+        point = pain_point_from_signal(signal, industry)
+        if point is not None:
+            pain_points.append(point)
+
+    if len([point for point in pain_points if point.evidence_level != "Industry benchmark to verify"]) < 2:
+        pain_points.extend(industry_benchmark_pain_points(industry, company))
 
     linkedin_contacts = dedupe_contacts([*page_linkedin_contacts, *linkedin_contacts_from_results(tuple(linkedin_signals))])
     all_contacts = dedupe_contacts([*contacts, *linkedin_contacts])
@@ -1234,6 +1574,7 @@ def build_public_intel(
         linkedin_contacts=linkedin_contacts,
         linkedin_signals=tuple(linkedin_signals[:10]),
         account_signals=dedupe_account_signals(account_signals),
+        pain_points=dedupe_pain_points(pain_points),
         sources=tuple(source_urls[:12]),
         scanned_urls=tuple(scanned_urls[:12]),
     )
@@ -1441,16 +1782,26 @@ def demo_steps(prospect: Prospect) -> list[tuple[str, str]]:
     ]
 
 
-def demo_asset_pack(prospect: Prospect) -> dict[str, str]:
+def demo_asset_pack(prospect: Prospect, intel: CompanyIntel | None = None) -> dict[str, str]:
     agency = prospect.funding_sub_agency or prospect.awarding_sub_agency or prospect.awarding_agency
+    pain_points = getattr(intel, "pain_points", tuple()) if isinstance(intel, CompanyIntel) else tuple()
+    if pain_points:
+        top_pain = pain_points[0]
+        pain_hypothesis = (
+            f"Lead with a researched pain point: {top_pain.pain_point}. Evidence level: {top_pain.evidence_level}. "
+            f"Use the source as context, then verify: {top_pain.recommended_question}"
+        )
+    else:
+        pain_hypothesis = (
+            f"The team likely needs to organize {prospect.contract_focus} while preserving reusable material for future bids. "
+            "Run Public Intel first to replace this with evidence-backed pain."
+        )
     return {
         "Opening scene": (
             f"Start with {prospect.company}'s {money(prospect.amount)} award {prospect.award_id} with {agency}. "
             f"Show the award record, dates, NAICS/PSC, and the contract description as the source of truth."
         ),
-        "Pain hypothesis": (
-            f"The team likely needs to organize {prospect.contract_focus} while preserving reusable material for future bids."
-        ),
+        "Pain hypothesis": pain_hypothesis,
         "GovDash workflow": (
             "Create an award workspace, extract requirements, assign owners, generate a compliance matrix, draft reusable sections, "
             "and tag delivery evidence for option years or recompetes."
@@ -1999,6 +2350,20 @@ with tabs[1]:
                 st.session_state[public_intel_key(selected_intel_account.company)] = existing_intel
 
         if isinstance(existing_intel, CompanyIntel):
+            pain_points = getattr(existing_intel, "pain_points", tuple())
+            st.markdown("### Evidence-Based Pain Points")
+            st.caption("Company evidence is shown when public sources mention a real signal. Industry benchmark rows are hypotheses to verify, not claims about the company.")
+            if pain_points:
+                dataframe_with_links(pain_points_dataframe(existing_intel), width="stretch", hide_index=True)
+                st.download_button(
+                    "Download pain points CSV",
+                    data=pain_points_dataframe(existing_intel).to_csv(index=False),
+                    file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-pain-points.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No pain-point evidence was found in the quick public scan. Try role-specific searches in Contact Finder or broaden the account filters.")
+
             signals = getattr(existing_intel, "account_signals", tuple())
             if signals:
                 st.markdown("### Call Intel Beyond The Award")
@@ -2386,7 +2751,8 @@ with tabs[4]:
         )
 
         st.markdown("### Demo Asset Pack")
-        pack = demo_asset_pack(selected_demo)
+        demo_intel = st.session_state.get(public_intel_key(selected_demo_account.company))
+        pack = demo_asset_pack(selected_demo, demo_intel if isinstance(demo_intel, CompanyIntel) else None)
         for label, body in pack.items():
             st.markdown(
                 f"""
@@ -2448,6 +2814,23 @@ with tabs[5]:
                 )
         else:
             st.caption("Run Public Intel scan first to populate announcements, LinkedIn updates, podcasts, interviews, and other call triggers.")
+
+        sequence_pains = getattr(sequence_intel, "pain_points", tuple()) if isinstance(sequence_intel, CompanyIntel) else tuple()
+        st.markdown("### Pain Points To Validate")
+        if sequence_pains:
+            for point in sequence_pains[:3]:
+                st.markdown(
+                    f"""
+                    <div class="cadence-row">
+                      <b>{html_escape(point.pain_point)}</b><br>
+                      <span class="muted">{html_escape(point.evidence_level)} | {html_escape(point.industry)} | {html_escape(point.severity)}</span><br>
+                      <span class="muted">{html_escape(point.recommended_question)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("Run Public Intel scan first to populate evidence-backed or industry-benchmark pain points.")
 
         st.markdown("### First-Touch Email")
         st.code(outreach_copy(selected_sequence), language="text")

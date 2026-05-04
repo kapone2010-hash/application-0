@@ -18,6 +18,7 @@ import streamlit as st
 
 USASPENDING_AWARD_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 PUBLIC_SEARCH_URL = "https://duckduckgo.com/html/"
+SAM_OPPORTUNITIES_SEARCH_URL = "https://api.sam.gov/opportunities/v2/search"
 APP_DB_PATH = Path("application0_crm.sqlite3")
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_STATUSES = ["New", "Researching", "Contact found", "Emailed", "Meeting booked", "Nurture", "Disqualified"]
@@ -276,6 +277,14 @@ def supabase_ping() -> tuple[bool, str]:
     return True, "Supabase is configured and reachable."
 
 
+def sam_api_key() -> str:
+    return secret_value("SAM_API_KEY")
+
+
+def sam_enabled() -> bool:
+    return bool(sam_api_key())
+
+
 @dataclass(frozen=True)
 class Prospect:
     award_id: str
@@ -523,6 +532,37 @@ class PainPoint:
 
 
 @dataclass(frozen=True)
+class SamOpportunity:
+    notice_id: str
+    title: str
+    solicitation_number: str
+    notice_type: str
+    posted_date: str
+    response_deadline: str
+    set_aside: str
+    set_aside_code: str
+    naics_code: str
+    classification_code: str
+    department: str
+    subtier: str
+    office: str
+    organization_path: str
+    award_number: str
+    award_amount: str
+    award_date: str
+    awardee_name: str
+    awardee_uei: str
+    place_of_performance: str
+    point_of_contact: str
+    poc_email: str
+    poc_phone: str
+    description_url: str
+    ui_link: str
+    resource_links: tuple[str, ...]
+    match_reason: str
+
+
+@dataclass(frozen=True)
 class CompanyIntel:
     company: str
     website: str
@@ -602,6 +642,141 @@ def fetch_recent_awards(start: date, end: date, limit: int, min_amount: int, key
     raise RuntimeError(f"USAspending did not respond after 3 attempts: {last_error}") from last_error
 
 
+def sam_date_window(account: Account) -> tuple[str, str]:
+    latest = parse_iso_date(account.latest_award_date) or date.today()
+    posted_from = max(latest - timedelta(days=365), date.today() - timedelta(days=730))
+    posted_to = min(max(latest + timedelta(days=180), posted_from + timedelta(days=30)), date.today(), posted_from + timedelta(days=364))
+    return posted_from.strftime("%m/%d/%Y"), posted_to.strftime("%m/%d/%Y")
+
+
+def sam_query_params(account: Account, limit: int = 50) -> dict[str, str]:
+    posted_from, posted_to = sam_date_window(account)
+    params = {
+        "api_key": sam_api_key(),
+        "postedFrom": posted_from,
+        "postedTo": posted_to,
+        "ptype": "a",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    if account.primary.naics_code:
+        params["ncode"] = account.primary.naics_code[:6]
+    return params
+
+
+def company_match_score(account: Account, item: dict[str, object]) -> tuple[int, list[str]]:
+    company = account.company.lower()
+    company_tokens = [token for token in re.split(r"[^a-z0-9]+", company) if len(token) > 3]
+    award = item.get("award") if isinstance(item.get("award"), dict) else {}
+    awardee = award.get("awardee") if isinstance(award.get("awardee"), dict) else {}
+    haystack = " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("solicitationNumber") or ""),
+            str(award.get("number") or ""),
+            str(awardee.get("name") or ""),
+            str(awardee.get("ueiSAM") or ""),
+            str(item.get("naicsCode") or ""),
+            str(item.get("fullParentPathName") or ""),
+        ]
+    ).lower()
+    reasons: list[str] = []
+    score = 0
+    if account.primary.uei and account.primary.uei.lower() in haystack:
+        score += 70
+        reasons.append("UEI match")
+    if company and company in haystack:
+        score += 45
+        reasons.append("awardee/company name match")
+    token_hits = [token for token in company_tokens if token in haystack]
+    if token_hits:
+        score += min(30, len(token_hits) * 8)
+        reasons.append(f"company token match: {', '.join(token_hits[:3])}")
+    if account.primary.naics_code and str(item.get("naicsCode") or "").startswith(account.primary.naics_code[:4]):
+        score += 12
+        reasons.append("NAICS context match")
+    if account.primary.award_id and account.primary.award_id.lower() in haystack:
+        score += 30
+        reasons.append("award/solicitation number match")
+    if not reasons:
+        reasons.append("same date-window award-notice context")
+    return score, reasons
+
+
+def parse_sam_opportunity(account: Account, item: dict[str, object]) -> SamOpportunity:
+    award = item.get("award") if isinstance(item.get("award"), dict) else {}
+    awardee = award.get("awardee") if isinstance(award.get("awardee"), dict) else {}
+    poc = first_poc(item.get("pointOfContact"))
+    score, reasons = company_match_score(account, item)
+    resource_links = item.get("resourceLinks") if isinstance(item.get("resourceLinks"), list) else []
+    return SamOpportunity(
+        notice_id=str(item.get("noticeId") or ""),
+        title=str(item.get("title") or ""),
+        solicitation_number=str(item.get("solicitationNumber") or ""),
+        notice_type=str(item.get("type") or item.get("baseType") or ""),
+        posted_date=str(item.get("postedDate") or ""),
+        response_deadline=str(item.get("responseDeadLine") or item.get("reponseDeadLine") or ""),
+        set_aside=str(item.get("typeOfSetAsideDescription") or item.get("setAside") or ""),
+        set_aside_code=str(item.get("typeOfSetAside") or item.get("setAsideCode") or ""),
+        naics_code=str(item.get("naicsCode") or ""),
+        classification_code=str(item.get("classificationCode") or ""),
+        department=str(item.get("department") or ""),
+        subtier=str(item.get("subTier") or item.get("subtier") or ""),
+        office=str(item.get("office") or ""),
+        organization_path=str(item.get("fullParentPathName") or ""),
+        award_number=str(award.get("number") or ""),
+        award_amount=str(award.get("amount") or ""),
+        award_date=str(award.get("date") or ""),
+        awardee_name=str(awardee.get("name") or ""),
+        awardee_uei=str(awardee.get("ueiSAM") or ""),
+        place_of_performance=stateful_place(item.get("placeOfPerformance")),
+        point_of_contact=str(poc.get("fullName") or poc.get("fullname") or poc.get("title") or ""),
+        poc_email=str(poc.get("email") or ""),
+        poc_phone=str(poc.get("phone") or ""),
+        description_url=clean_sam_url(str(item.get("description") or "")),
+        ui_link=clean_sam_url(str(item.get("uiLink") or "")),
+        resource_links=tuple(str(link) for link in resource_links if link),
+        match_reason=f"{score} match score; {'; '.join(reasons)}",
+    )
+
+
+def sam_match_score(opportunity: SamOpportunity) -> int:
+    match = re.match(r"(\d+)", opportunity.match_reason)
+    return int(match.group(1)) if match else 0
+
+
+def fetch_sam_opportunities(account: Account, limit: int = 50) -> tuple[tuple[SamOpportunity, ...], str]:
+    if not sam_enabled():
+        return tuple(), "SAM_API_KEY is not configured."
+    params = sam_query_params(account, limit)
+    try:
+        response = requests.get(
+            SAM_OPPORTUNITIES_SEARCH_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=75,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        body = exc.response.text[:180] if exc.response is not None else str(exc)
+        return tuple(), f"SAM.gov returned HTTP {status}: {body}"
+    except requests.RequestException as exc:
+        return tuple(), f"SAM.gov request failed: {exc}"
+    rows = payload.get("opportunitiesData") or []
+    if not isinstance(rows, list):
+        rows = []
+    parsed = [parse_sam_opportunity(account, row) for row in rows if isinstance(row, dict)]
+    parsed.sort(key=lambda item: (sam_match_score(item), item.posted_date), reverse=True)
+    posted_from, posted_to = sam_date_window(account)
+    message = (
+        f"Returned {len(parsed)} award notice candidate(s) from SAM.gov for {posted_from} to {posted_to}. "
+        f"Total API records reported: {payload.get('totalRecords', 'unknown')}."
+    )
+    return tuple(parsed[:20]), message
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def check_usaspending_freshness(start: date, end: date, min_amount: int, keyword: str) -> SourceFreshness:
     payload = build_search_payload(start, end, 1, min_amount, keyword, sort_field="Last Modified Date")
@@ -668,6 +843,36 @@ def nested_field(row: dict, field: str, child: str) -> str:
     if isinstance(value, dict):
         return str(value.get(child) or "")
     return ""
+
+
+def nested_text(value: object, *path: str) -> str:
+    current = value
+    for part in path:
+        if not isinstance(current, dict):
+            return ""
+        current = current.get(part)
+    if current is None:
+        return ""
+    return str(current)
+
+
+def stateful_place(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    city = nested_text(value, "city", "name") or str(value.get("city") or "")
+    state = nested_text(value, "state", "code") or nested_text(value, "state", "name") or str(value.get("state") or "")
+    country = nested_text(value, "country", "code") or nested_text(value, "country", "name") or str(value.get("country") or "")
+    zip_code = str(value.get("zip") or value.get("zipcode") or "")
+    return ", ".join(part for part in [city, state, zip_code, country] if part and part != "{}")
+
+
+def first_poc(value: object) -> dict[str, object]:
+    if isinstance(value, list) and value:
+        item = value[0]
+        return item if isinstance(item, dict) else {}
+    if isinstance(value, dict):
+        return value
+    return {}
 
 
 def load_crm_record(company: str) -> dict[str, object]:
@@ -976,6 +1181,12 @@ def clean_import_value(value: object) -> str:
         pass
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
+
+
+def clean_sam_url(url: str) -> str:
+    if not url or url.lower() == "null":
+        return ""
+    return url
 
 
 def import_verified_contacts_csv(uploaded_file: object, default_company: str) -> int:
@@ -2154,6 +2365,38 @@ def account_signals_dataframe(intel: CompanyIntel) -> pd.DataFrame:
     )
 
 
+def sam_opportunities_dataframe(opportunities: tuple[SamOpportunity, ...]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Match": sam_match_score(opportunity),
+                "Title": opportunity.title,
+                "Notice type": opportunity.notice_type,
+                "Posted": opportunity.posted_date,
+                "Solicitation": opportunity.solicitation_number,
+                "Award number": opportunity.award_number,
+                "Award amount": opportunity.award_amount,
+                "Awardee": opportunity.awardee_name,
+                "Awardee UEI": opportunity.awardee_uei,
+                "Set-aside": opportunity.set_aside,
+                "NAICS": opportunity.naics_code,
+                "PSC": opportunity.classification_code,
+                "Organization": opportunity.organization_path or " / ".join(
+                    part for part in [opportunity.department, opportunity.subtier, opportunity.office] if part
+                ),
+                "Place of performance": opportunity.place_of_performance,
+                "Government POC": opportunity.point_of_contact,
+                "POC email": opportunity.poc_email,
+                "POC phone": opportunity.poc_phone,
+                "SAM.gov link": opportunity.ui_link,
+                "Description URL": opportunity.description_url,
+                "Match reason": opportunity.match_reason,
+            }
+            for opportunity in opportunities
+        ]
+    )
+
+
 def fallback_call_intel_links(company: str) -> pd.DataFrame:
     rows = []
     for label, query in [
@@ -2450,13 +2693,33 @@ def best_contact_summary(account: Account, intel: CompanyIntel | None = None) ->
     }
 
 
-def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> dict[str, list[str] | str]:
+def sam_context_lines(opportunities: tuple[SamOpportunity, ...]) -> list[str]:
+    lines = []
+    for opportunity in opportunities[:4]:
+        parts = [
+            opportunity.notice_type or "SAM.gov notice",
+            opportunity.title,
+            f"solicitation {opportunity.solicitation_number}" if opportunity.solicitation_number else "",
+            f"set-aside {opportunity.set_aside}" if opportunity.set_aside else "",
+            f"place {opportunity.place_of_performance}" if opportunity.place_of_performance else "",
+            f"government POC {opportunity.point_of_contact}" if opportunity.point_of_contact else "",
+        ]
+        lines.append(" | ".join(part for part in parts if part))
+    return lines or ["Run SAM.gov enrichment to add notice, set-aside, contracting office, place-of-performance, and government POC context."]
+
+
+def call_prep_sections(
+    account: Account,
+    intel: CompanyIntel | None = None,
+    sam_opportunities: tuple[SamOpportunity, ...] = tuple(),
+) -> dict[str, list[str] | str]:
     primary = account.primary
     agency = primary.funding_sub_agency or primary.awarding_sub_agency or primary.awarding_agency
     contact = best_contact_summary(account, intel)
     assessment = account_fit_assessment(account, intel)
     signals = list(getattr(intel, "account_signals", tuple())) if isinstance(intel, CompanyIntel) else []
     pains = list(getattr(intel, "pain_points", tuple())) if isinstance(intel, CompanyIntel) else []
+    top_sam = sam_opportunities[0] if sam_opportunities else None
     if not pains:
         pains = industry_benchmark_pain_points(
             industry_category(primary.naics_description, primary.psc_description, primary.description, primary.psc_code),
@@ -2475,13 +2738,21 @@ def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> d
             f"The award record points to fit around {primary.contract_focus}. USAspending does not expose evaluation rationale, "
             "so treat this as a hypothesis to validate."
         )
+    if top_sam:
+        sam_won_context = (
+            f"SAM.gov context: {top_sam.notice_type or 'notice'} posted {top_sam.posted_date or 'date unknown'}"
+            f"{' with set-aside ' + top_sam.set_aside if top_sam.set_aside else ''}"
+            f"{' through ' + (top_sam.organization_path or top_sam.office) if (top_sam.organization_path or top_sam.office) else ''}."
+        )
+    else:
+        sam_won_context = "Run SAM.gov enrichment to add notice-level procurement context."
 
     return {
         "headline": f"{account.company} | {assessment['tier']} | action score {assessment['score']}/100",
         "account_summary": company_summary,
         "what_they_won": (
             f"{primary.award_id} for {money(primary.amount)} with {agency or 'the buying agency'}. "
-            f"{primary.description or 'No public description was included in the award result.'}"
+            f"{primary.description or 'No public description was included in the award result.'} {sam_won_context}"
         ),
         "why_they_may_have_won": why_won,
         "why_now": why_now_triggers(primary)[:4],
@@ -2499,6 +2770,7 @@ def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> d
             for signal in signals[:4]
         ]
         or ["No public call-intel signals are saved yet. Run Public Intel before using this as a live call brief."],
+        "sam_gov_context": sam_context_lines(sam_opportunities),
         "pain_points": [
             f"{point.pain_point} - ask: {point.recommended_question}"
             for point in pains[:4]
@@ -2511,6 +2783,7 @@ def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> d
         "objections": [
             "We already have tools: ask where award kickoff, proposal reuse, compliance matrices, and delivery proof live today.",
             "Timing is bad: anchor to the award kickoff, option-year, or follow-on pursuit window.",
+            "This is just a contract-management problem: pivot to how award evidence becomes reusable proposal and capture material.",
             "Not my role: ask who owns capture/proposal operations, contracts, or program evidence for this award.",
         ],
         "demo_angle": list(demo_asset_pack(primary, intel).values())[:4],
@@ -2518,13 +2791,17 @@ def call_prep_sections(account: Account, intel: CompanyIntel | None = None) -> d
     }
 
 
-def call_prep_markdown(account: Account, intel: CompanyIntel | None = None) -> str:
-    sections = call_prep_sections(account, intel)
+def call_prep_markdown(
+    account: Account,
+    intel: CompanyIntel | None = None,
+    sam_opportunities: tuple[SamOpportunity, ...] = tuple(),
+) -> str:
+    sections = call_prep_sections(account, intel, sam_opportunities)
     lines = [f"# Call Prep: {sections['headline']}", ""]
     for label in ["account_summary", "what_they_won", "why_they_may_have_won", "best_contact", "talk_track", "next_move"]:
         title = label.replace("_", " ").title()
         lines.extend([f"## {title}", str(sections[label]), ""])
-    for label in ["why_now", "contact_path", "call_intel", "pain_points", "discovery_questions", "objections", "demo_angle"]:
+    for label in ["why_now", "contact_path", "call_intel", "sam_gov_context", "pain_points", "discovery_questions", "objections", "demo_angle"]:
         title = label.replace("_", " ").title()
         lines.append(f"## {title}")
         for item in sections[label]:
@@ -2549,10 +2826,10 @@ def product_gap_dataframe() -> pd.DataFrame:
                 "Priority": "High",
             },
             {
-                "Gap": "SAM.gov award detail",
-                "Why it matters": "USAspending is strong for awards, but SAM.gov can add solicitation/notice context and procurement history.",
-                "Recommended update": "Add SAM.gov API key support for notice history, set-aside, place of performance, and solicitation links.",
-                "Priority": "High",
+                "Gap": "SAM.gov entity and full-history detail",
+                "Why it matters": "The app now pulls SAM.gov award-notice candidates, but deeper entity records and full notice-version history would improve matching.",
+                "Recommended update": "Add SAM.gov entity-management lookup, notice history downloads, and persistent source evidence tables.",
+                "Priority": "Medium",
             },
             {
                 "Gap": "Production CRM sync",
@@ -2662,6 +2939,14 @@ def summarize_why_won(prospect: Prospect) -> str:
 
 def public_intel_key(company: str) -> str:
     return f"public_intel_{company}"
+
+
+def sam_intel_key(company: str) -> str:
+    return f"sam_intel_{company}"
+
+
+def sam_message_key(company: str) -> str:
+    return f"sam_message_{company}"
 
 
 def scan_budget_available(started_at: float) -> bool:
@@ -3483,6 +3768,13 @@ with st.sidebar:
     if st.session_state.get("storage_warning"):
         st.warning(str(st.session_state["storage_warning"]))
 
+    st.header("SAM.gov")
+    if sam_enabled():
+        st.success("SAM API key configured")
+    else:
+        st.info("SAM API key missing")
+    st.caption("SAM.gov enrichment runs on demand for the active account.")
+
     st.header("Lead Filters")
     lookback_days = st.slider("Days back", 7, 90, DEFAULT_LOOKBACK_DAYS)
     result_limit = st.slider("Max awards", 10, 200, 50, step=10)
@@ -3677,6 +3969,34 @@ with tabs[1]:
         st.caption(
             "Public scan searches open web results, public company pages, and public LinkedIn search-result signals. It does not bypass LinkedIn login, paywalls, robots restrictions, or invent missing emails and phone numbers."
         )
+
+        st.markdown("### SAM.gov Intelligence")
+        st.caption("Pulls official SAM.gov award notices for procurement context. Government POCs are context for the notice, not SDR targets at the awardee company.")
+        sam_key = sam_intel_key(selected_intel_account.company)
+        sam_msg_key = sam_message_key(selected_intel_account.company)
+        sam_opportunities = st.session_state.get(sam_key, tuple())
+        if not isinstance(sam_opportunities, tuple()):
+            sam_opportunities = tuple()
+        sam_cols = st.columns([0.28, 0.72])
+        if sam_cols[0].button("Run SAM.gov enrichment", key=f"run_sam_{selected_intel_account.company}", disabled=not sam_enabled()):
+            with st.spinner("Searching SAM.gov award notices for procurement context..."):
+                sam_opportunities, sam_message = fetch_sam_opportunities(selected_intel_account)
+                st.session_state[sam_key] = sam_opportunities
+                st.session_state[sam_msg_key] = sam_message
+        if not sam_enabled():
+            sam_cols[1].warning("Add SAM_API_KEY to Streamlit secrets to enable SAM.gov enrichment.")
+        else:
+            sam_cols[1].caption(st.session_state.get(sam_msg_key, "SAM.gov key is ready. Run enrichment for this active account."))
+        if sam_opportunities:
+            dataframe_with_links(sam_opportunities_dataframe(sam_opportunities), width="stretch", hide_index=True)
+            st.download_button(
+                "Download SAM.gov context CSV",
+                data=sam_opportunities_dataframe(sam_opportunities).to_csv(index=False),
+                file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-sam-gov-context.csv",
+                mime="text/csv",
+            )
+        elif st.session_state.get(sam_msg_key):
+            st.info(str(st.session_state[sam_msg_key]))
 
         run_scan = st.button("Run public scan", key=f"run_scan_{selected_intel_account.company}")
         existing_intel = st.session_state.get(public_intel_key(selected_intel_account.company))
@@ -4018,7 +4338,10 @@ with tabs[3]:
         prep_intel = st.session_state.get(public_intel_key(selected_prep_account.company))
         if not isinstance(prep_intel, CompanyIntel):
             prep_intel = None
-        sections = call_prep_sections(selected_prep_account, prep_intel)
+        prep_sam = st.session_state.get(sam_intel_key(selected_prep_account.company), tuple())
+        if not isinstance(prep_sam, tuple):
+            prep_sam = tuple()
+        sections = call_prep_sections(selected_prep_account, prep_intel, prep_sam)
         assessment = account_fit_assessment(selected_prep_account, prep_intel)
 
         st.caption(f"Using active company: {selected_prep_account.company}")
@@ -4075,6 +4398,10 @@ with tabs[3]:
             for item in sections["call_intel"]:
                 st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
 
+            st.markdown("### SAM.gov Context")
+            for item in sections["sam_gov_context"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
             st.markdown("### Likely Objections")
             for item in sections["objections"]:
                 st.markdown(f'<div class="score-card">{html_escape(str(item))}</div>', unsafe_allow_html=True)
@@ -4091,7 +4418,7 @@ with tabs[3]:
 
         st.download_button(
             "Download call prep brief",
-            data=call_prep_markdown(selected_prep_account, prep_intel),
+            data=call_prep_markdown(selected_prep_account, prep_intel, prep_sam),
             file_name=f"{selected_prep_account.company.lower().replace(' ', '-')}-call-prep.md",
             mime="text/markdown",
         )
@@ -4449,6 +4776,12 @@ with tabs[7]:
     st.write(
         "CRM accounts, verified contacts, and activity history use Supabase when `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are configured and the Supabase schema has been created. "
         "Without those secrets, Application 0 uses the local SQLite file as a fallback so development still works."
+    )
+    st.markdown("### SAM.gov Enrichment")
+    st.write(
+        "When `SAM_API_KEY` is configured, Public Intel can pull official SAM.gov award-notice candidates for the active account. "
+        "These rows add procurement context such as solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, and government point of contact. "
+        "Government POCs are shown as notice context, not contractor SDR targets."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

@@ -11,6 +11,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Adds a dynamic SDR action queue that blends award fit, verified contacts, public call-intel signals, pain evidence, open tasks, and contact readiness.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
 - Scans public web sources for company descriptions, likely website, source pages, public business emails/phones, named contacts, call-intel signals, evidence-backed pain points, and public LinkedIn result signals when available.
+- Enriches active accounts with SAM.gov award-notice context when `SAM_API_KEY` is configured, including notice type, solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, government POC, and source links when available.
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
@@ -47,6 +48,16 @@ A Streamlit prototype for finding government contractors that recently won publi
 
 When those two secrets are present and the schema exists, Application 0 uses Supabase for CRM accounts, verified contacts, and activity history. If Supabase is not configured, the app continues using local SQLite.
 
+## SAM.gov Enrichment
+
+Add this secret locally and in Streamlit Community Cloud to enable official SAM.gov award-notice context:
+
+```toml
+SAM_API_KEY = "your_sam_gov_api_key"
+```
+
+SAM.gov enrichment is run on demand from the Public Intel tab for the active account. Government points of contact returned by SAM.gov are shown as procurement context, not as SDR targets at the contractor company.
+
 ## Deploy
 
 Use [DEPLOYMENT.md](DEPLOYMENT.md) for the GitHub and Streamlit Community Cloud deployment checklist.
@@ -63,4 +74,4 @@ The contact list uses a readiness gate. `Ready to verify` means there is a named
 
 Verified contacts can be added manually or imported from CSV enrichment exports. Accepted CSV columns include `company`, `full_name` or `name`, `title`, `email`, `phone`, `linkedin_url` or `linkedin`, `source_url` or `source`, `source_type`, `verification_status` or `status`, and `notes`.
 
-SAM.gov Contract Awards can be added later with a SAM.gov public API key for deeper award records. Verified enrichment vendors such as CRM/contact-data providers can also be connected later if you want higher-confidence direct dials and emails.
+Verified enrichment vendors such as CRM/contact-data providers can also be connected later if you want higher-confidence direct dials and emails.

@@ -5,6 +5,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 ## What It Does
 
 - Pulls recent federal contract awards from the USAspending public API.
+- Checks USAspending source freshness before the full lead pull using the newest `Last Modified Date` for the current filters.
 - Groups award winners into account-level views.
 - Ranks accounts by GovDash fit, recent award value, number of awards, agencies, NAICS/PSC, and follow-on signals.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
@@ -37,7 +38,9 @@ Use [DEPLOYMENT.md](DEPLOYMENT.md) for the GitHub and Streamlit Community Cloud 
 
 ## Data Notes
 
-The current prototype uses USAspending because the public API does not require authorization and includes federal award recipient data. Responses are cached for 30 minutes, and the app retries transient API failures before surfacing an error.
+The current prototype uses USAspending because the public API does not require authorization and includes federal award recipient data. Before pulling the full lead list, the app runs a one-record freshness check sorted by USAspending `Last Modified Date` with the same filters. Responses are cached for 30 minutes, and the app retries transient API failures before surfacing an error.
+
+Freshness labels are based on the newest matching USAspending modification: `Current` is within 7 days, `Aging` is 8 to 14 days, `Stale` is more than 14 days, and `No matching data` means the API responded but the filters found no records.
 
 Public award data usually does not include verified direct emails or phone numbers. The app now performs a best-effort public web scan and records source URLs for any names, emails, phone numbers, LinkedIn result signals, announcements, interviews, podcasts, pain evidence, and other call-intel triggers it finds. It does not bypass LinkedIn login, other logins, or paywalls, and SDRs should verify each contact and pain point before outreach.
 

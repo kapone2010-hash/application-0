@@ -75,6 +75,18 @@ def parse_iso_date(value: str) -> date | None:
         return None
 
 
+def parse_source_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    value = value.strip().replace("Z", "")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value[:19] if "%H" in fmt else value[:10], fmt)
+        except ValueError:
+            continue
+    return None
+
+
 @dataclass(frozen=True)
 class Prospect:
     award_id: str
@@ -82,6 +94,7 @@ class Prospect:
     uei: str
     amount: float
     base_obligation_date: str
+    last_modified_date: str
     start_date: str
     end_date: str
     awarding_agency: str
@@ -179,6 +192,11 @@ class Account:
         return max(dates) if dates else ""
 
     @property
+    def latest_source_modified_date(self) -> str:
+        dates = [prospect.last_modified_date for prospect in self.prospects if prospect.last_modified_date]
+        return max(dates) if dates else ""
+
+    @property
     def priority_score(self) -> int:
         primary = self.primary
         score = primary.govdash_fit_score
@@ -247,6 +265,20 @@ class AccountSignal:
 
 
 @dataclass(frozen=True)
+class SourceFreshness:
+    status: str
+    checked_at: str
+    latest_modified_date: str
+    latest_award_date: str
+    award_id: str
+    recipient: str
+    amount: float
+    lag_days: int | None
+    message: str
+    api_messages: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PainPoint:
     industry: str
     pain_point: str
@@ -275,7 +307,15 @@ class CompanyIntel:
     scanned_urls: tuple[str, ...]
 
 
-def build_search_payload(start: date, end: date, limit: int, min_amount: int, keyword: str) -> dict:
+def build_search_payload(
+    start: date,
+    end: date,
+    limit: int,
+    min_amount: int,
+    keyword: str,
+    sort_field: str = "Base Obligation Date",
+    order: str = "desc",
+) -> dict:
     filters: dict[str, object] = {
         "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
         "award_type_codes": ["A", "B", "C", "D"],
@@ -310,8 +350,8 @@ def build_search_payload(start: date, end: date, limit: int, min_amount: int, ke
         ],
         "page": 1,
         "limit": limit,
-        "sort": "Base Obligation Date",
-        "order": "desc",
+        "sort": sort_field,
+        "order": order,
         "subawards": False,
     }
 
@@ -332,6 +372,67 @@ def fetch_recent_awards(start: date, end: date, limit: int, min_amount: int, key
     raise RuntimeError(f"USAspending did not respond after 3 attempts: {last_error}") from last_error
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def check_usaspending_freshness(start: date, end: date, min_amount: int, keyword: str) -> SourceFreshness:
+    payload = build_search_payload(start, end, 1, min_amount, keyword, sort_field="Last Modified Date")
+    last_error: Exception | None = None
+    checked_at = datetime.now()
+    for attempt in range(3):
+        try:
+            response = requests.post(USASPENDING_AWARD_SEARCH_URL, json=payload, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            rows = data.get("results", [])
+            messages = tuple(str(message) for message in data.get("messages", []))
+            if not rows:
+                return SourceFreshness(
+                    status="No matching data",
+                    checked_at=checked_at.strftime("%b %d, %Y %I:%M %p"),
+                    latest_modified_date="",
+                    latest_award_date="",
+                    award_id="",
+                    recipient="",
+                    amount=0,
+                    lag_days=None,
+                    message="USAspending responded, but no matching records were found for the current filters.",
+                    api_messages=messages,
+                )
+
+            row = rows[0]
+            latest_modified = str(row.get("Last Modified Date") or "")
+            modified_at = parse_source_datetime(latest_modified)
+            lag_days = (checked_at.date() - modified_at.date()).days if modified_at else None
+            if lag_days is None:
+                status = "Unknown freshness"
+                message = "USAspending responded, but the latest modified timestamp could not be parsed."
+            elif lag_days <= 7:
+                status = "Current"
+                message = "USAspending has recent modifications for these filters."
+            elif lag_days <= 14:
+                status = "Aging"
+                message = "USAspending has matching data, but the newest modification is more than a week old."
+            else:
+                status = "Stale"
+                message = "USAspending has matching data, but the newest modification is more than two weeks old."
+
+            return SourceFreshness(
+                status=status,
+                checked_at=checked_at.strftime("%b %d, %Y %I:%M %p"),
+                latest_modified_date=latest_modified,
+                latest_award_date=str(row.get("Base Obligation Date") or ""),
+                award_id=str(row.get("Award ID") or ""),
+                recipient=str(row.get("Recipient Name") or ""),
+                amount=float(row.get("Award Amount") or 0),
+                lag_days=lag_days,
+                message=message,
+                api_messages=messages,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            sleep(0.8 * (attempt + 1))
+    raise RuntimeError(f"USAspending freshness check failed after 3 attempts: {last_error}") from last_error
+
+
 def nested_field(row: dict, field: str, child: str) -> str:
     value = row.get(field) or {}
     if isinstance(value, dict):
@@ -346,6 +447,7 @@ def parse_prospect(row: dict) -> Prospect:
         uei=str(row.get("Recipient UEI") or ""),
         amount=float(row.get("Award Amount") or 0),
         base_obligation_date=str(row.get("Base Obligation Date") or ""),
+        last_modified_date=str(row.get("Last Modified Date") or ""),
         start_date=str(row.get("Start Date") or ""),
         end_date=str(row.get("End Date") or ""),
         awarding_agency=str(row.get("Awarding Agency") or ""),
@@ -1548,6 +1650,7 @@ def build_public_intel(
         uei="",
         amount=award_amount,
         base_obligation_date="",
+        last_modified_date="",
         start_date="",
         end_date="",
         awarding_agency=agency,
@@ -1864,6 +1967,7 @@ def to_dataframe(prospects: list[Prospect]) -> pd.DataFrame:
                 "Award": p.award_id,
                 "Amount": money(p.amount),
                 "Base obligation": p.base_obligation_date,
+                "Last source update": p.last_modified_date,
                 "Agency": p.awarding_agency,
                 "Sub agency": p.awarding_sub_agency,
                 "NAICS": f"{p.naics_code} {p.naics_description}".strip(),
@@ -1886,6 +1990,7 @@ def account_dataframe(accounts: list[Account]) -> pd.DataFrame:
                 "Total recent value": money(account.total_amount),
                 "Largest award": money(account.largest_award),
                 "Latest award": account.latest_award_date,
+                "Latest source update": account.latest_source_modified_date,
                 "Primary agency": account.primary.funding_sub_agency
                 or account.primary.awarding_sub_agency
                 or account.primary.awarding_agency,
@@ -2208,6 +2313,7 @@ with st.sidebar:
     active_only = st.checkbox("Active or starting soon only")
     if st.button("Refresh live data"):
         fetch_recent_awards.clear()
+        check_usaspending_freshness.clear()
         st.rerun()
     st.caption("Data comes from USAspending award search. SAM.gov Contract Awards can be added when you provide a SAM.gov public API key.")
 
@@ -2215,7 +2321,9 @@ end_date = date.today()
 start_date = end_date - timedelta(days=lookback_days)
 
 try:
-    with st.spinner("Pulling recent public award data..."):
+    with st.spinner("Checking USAspending source freshness..."):
+        freshness = check_usaspending_freshness(start_date, end_date, int(min_amount), keyword.strip())
+    with st.spinner("Pulling recent public award data after freshness check..."):
         rows, api_messages = fetch_recent_awards(start_date, end_date, result_limit, int(min_amount), keyword.strip())
     prospects = [parse_prospect(row) for row in rows]
     st.session_state["last_refresh"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
@@ -2234,7 +2342,43 @@ metrics[1].metric("Date range", f"{start_date:%b %d} - {end_date:%b %d}")
 metrics[2].metric("Pipeline value", money(sum(account.total_amount for account in accounts)))
 metrics[3].metric("Top account score", max((account.priority_score for account in accounts), default=0))
 
-st.caption(f"Live source refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change or Refresh live data is clicked.")
+freshness_icon = {"Current": "OK", "Aging": "Check", "Stale": "Stale", "No matching data": "No data", "Unknown freshness": "Unknown"}.get(freshness.status, freshness.status)
+st.caption(
+    f"Freshness gate: {freshness_icon} | Checked {freshness.checked_at} | "
+    f"Latest source update: {freshness.latest_modified_date or 'none'} | "
+    f"Latest award date: {freshness.latest_award_date or 'none'} | "
+    f"Full pull refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change or Refresh live data is clicked."
+)
+
+if freshness.status == "Current":
+    st.success(f"Source freshness check passed. {freshness.message}")
+elif freshness.status in {"Aging", "Unknown freshness"}:
+    st.warning(f"Source freshness needs review. {freshness.message}")
+elif freshness.status == "Stale":
+    st.error(f"Source freshness warning. {freshness.message}")
+else:
+    st.info(freshness.message)
+
+with st.expander("Source Freshness Details"):
+    freshness_cols = st.columns(4)
+    freshness_cols[0].metric("Freshness", freshness.status)
+    freshness_cols[1].metric("Lag days", freshness.lag_days if freshness.lag_days is not None else "N/A")
+    freshness_cols[2].metric("Latest modified", freshness.latest_modified_date or "N/A")
+    freshness_cols[3].metric("Latest award", freshness.latest_award_date or "N/A")
+    st.write(
+        {
+            "sample_award": freshness.award_id,
+            "sample_recipient": freshness.recipient,
+            "sample_amount": money(freshness.amount),
+            "checked_before_full_pull": freshness.checked_at,
+            "filters": {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "minimum_award_amount": int(min_amount),
+                "keyword": keyword.strip(),
+            },
+        }
+    )
 
 selected_global_account = ensure_active_company(accounts)
 if selected_global_account:
@@ -2251,8 +2395,10 @@ if selected_global_account:
     with selector_cols[1]:
         st.metric("Selected company score", selected_global_account.priority_score, selected_global_account.tier)
 
-if api_messages:
+if api_messages or freshness.api_messages:
     with st.expander("API notes"):
+        for message in freshness.api_messages:
+            st.write(message)
         for message in api_messages:
             st.write(message)
 
@@ -2854,7 +3000,13 @@ with tabs[6]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "
-        "The app retries transient API failures and caches successful responses for 30 minutes to keep the live workflow responsive."
+        "Before the full pull, the app runs a one-record freshness check sorted by USAspending Last Modified Date using the same filters. "
+        "The app retries transient API failures and caches successful lead responses for 30 minutes to keep the live workflow responsive."
+    )
+    st.markdown("### Freshness Rules")
+    st.write(
+        "Current means the newest matching USAspending modification is within 7 days. Aging means 8 to 14 days. "
+        "Stale means more than 14 days. No matching data means the source responded but the current filters found no records."
     )
     st.markdown("### Contact Quality Guardrails")
     st.write(

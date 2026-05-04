@@ -1638,6 +1638,21 @@ def active_account(accounts: list[Account]) -> Account:
     return selected
 
 
+def dataframe_with_links(data: pd.DataFrame, **kwargs: object) -> None:
+    df = data.copy()
+    column_config = {}
+    for column in df.columns:
+        values = df[column].dropna().astype(str)
+        has_url = values.str.startswith(("http://", "https://")).any()
+        link_named = any(term in column.lower() for term in ["url", "source", "link"])
+        if has_url and link_named:
+            column_config[column] = st.column_config.LinkColumn(
+                column,
+                help=f"Open {column} in a new browser tab.",
+            )
+    st.dataframe(df, column_config=column_config or None, **kwargs)
+
+
 st.set_page_config(
     page_title="Application 0 | GovDash SDR Prospecting",
     page_icon="0",
@@ -1910,7 +1925,7 @@ with tabs[0]:
                     use_container_width=True,
                 )
 
-        st.dataframe(account_dataframe(accounts), width="stretch", hide_index=True)
+        dataframe_with_links(account_dataframe(accounts), width="stretch", hide_index=True)
 
         export_cols = st.columns(3)
         export_cols[0].download_button(
@@ -1988,7 +2003,7 @@ with tabs[1]:
             if signals:
                 st.markdown("### Call Intel Beyond The Award")
                 st.caption("Use these public signals to make the first call relevant before you pivot into GovDash.")
-                st.dataframe(account_signals_dataframe(existing_intel), width="stretch", hide_index=True)
+                dataframe_with_links(account_signals_dataframe(existing_intel), width="stretch", hide_index=True)
                 top_signal = signals[0]
                 st.markdown(
                     f"""
@@ -2008,7 +2023,7 @@ with tabs[1]:
             else:
                 st.markdown("### Call Intel Beyond The Award")
                 st.caption("No announcement/interview signals were found in the quick scan. Use these live research links to manually check public sources.")
-                st.dataframe(fallback_call_intel_links(selected_intel_account.company), width="stretch", hide_index=True)
+                dataframe_with_links(fallback_call_intel_links(selected_intel_account.company), width="stretch", hide_index=True)
 
             intel_cols = st.columns([0.55, 0.45])
             with intel_cols[0]:
@@ -2046,7 +2061,7 @@ with tabs[1]:
             with intel_cols[1]:
                 st.markdown("### Public Contacts Found")
                 if existing_intel.contacts:
-                    st.dataframe(public_contacts_dataframe(existing_intel), width="stretch", hide_index=True)
+                    dataframe_with_links(public_contacts_dataframe(existing_intel), width="stretch", hide_index=True)
                     st.download_button(
                         "Download public intel CSV",
                         data=public_contacts_dataframe(existing_intel).to_csv(index=False),
@@ -2059,7 +2074,7 @@ with tabs[1]:
                 st.markdown("### LinkedIn Intelligence")
                 linkedin_signals = getattr(existing_intel, "linkedin_signals", tuple())
                 if linkedin_signals:
-                    st.dataframe(linkedin_signals_dataframe(existing_intel), width="stretch", hide_index=True)
+                    dataframe_with_links(linkedin_signals_dataframe(existing_intel), width="stretch", hide_index=True)
                 else:
                     st.caption("No public LinkedIn search signals were found yet. Run the scan again to refresh LinkedIn profile, company, and job-result signals.")
 
@@ -2101,7 +2116,7 @@ with tabs[2]:
         current_contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         if not isinstance(current_contact_intel, CompanyIntel):
             current_contact_intel = None
-        st.dataframe(people_to_contact_dataframe(selected_contact_account, current_contact_intel), width="stretch", hide_index=True)
+        dataframe_with_links(people_to_contact_dataframe(selected_contact_account, current_contact_intel), width="stretch", hide_index=True)
 
         jump_links = " ".join(
             f'<a class="mini" href="#{anchor_slug(target.title)}">{html_escape(target.title)}</a>'
@@ -2135,9 +2150,9 @@ with tabs[2]:
 
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
             st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
-            st.dataframe(public_contacts_dataframe(contact_intel), width="stretch", hide_index=True)
+            dataframe_with_links(public_contacts_dataframe(contact_intel), width="stretch", hide_index=True)
             st.markdown("### Updated People To Contact")
-            st.dataframe(people_to_contact_dataframe(selected_contact_account, contact_intel), width="stretch", hide_index=True)
+            dataframe_with_links(people_to_contact_dataframe(selected_contact_account, contact_intel), width="stretch", hide_index=True)
             st.download_button(
                 "Download updated people CSV",
                 data=people_to_contact_dataframe(selected_contact_account, contact_intel).to_csv(index=False),
@@ -2147,7 +2162,7 @@ with tabs[2]:
             linkedin_contacts = getattr(contact_intel, "linkedin_contacts", tuple())
             if linkedin_contacts:
                 st.markdown("### LinkedIn People Signals")
-                st.dataframe(
+                dataframe_with_links(
                     pd.DataFrame(
                         [
                             {
@@ -2314,7 +2329,7 @@ with tabs[3]:
             )
 
         st.markdown("### Account Award History")
-        st.dataframe(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
+        dataframe_with_links(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
 
         st.markdown("### Recommended Cadence")
         cadence_cols = st.columns(2)

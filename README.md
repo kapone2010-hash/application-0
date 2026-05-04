@@ -17,6 +17,8 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
 - Uses Hunter.io contact enrichment when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
+- Adds a verified-contact Sequence Gate with verified age, evidence grade, and SDR action so reps know whether a person is ready to sequence, needs recheck, or should be blocked.
+- Builds a source audit trail for contacts, pain points, call-intel signals, and scanned pages with source URL, capture/verification timestamp, evidence snippet, audit status, and SDR action.
 - Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
 - Syncs active companies and selected verified contacts into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
@@ -92,7 +94,11 @@ Freshness labels are based on the newest matching USAspending modification: `Cur
 
 Public award data usually does not include verified direct emails or phone numbers. The app now performs a best-effort public web scan and records source URLs for any names, emails, phone numbers, LinkedIn result signals, announcements, interviews, podcasts, pain evidence, and other call-intel triggers it finds. It does not bypass LinkedIn login, other logins, or paywalls, and SDRs should verify each contact and pain point before outreach.
 
-The contact list uses a readiness gate. `Ready to verify` means there is a named, relevant contact with enough source evidence for an SDR to manually confirm. `Verify first` means it is a research lead. `Not ready` means the app did not find enough public evidence and the SDR should use manual LinkedIn research or a verified enrichment provider before sequencing.
+The contact list uses a readiness gate. `Ready to verify` means there is a named, relevant public contact with enough source evidence for an SDR to manually confirm. `Verify first` means it is a research lead. `Not ready` means the app did not find enough public evidence and the SDR should use manual LinkedIn research or a verified enrichment provider before sequencing.
+
+Verified contacts use a stricter Sequence Gate. `Ready to sequence` requires a verified current role, source evidence, and a usable business email or phone. `Verify before sequence`, `Verify missing fields`, and `Recheck before sequence` tell the SDR exactly what needs to be confirmed before outreach. `Do not sequence` keeps blocked contacts out of cadence.
+
+The Source Audit Trail is available after public scans and in Contact Finder. It gives SDRs a downloadable evidence table for contacts, pain points, call-intel signals, and scanned pages so they can see where each recommendation came from before calling or emailing.
 
 Verified contacts can be added manually or imported from CSV enrichment exports. Accepted CSV columns include `company`, `full_name` or `name`, `title`, `email`, `phone`, `linkedin_url` or `linkedin`, `source_url` or `source`, `source_type`, `verification_status` or `status`, and `notes`.
 

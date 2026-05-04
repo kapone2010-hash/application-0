@@ -676,6 +676,7 @@ class CompanyIntel:
     pain_points: tuple[PainPoint, ...]
     sources: tuple[str, ...]
     scanned_urls: tuple[str, ...]
+    scanned_at: str = ""
 
 
 def build_search_payload(
@@ -1537,11 +1538,67 @@ def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
     )
 
 
+def verified_contact_evidence_grade(contact: VerifiedContact) -> str:
+    status = contact.verification_status.lower()
+    has_source = bool(contact.linkedin_url or contact.source_url)
+    has_contact_path = bool(contact.email or contact.phone)
+    has_role = bool(contact.title)
+    if "do not" in status:
+        return "D - blocked"
+    if "verified current role" in status and has_source and has_contact_path and has_role:
+        return "A - source-backed"
+    if "verified current role" in status:
+        return "B - verified, missing detail"
+    if "needs recheck" in status:
+        return "C - stale/recheck"
+    if "imported" in status:
+        return "C - imported"
+    return "C - needs review"
+
+
+def verified_contact_gate(contact: VerifiedContact) -> dict[str, str]:
+    status = contact.verification_status.lower()
+    age_days = days_since(contact.verified_at)
+    has_source = bool(contact.linkedin_url or contact.source_url)
+    has_contact_path = bool(contact.email or contact.phone)
+    has_role = bool(contact.title)
+    age = age_bucket(contact.verified_at)
+
+    if "do not" in status:
+        gate = "Do not sequence"
+        action = "Keep out of cadence until a new source clears this contact."
+    elif age_days is not None and age_days > 180:
+        gate = "Recheck before sequence"
+        action = "Open the source or LinkedIn profile and update the verified date before outreach."
+    elif "needs recheck" in status or "imported" in status:
+        gate = "Verify before sequence"
+        action = "Confirm current role, company, and contact path before adding to cadence."
+    elif "verified current role" in status and has_source and has_contact_path and has_role:
+        gate = "Ready to sequence"
+        action = "Use in cadence and keep the source link in HubSpot notes."
+    elif "verified current role" in status:
+        gate = "Verify missing fields"
+        action = "Add a source URL, role, email, or phone before sequencing."
+    else:
+        gate = "Verify before sequence"
+        action = "Treat as a research lead until verified."
+
+    return {
+        "gate": gate,
+        "age": age,
+        "evidence_grade": verified_contact_evidence_grade(contact),
+        "action": action,
+    }
+
+
 def verified_contacts_dataframe(company: str) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
                 "ID": contact.id,
+                "Sequence gate": verified_contact_gate(contact)["gate"],
+                "Verified age": verified_contact_gate(contact)["age"],
+                "Evidence grade": verified_contact_gate(contact)["evidence_grade"],
                 "Name": contact.full_name,
                 "Title": contact.title,
                 "Email": contact.email,
@@ -1550,6 +1607,7 @@ def verified_contacts_dataframe(company: str) -> pd.DataFrame:
                 "Source URL": contact.source_url,
                 "Status": contact.verification_status,
                 "Verified at": contact.verified_at,
+                "SDR action": verified_contact_gate(contact)["action"],
                 "Notes": contact.notes,
             }
             for contact in load_verified_contacts(company)
@@ -1567,6 +1625,31 @@ def clean_import_value(value: object) -> str:
         pass
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
+
+
+def short_text(value: str, limit: int = 220) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3].rstrip()}..."
+
+
+def days_since(value: str) -> int | None:
+    parsed = parse_source_datetime(value)
+    if parsed is None:
+        return None
+    return max((date.today() - parsed.date()).days, 0)
+
+
+def age_bucket(value: str, fresh_days: int = 90, aging_days: int = 180) -> str:
+    age_days = days_since(value)
+    if age_days is None:
+        return "Date not visible"
+    if age_days <= fresh_days:
+        return f"Fresh ({age_days}d)"
+    if age_days <= aging_days:
+        return f"Aging ({age_days}d)"
+    return f"Stale ({age_days}d)"
 
 
 def clean_sam_url(url: str) -> str:
@@ -3033,6 +3116,109 @@ def contact_quality_summary(account: Account, intel: CompanyIntel | None = None)
     }
 
 
+def source_audit_status(evidence_type: str, evidence_level: str, recency: str) -> str:
+    combined = f"{evidence_type} {evidence_level} {recency}".lower()
+    if "do not sequence" in combined or "blocked" in combined:
+        return "Do not use"
+    if "ready to sequence" in combined or "source-backed" in combined or "company-specific" in combined:
+        return "Strong"
+    if "stale" in combined or "verify date" in combined or "date not visible" in combined:
+        return "Verify"
+    if "industry benchmark" in combined or "hypothesis" in combined:
+        return "Hypothesis"
+    return "Review"
+
+
+def source_audit_dataframe(account: Account, intel: CompanyIntel | None = None) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    scanned_at = getattr(intel, "scanned_at", "") if isinstance(intel, CompanyIntel) else ""
+
+    for contact in load_verified_contacts(account.company):
+        gate = verified_contact_gate(contact)
+        rows.append(
+            {
+                "Evidence type": "Verified contact",
+                "Item": contact.full_name,
+                "Evidence level": gate["evidence_grade"],
+                "Recency / gate": gate["gate"],
+                "Captured / verified": contact.verified_at,
+                "Source": contact.source_type,
+                "Source URL": contact.linkedin_url or contact.source_url,
+                "Evidence snippet": short_text(contact.notes or contact.verification_status),
+                "Audit status": source_audit_status("Verified contact", gate["evidence_grade"], gate["gate"]),
+                "SDR action": gate["action"],
+            }
+        )
+
+    if isinstance(intel, CompanyIntel):
+        for contact in intel.contacts:
+            quality = quality_for_contact(contact)
+            rows.append(
+                {
+                    "Evidence type": "Public contact",
+                    "Item": contact.full_name or contact.title or "Unnamed contact",
+                    "Evidence level": quality.relevance,
+                    "Recency / gate": quality.freshness,
+                    "Captured / verified": scanned_at,
+                    "Source": "LinkedIn signal" if "linkedin.com" in contact.source_url.lower() else "Public web",
+                    "Source URL": contact.source_url,
+                    "Evidence snippet": short_text(contact.evidence),
+                    "Audit status": source_audit_status("Public contact", quality.status, quality.freshness),
+                    "SDR action": quality.next_step,
+                }
+            )
+
+        for point in getattr(intel, "pain_points", tuple()):
+            rows.append(
+                {
+                    "Evidence type": "Pain point",
+                    "Item": point.pain_point,
+                    "Evidence level": point.evidence_level,
+                    "Recency / gate": recency_hint(" ".join([point.evidence_title, point.snippet, point.source_url])),
+                    "Captured / verified": scanned_at,
+                    "Source": point.source,
+                    "Source URL": point.source_url,
+                    "Evidence snippet": short_text(point.snippet),
+                    "Audit status": source_audit_status("Pain point", point.evidence_level, point.snippet),
+                    "SDR action": f"Verify on call: {point.recommended_question}",
+                }
+            )
+
+        for signal in getattr(intel, "account_signals", tuple()):
+            rows.append(
+                {
+                    "Evidence type": signal.signal_type,
+                    "Item": signal.title,
+                    "Evidence level": "Company signal",
+                    "Recency / gate": signal.recency_hint,
+                    "Captured / verified": scanned_at,
+                    "Source": signal.source,
+                    "Source URL": signal.url,
+                    "Evidence snippet": short_text(signal.snippet),
+                    "Audit status": source_audit_status(signal.signal_type, "Company signal", signal.recency_hint),
+                    "SDR action": signal.call_angle,
+                }
+            )
+
+        for url in getattr(intel, "scanned_urls", tuple()):
+            rows.append(
+                {
+                    "Evidence type": "Scanned source",
+                    "Item": url_domain(url) or url,
+                    "Evidence level": "Source page scanned",
+                    "Recency / gate": "Captured",
+                    "Captured / verified": scanned_at,
+                    "Source": signal_source(url),
+                    "Source URL": url,
+                    "Evidence snippet": "Page was scanned for company intel, contacts, and pain evidence.",
+                    "Audit status": "Review",
+                    "SDR action": "Use only source-backed rows from this page; do not infer unsupported claims.",
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
 def account_fit_assessment(account: Account, intel: CompanyIntel | None = None) -> dict[str, object]:
     contact_summary = contact_quality_summary(account, intel)
     verified_count = len(load_verified_contacts(account.company))
@@ -3292,9 +3478,9 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Contact recency confirmation",
-                "Why it matters": "LinkedIn/search snippets may not show whether a person is still in role.",
-                "Recommended update": "Add an enrichment timestamp, profile last-seen date, and a manual verification checkbox before export.",
-                "Priority": "High",
+                "Why it matters": "The app now gates verified contacts by verification date/status, but public snippets still may not prove a person is currently in role.",
+                "Recommended update": "Connect a second-source enrichment provider with explicit profile last-seen dates and direct-dial freshness.",
+                "Priority": "Medium",
             },
             {
                 "Gap": "SAM.gov entity and full-history detail",
@@ -3316,9 +3502,9 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Source audit trail",
-                "Why it matters": "SDRs need to defend why a contact or pain point was selected.",
-                "Recommended update": "Store scan timestamp, source URL, evidence snippet, confidence, and manual verifier name for each row.",
-                "Priority": "Medium",
+                "Why it matters": "The app now shows source URLs, scan timestamps, evidence snippets, and SDR actions, but does not yet store named reviewer ownership for every evidence row.",
+                "Recommended update": "Add reviewer/owner fields and persist source-audit rows in Supabase for team-level compliance reporting.",
+                "Priority": "Low",
             },
             {
                 "Gap": "Account dedupe and subsidiaries",
@@ -3364,11 +3550,13 @@ def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = N
                 "Confidence": best.confidence if best else "",
                 "Contact status": quality.status,
                 "Contact score": quality.score,
+                "Sequence gate": "Ready to sequence" if quality.status == "Verified" and quality.freshness in {"Fresh", "Likely recent"} else quality.status,
                 "Role relevance": quality.relevance,
                 "Source freshness": quality.freshness,
                 "Verification next step": quality.next_step,
                 "Source type": "LinkedIn signal" if best and "linkedin.com" in best.source_url.lower() else ("Public web" if best else "Manual research"),
                 "Source / search URL": best.source_url if best else search,
+                "Evidence snippet": short_text(best.evidence if best else target.why),
                 "Why this person": best.recommended_reason if best else target.why,
                 "Message angle": target.message_angle,
             }
@@ -3574,6 +3762,7 @@ def build_public_intel(
         pain_points=dedupe_pain_points(pain_points),
         sources=tuple(source_urls[:12]),
         scanned_urls=tuple(scanned_urls[:12]),
+        scanned_at=datetime.now().isoformat(timespec="seconds"),
     )
 
 
@@ -4601,6 +4790,18 @@ with tabs[1]:
                 else:
                     st.caption("No public LinkedIn search signals were found yet. Run the scan again to refresh LinkedIn profile, company, and job-result signals.")
 
+                audit_df = source_audit_dataframe(selected_intel_account, existing_intel)
+                if not audit_df.empty:
+                    st.markdown("### Source Audit Trail")
+                    st.caption("Use this to defend where each contact, pain point, and call opener came from before an SDR sequences the account.")
+                    dataframe_with_links(audit_df, width="stretch", hide_index=True)
+                    st.download_button(
+                        "Download source audit CSV",
+                        data=audit_df.to_csv(index=False),
+                        file_name=f"{selected_intel_account.company.lower().replace(' ', '-')}-source-audit.csv",
+                        mime="text/csv",
+                    )
+
                 st.markdown("### What SDR Should Verify")
                 for item in [
                     "Confirm the person still works at the company.",
@@ -4669,6 +4870,12 @@ with tabs[2]:
         st.caption("Use this for Apollo/ZoomInfo/Hunter/Clay exports or manually verified LinkedIn/business contacts. These records persist in the app database and outrank public web guesses.")
         verified_df = verified_contacts_dataframe(selected_contact_account.company)
         if not verified_df.empty:
+            st.markdown("#### Verified Contact Recency Gate")
+            recency_cols = st.columns(4)
+            recency_cols[0].metric("Ready", int((verified_df["Sequence gate"] == "Ready to sequence").sum()))
+            recency_cols[1].metric("Verify", int(verified_df["Sequence gate"].isin(["Verify before sequence", "Verify missing fields", "Recheck before sequence"]).sum()))
+            recency_cols[2].metric("Blocked", int((verified_df["Sequence gate"] == "Do not sequence").sum()))
+            recency_cols[3].metric("Source-backed", int(verified_df["Evidence grade"].astype(str).str.startswith("A").sum()))
             dataframe_with_links(verified_df, width="stretch", hide_index=True)
             delete_options = {
                 f"{row['Name']} | {row['Title']} | ID {row['ID']}": int(row["ID"])
@@ -4901,6 +5108,18 @@ with tabs[2]:
                 st.warning(str(summary["message"]))
             else:
                 st.error(str(summary["message"]))
+
+            audit_df = source_audit_dataframe(selected_contact_account, contact_intel)
+            if not audit_df.empty:
+                st.markdown("### Source Audit Trail")
+                st.caption("Every usable contact, pain point, and call-intel signal should have a source, capture time, evidence snippet, and SDR action.")
+                dataframe_with_links(audit_df, width="stretch", hide_index=True)
+                st.download_button(
+                    "Download source audit CSV",
+                    data=audit_df.to_csv(index=False),
+                    file_name=f"{selected_contact_account.company.lower().replace(' ', '-')}-source-audit.csv",
+                    mime="text/csv",
+                )
 
         if isinstance(contact_intel, CompanyIntel) and contact_intel.contacts:
             st.caption("Includes public web contacts plus LinkedIn profile-result signals. LinkedIn rows need manual verification before outreach.")
@@ -5403,7 +5622,13 @@ with tabs[7]:
     st.markdown("### Contact List Freshness Rules")
     st.write(
         "The Contact Readiness Gate scores each row by whether it has a named person, role relevance, source type, visible recency, and business contact data. "
-        "Ready means the SDR can verify and add to cadence. Verify first means it is a research lead. Not ready means use manual LinkedIn research or a verified enrichment provider before outreach."
+        "Verified contacts now also show a Sequence Gate, Verified Age, Evidence Grade, and SDR action. "
+        "Ready to sequence means the person has a current-role verification, a source, and a usable business contact path. Verify first or Recheck before sequence means the SDR should confirm role and source recency before outreach."
+    )
+    st.markdown("### Source Audit Trail")
+    st.write(
+        "Public Intel and Contact Finder now build an audit table for verified contacts, public contacts, pain points, call-intel signals, and scanned pages. "
+        "Each row carries the source URL, captured or verified timestamp, evidence snippet, audit status, and recommended SDR action so reps can defend why a contact or pain point was used."
     )
     st.markdown("### Storage Backend")
     st.write(

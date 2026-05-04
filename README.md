@@ -26,7 +26,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
 - Shows "why now" triggers and recommended next best actions.
-- Generates a downloadable call-prep brief with account context, what they won, why they may have won, best contact path, pain points, objections, discovery questions, and GovDash demo angle.
+- Generates downloadable call-prep and account research briefs with account context, what they won, why they may have won, best contact path, pain points, call intel, trust gaps, objections, discovery questions, CRM state, and GovDash demo angle.
 - Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, notes, and activity/task logging.
 - Persists CRM fields, verified contacts, and activity history in Supabase when configured, with a local SQLite fallback (`application0_crm.sqlite3`).
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.

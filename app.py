@@ -4323,6 +4323,186 @@ def call_prep_markdown(
     return "\n".join(lines).strip() + "\n"
 
 
+def account_brief_sections(
+    account: Account,
+    intel: CompanyIntel | None = None,
+    sam_opportunities: tuple[SamOpportunity, ...] = tuple(),
+) -> dict[str, object]:
+    primary = account.primary
+    call_sections = call_prep_sections(account, intel, sam_opportunities)
+    assessment = account_fit_assessment(account, intel)
+    crm = load_crm_record(account.company)
+    verified_contacts = load_verified_contacts(account.company)
+    email_ready = email_ready_contacts(verified_contacts)
+    domain, domain_source = suggested_hubspot_domain(account, intel, verified_contacts)
+    signals = list(getattr(intel, "account_signals", tuple())) if isinstance(intel, CompanyIntel) else []
+    pains = list(getattr(intel, "pain_points", tuple())) if isinstance(intel, CompanyIntel) else []
+    website = intel.website if isinstance(intel, CompanyIntel) else ""
+    sources = list(getattr(intel, "sources", tuple())) if isinstance(intel, CompanyIntel) else []
+    scanned_at = intel.scanned_at if isinstance(intel, CompanyIntel) else ""
+    trust_gaps: list[str] = []
+    if not isinstance(intel, CompanyIntel):
+        trust_gaps.append("Run Public Intel to replace award-only hypotheses with source-backed company research.")
+    if not email_ready:
+        trust_gaps.append("Save or enrich at least one contact with a business email before launching cadence.")
+    if not domain:
+        trust_gaps.append("Confirm the company domain before relying on HubSpot duplicate matching.")
+    if not signals:
+        trust_gaps.append("Add recent announcements, interviews, podcasts, hiring, or LinkedIn-style public signals for a more relevant opener.")
+    if not pains or all(point.evidence_level == "Industry benchmark to verify" for point in pains):
+        trust_gaps.append("Validate the pain hypotheses with company-specific evidence before using them as claims.")
+    if not trust_gaps:
+        trust_gaps.append("No major brief blocker. Re-check contact title and consent/compliance before outreach.")
+
+    return {
+        "headline": call_sections["headline"],
+        "executive_summary": (
+            f"{account.company} is a {assessment['tier']} account with {account.award_count} recent award(s), "
+            f"{money(account.total_amount)} in visible award value, and an action score of {assessment['score']}/100. "
+            f"The strongest trigger is {why_now_triggers(primary)[0]}"
+        ),
+        "company": {
+            "website": website or "Not found yet",
+            "domain": domain or "Not found yet",
+            "domain_source": domain_source,
+            "what_they_do": call_sections["account_summary"],
+            "scanned_at": scanned_at or "Public Intel not run yet",
+            "sources": sources[:6],
+        },
+        "award": {
+            "award_id": primary.award_id,
+            "value": money(primary.amount),
+            "agency": primary.funding_sub_agency or primary.awarding_sub_agency or primary.awarding_agency or "Unknown agency",
+            "latest_award": account.latest_award_date or "Unknown",
+            "period": f"{primary.start_date or 'unknown'} to {primary.end_date or 'unknown'}",
+            "description": primary.description or "No public description was included in the award result.",
+            "why_they_may_have_won": call_sections["why_they_may_have_won"],
+        },
+        "best_contact": best_contact_summary(account, intel),
+        "verified_contacts": verified_contacts,
+        "contact_counts": {
+            "saved": len(verified_contacts),
+            "email_ready": len(email_ready),
+            "public_candidates": len(getattr(intel, "contacts", tuple())) if isinstance(intel, CompanyIntel) else 0,
+        },
+        "pain_points": [
+            f"{point.pain_point} | Evidence: {point.evidence_level} | Ask: {point.recommended_question}"
+            for point in pains[:5]
+        ]
+        or list(call_sections["pain_points"]),
+        "call_intel": list(call_sections["call_intel"]),
+        "talk_track": call_sections["talk_track"],
+        "discovery_questions": list(call_sections["discovery_questions"]),
+        "govdash_demo": list(demo_asset_pack(primary, intel).items()),
+        "cadence": [
+            f"{day}: {action} - {detail}"
+            for day, action, detail in DEFAULT_CADENCE
+        ],
+        "crm": {
+            "status": str(crm.get("status", "New")),
+            "owner": str(crm.get("owner", "")),
+            "persona": str(crm.get("persona", suggested_personas(primary)[0])),
+            "cadence_stage": str(crm.get("cadence_stage", DEFAULT_CADENCE[0][0])),
+            "next_action": str(crm.get("next_action", "Email")),
+            "next_step": str(crm.get("next_step", "")),
+            "notes": str(crm.get("notes", "")),
+        },
+        "assessment": assessment,
+        "trust_gaps": trust_gaps[:6],
+        "next_move": str(assessment["next_move"]),
+        "sam_context": sam_context_lines(sam_opportunities),
+    }
+
+
+def account_brief_markdown(
+    account: Account,
+    intel: CompanyIntel | None = None,
+    sam_opportunities: tuple[SamOpportunity, ...] = tuple(),
+) -> str:
+    brief = account_brief_sections(account, intel, sam_opportunities)
+    company = brief["company"]
+    award = brief["award"]
+    contact = brief["best_contact"]
+    crm = brief["crm"]
+    assessment = brief["assessment"]
+    contact_counts = brief["contact_counts"]
+    lines = [
+        f"# Account Research Brief: {account.company}",
+        "",
+        f"## Executive Summary\n{brief['executive_summary']}",
+        "",
+        "## Company Research",
+        f"- Website: {company['website']}",
+        f"- Domain: {company['domain']} ({company['domain_source']})",
+        f"- Scanned at: {company['scanned_at']}",
+        f"- What they do: {company['what_they_do']}",
+        "",
+        "## Contract Trigger",
+        f"- Award: {award['award_id']}",
+        f"- Value: {award['value']}",
+        f"- Agency: {award['agency']}",
+        f"- Latest award date: {award['latest_award']}",
+        f"- Period: {award['period']}",
+        f"- Description: {award['description']}",
+        f"- Why they may have won: {award['why_they_may_have_won']}",
+        "",
+        "## Best Contact",
+        f"- Name: {contact['name']}",
+        f"- Role: {contact['title']}",
+        f"- Status: {contact['status']}",
+        f"- Email: {contact['email'] or 'Not verified yet'}",
+        f"- Phone: {contact['phone'] or 'Not verified yet'}",
+        f"- Source: {contact['source']}",
+        f"- Why: {contact['reason']}",
+        f"- Saved contacts: {contact_counts['saved']}; email-ready: {contact_counts['email_ready']}; public candidates: {contact_counts['public_candidates']}",
+        "",
+        "## Pain Points To Validate",
+    ]
+    for item in brief["pain_points"]:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Call Intel"])
+    for item in brief["call_intel"]:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Talk Track", str(brief["talk_track"]), "", "## Discovery Questions"])
+    for item in brief["discovery_questions"]:
+        lines.append(f"- {item}")
+    lines.extend(["", "## GovDash Demo"])
+    for label, body in brief["govdash_demo"]:
+        lines.append(f"- {label}: {body}")
+    lines.extend(["", "## Cadence"])
+    for item in brief["cadence"]:
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "## CRM State",
+            f"- Status: {crm['status']}",
+            f"- Owner: {crm['owner'] or 'Unassigned'}",
+            f"- Persona: {crm['persona']}",
+            f"- Cadence stage: {crm['cadence_stage']}",
+            f"- Next action: {crm['next_action']} on {crm['next_step'] or 'not scheduled'}",
+            f"- Notes: {crm['notes'] or 'None'}",
+            "",
+            "## Readiness",
+            f"- Score: {assessment['score']}/100",
+            f"- Priority: {assessment['tier']}",
+            f"- Next move: {brief['next_move']}",
+            "",
+            "## Trust Gaps",
+        ]
+    )
+    for item in brief["trust_gaps"]:
+        lines.append(f"- {item}")
+    if company["sources"]:
+        lines.extend(["", "## Sources"])
+        for source in company["sources"]:
+            lines.append(f"- {source}")
+    lines.extend(["", "## SAM.gov Context"])
+    for item in brief["sam_context"]:
+        lines.append(f"- {item}")
+    return "\n".join(str(line) for line in lines).strip() + "\n"
+
+
 def product_gap_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -5417,7 +5597,7 @@ if selected_global_account:
             account_names(accounts),
             key="active_company_picker",
             on_change=sync_active_company_picker,
-            help="This selected company drives Public Intel, Contact Finder, CRM Cadence, Demo Builder, and Outreach.",
+            help="This selected company drives Public Intel, Contact Finder, CRM Cadence, Demo Builder, Outreach, and Account Brief.",
         )
     selected_global_account = active_account(accounts)
     with selector_cols[1]:
@@ -5430,7 +5610,7 @@ if api_messages or freshness.api_messages:
         for message in api_messages:
             st.write(message)
 
-tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "Call Prep", "CRM Cadence", "Demo Builder", "Outreach Sequence", "Data Notes"])
+tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "Call Prep", "CRM Cadence", "Demo Builder", "Outreach Sequence", "Account Brief", "Data Notes"])
 
 with tabs[0]:
     st.subheader("Account Radar")
@@ -6789,6 +6969,152 @@ with tabs[6]:
             )
 
 with tabs[7]:
+    if not accounts:
+        st.info("No accounts to brief. Adjust filters on the left to load recent award winners.")
+    else:
+        selected_brief_account = active_account(accounts)
+        brief_intel = st.session_state.get(public_intel_key(selected_brief_account.company))
+        if not isinstance(brief_intel, CompanyIntel):
+            brief_intel = None
+        brief_sam = st.session_state.get(sam_intel_key(selected_brief_account.company), tuple())
+        if not isinstance(brief_sam, tuple):
+            brief_sam = tuple()
+        brief = account_brief_sections(selected_brief_account, brief_intel, brief_sam)
+        company_brief = brief["company"]
+        award_brief = brief["award"]
+        contact_brief = brief["best_contact"]
+        contact_counts = brief["contact_counts"]
+        crm_brief = brief["crm"]
+        assessment_brief = brief["assessment"]
+
+        st.caption(f"Using active company: {selected_brief_account.company}")
+        st.markdown(
+            f"""
+            <div class="prospect-card">
+              <span class="tier-pill">{html_escape(str(brief['headline']))}</span>
+              <h3>{html_escape(selected_brief_account.company)} Account Research Brief</h3>
+              <div class="muted">{html_escape(str(brief['executive_summary']))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        brief_metrics = st.columns(6)
+        brief_metrics[0].metric("Action score", int(assessment_brief["score"]))
+        brief_metrics[1].metric("Priority", str(assessment_brief["tier"]))
+        brief_metrics[2].metric("Award value", money(selected_brief_account.total_amount))
+        brief_metrics[3].metric("Email-ready contacts", int(contact_counts["email_ready"]))
+        brief_metrics[4].metric("Call signals", int(assessment_brief["signal_count"]))
+        brief_metrics[5].metric("Pain signals", int(assessment_brief["pain_count"]))
+
+        if brief_intel is None:
+            st.warning("Run Public Intel to upgrade this from an award-based brief to a source-backed account brief.")
+
+        brief_cols = st.columns([0.52, 0.48])
+        with brief_cols[0]:
+            st.markdown("### Company & Contract")
+            st.markdown(
+                f"""
+                <div class="score-card">
+                  <b>What they do</b>
+                  {html_escape(str(company_brief['what_they_do']))}
+                </div>
+                <div class="score-card">
+                  <b>What they won</b>
+                  {html_escape(str(award_brief['award_id']))} | {html_escape(str(award_brief['value']))} | {html_escape(str(award_brief['agency']))}<br>
+                  <span class="muted">{html_escape(str(award_brief['description']))}</span>
+                </div>
+                <div class="score-card">
+                  <b>Why they may have won</b>
+                  {html_escape(str(award_brief['why_they_may_have_won']))}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("### Best Contact")
+            st.markdown(
+                f"""
+                <div class="target-card">
+                  <h4>{html_escape(str(contact_brief['name']))}</h4>
+                  <div class="muted">{html_escape(str(contact_brief['title']))} | {html_escape(str(contact_brief['status']))}</div>
+                  <div class="muted">Email: {html_escape(str(contact_brief['email'] or 'not verified yet'))} | Phone: {html_escape(str(contact_brief['phone'] or 'not verified yet'))}</div>
+                  <div class="muted">{html_escape(str(contact_brief['reason']))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if contact_brief.get("source"):
+                st.link_button("Open contact source/search", str(contact_brief["source"]))
+
+            st.markdown("### Pain Points To Validate")
+            for item in brief["pain_points"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+        with brief_cols[1]:
+            st.markdown("### SDR Talk Track")
+            st.markdown(f'<div class="intel-card">{html_escape(str(brief["talk_track"]))}</div>', unsafe_allow_html=True)
+
+            st.markdown("### Call Intel")
+            for item in brief["call_intel"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+            st.markdown("### GovDash Demo")
+            for label, body in brief["govdash_demo"]:
+                st.markdown(
+                    f"""
+                    <div class="demo-step">
+                      <b>{html_escape(str(label))}</b><br>
+                      <span class="muted">{html_escape(str(body))}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        lower_cols = st.columns([0.34, 0.33, 0.33])
+        with lower_cols[0]:
+            st.markdown("### Discovery")
+            for question in brief["discovery_questions"]:
+                st.markdown(f'<div class="score-card">{html_escape(str(question))}</div>', unsafe_allow_html=True)
+        with lower_cols[1]:
+            st.markdown("### CRM State")
+            crm_rows = [
+                f"Status: {crm_brief['status']}",
+                f"Owner: {crm_brief['owner'] or 'Unassigned'}",
+                f"Persona: {crm_brief['persona']}",
+                f"Cadence: {crm_brief['cadence_stage']}",
+                f"Next: {crm_brief['next_action']} {crm_brief['next_step']}",
+            ]
+            for row in crm_rows:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(row))}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="score-card"><b>Next move</b>{html_escape(str(brief["next_move"]))}</div>', unsafe_allow_html=True)
+        with lower_cols[2]:
+            st.markdown("### Trust Gaps")
+            for item in brief["trust_gaps"]:
+                st.markdown(f'<div class="cadence-row">{html_escape(str(item))}</div>', unsafe_allow_html=True)
+
+        source_urls = company_brief["sources"] if isinstance(company_brief.get("sources"), list) else []
+        if source_urls:
+            st.markdown("### Source Links")
+            st.markdown(
+                '<div class="source-list">'
+                + "".join(
+                    f'<a href="{html_escape(url)}" target="_blank" rel="noopener noreferrer">{html_escape(url)}</a>'
+                    for url in source_urls
+                )
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.download_button(
+            "Download account research brief",
+            data=account_brief_markdown(selected_brief_account, brief_intel, brief_sam),
+            file_name=f"{selected_brief_account.company.lower().replace(' ', '-')}-account-brief.md",
+            mime="text/markdown",
+        )
+
+
+with tabs[8]:
     st.markdown("### Source Strategy")
     st.write(
         "Application 0 uses the USAspending public API because it does not require authorization and exposes recent federal contract-award data. "
@@ -6843,6 +7169,12 @@ with tabs[7]:
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."
+    )
+    st.markdown("### Account Brief")
+    st.write(
+        "The Account Brief tab packages the active company into one SDR-ready brief: executive summary, company research, contract trigger, best contact, "
+        "pain points to validate, call intel, GovDash demo angle, CRM state, trust gaps, sources, and a downloadable markdown version. "
+        "Run Public Intel, SAM.gov enrichment, Hunter enrichment, and HubSpot sync first when you want the strongest brief."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

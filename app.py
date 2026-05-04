@@ -1953,6 +1953,62 @@ def save_hunter_contact(company: str, contact: HunterContact) -> None:
     )
 
 
+def email_ready_contacts(contacts: tuple[VerifiedContact, ...]) -> tuple[VerifiedContact, ...]:
+    return tuple(contact for contact in contacts if contact.email.strip())
+
+
+def auto_import_hunter_contacts_for_hubspot(
+    account: Account,
+    domain: str,
+    existing_contacts: tuple[VerifiedContact, ...],
+    limit: int = 5,
+) -> tuple[tuple[VerifiedContact, ...], list[str]]:
+    messages: list[str] = []
+    if email_ready_contacts(existing_contacts):
+        return existing_contacts, messages
+    if not hunter_enabled():
+        return existing_contacts, ["No saved contacts have an email yet, and Hunter is not configured."]
+
+    hunter_contacts, hunter_message = fetch_hunter_contacts(account.company, domain, limit=max(limit * 2, 10))
+    messages.append(hunter_message)
+    existing_emails = {contact.email.strip().lower() for contact in existing_contacts if contact.email.strip()}
+    imported = 0
+    for hunter_contact in hunter_contacts:
+        email = hunter_contact.email.strip().lower()
+        if not email or email in existing_emails:
+            continue
+        save_verified_contact(
+            company=account.company,
+            full_name=hunter_contact.full_name or hunter_contact.email,
+            title=hunter_contact.title,
+            email=hunter_contact.email,
+            phone=hunter_contact.phone,
+            linkedin_url=hunter_contact.linkedin_url,
+            source_url=hunter_contact.source_url or (hunter_contact.sources[0] if hunter_contact.sources else ""),
+            source_type="Hunter",
+            verification_status="Imported for verification",
+            verification_method="Vendor enrichment checked",
+            verified_by="Application 0 auto-enrichment",
+            notes=(
+                "Auto-imported during HubSpot sync because no saved email-ready contacts existed. "
+                f"Hunter confidence {hunter_contact.confidence}; result {hunter_contact.result}; "
+                f"status {hunter_contact.verification_status}; department {hunter_contact.department}; "
+                f"seniority {hunter_contact.seniority}; domain {hunter_contact.domain}; "
+                f"sources {', '.join(hunter_contact.sources[:3])}"
+            ),
+        )
+        existing_emails.add(email)
+        imported += 1
+        if imported >= limit:
+            break
+
+    if imported:
+        messages.append(f"Auto-imported {imported} Hunter contact(s) with email because no email-ready contacts were saved.")
+        return load_verified_contacts(account.company), messages
+    messages.append("No email-ready contacts were found to sync. Run Contact Finder enrichment or save a verified contact with an email.")
+    return existing_contacts, messages
+
+
 def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
     source = contact.linkedin_url or contact.source_url
     evidence = (
@@ -5648,7 +5704,7 @@ with tabs[2]:
 
         st.markdown("### HubSpot Sync")
         st.caption(
-            "One click auto-detects the company domain, checks HubSpot for duplicates, and syncs the active company plus every verified contact with an email."
+            "One click auto-detects the company domain, checks HubSpot for duplicates, and syncs the active company plus email-ready contacts. If no saved contact has an email, the app tries Hunter enrichment automatically."
         )
         hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
@@ -5700,11 +5756,28 @@ with tabs[2]:
             company_id, message = hubspot_upsert_company(selected_contact_account, resolved_domain)
             if company_id:
                 st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
-                synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(verified_contacts_for_sync, company_id)
-                sync_summary = f"{message} Domain source: {resolved_source}. Company ID: {company_id}. Synced {synced_count} contact(s)"
+                contacts_to_sync, enrichment_messages = auto_import_hunter_contacts_for_hubspot(
+                    selected_contact_account,
+                    resolved_domain,
+                    verified_contacts_for_sync,
+                )
+                if contacts_to_sync != verified_contacts_for_sync:
+                    verified_contacts_for_sync = contacts_to_sync
+                synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(contacts_to_sync, company_id)
+                domain_summary = (
+                    f"Domain source: {resolved_source}"
+                    if resolved_domain
+                    else "No company domain found; HubSpot was matched by company name"
+                )
+                sync_summary = f"{message} {domain_summary}. Company ID: {company_id}. Synced {synced_count} contact(s)"
                 if skipped_count:
                     sync_summary += f"; skipped {skipped_count} without email"
                 st.success(sync_summary + ".")
+                for enrichment_message in enrichment_messages[:3]:
+                    if "No saved contacts" in enrichment_message or "No email-ready contacts" in enrichment_message:
+                        st.warning(enrichment_message)
+                    else:
+                        st.info(enrichment_message)
                 for error in sync_errors[:3]:
                     st.warning(error)
                 if len(sync_errors) > 3:
@@ -6619,6 +6692,7 @@ with tabs[7]:
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
         "No domain typing or separate duplicate-check button is needed: the app auto-detects the company domain from company intel, verified-contact email domains, or public website search when the SDR clicks sync. "
         "During the same click, the app checks HubSpot by domain, exact name, and fuzzy name-token matches so exact matches update and likely duplicates are blocked for review. "
+        "If no saved verified contact has an email and Hunter is configured, the same sync click attempts Hunter enrichment, imports up to five email-ready contacts as review-needed records, and syncs them to HubSpot. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."

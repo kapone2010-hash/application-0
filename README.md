@@ -82,7 +82,7 @@ Add this secret locally and in Streamlit Community Cloud to sync companies, veri
 HUBSPOT_ACCESS_TOKEN = "your_hubspot_private_app_token"
 ```
 
-The current HubSpot integration syncs companies and verified contacts in one click. SDRs do not need to type a domain or run a separate check: the app auto-detects the company domain from public company intel or verified-contact email domains, falls back to a quick public website search when needed, and runs the HubSpot duplicate check automatically during sync.
+The current HubSpot integration syncs companies and verified contacts in one click. SDRs do not need to type a domain or run a separate check: the app auto-detects the company domain from public company intel or verified-contact email domains, falls back to a quick public website search when needed, and runs the HubSpot duplicate check automatically during sync. If no saved contact has an email and Hunter is configured, the same click attempts Hunter enrichment, imports up to five email-ready contacts as review-needed records, and syncs them to HubSpot.
 
 The CRM Cadence tab can also create HubSpot timeline activities. Planned follow-ups become HubSpot tasks, notes become HubSpot notes, and completed or outcome-based calls become HubSpot calls. The 14-day cadence launcher creates six dated follow-up activities in Application 0 and can create the matching HubSpot tasks in one click. If HubSpot denies a specific activity object because the private app is missing that scope, Application 0 still saves the activity locally/Supabase and shows a warning.
 

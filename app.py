@@ -82,7 +82,10 @@ CONSUMER_EMAIL_DOMAINS = {
 }
 NON_COMPANY_SITE_DOMAINS = {
     "acquisition.gov",
+    "bloomberg.com",
+    "crunchbase.com",
     "defense.gov",
+    "dnb.com",
     "facebook.com",
     "fpds.gov",
     "govinfo.gov",
@@ -93,6 +96,7 @@ NON_COMPANY_SITE_DOMAINS = {
     "twitter.com",
     "usaspending.gov",
     "x.com",
+    "zoominfo.com",
 }
 COMPANY_LEGAL_SUFFIXES = {
     "and",
@@ -2723,14 +2727,14 @@ def suggested_hubspot_domain(
     intel: CompanyIntel | None,
     verified_contacts: tuple[VerifiedContact, ...],
 ) -> tuple[str, str]:
+    contact_domain = likely_company_domain_from_contacts(verified_contacts)
+    if contact_domain:
+        return contact_domain, "verified contact email"
+
     if isinstance(intel, CompanyIntel) and intel.website:
         domain = clean_company_domain(intel.website)
         if business_domain_candidate(domain):
             return domain, "company intel website"
-
-    contact_domain = likely_company_domain_from_contacts(verified_contacts)
-    if contact_domain:
-        return contact_domain, "verified contact email"
 
     return "", "not found yet"
 

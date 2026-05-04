@@ -4091,7 +4091,7 @@ def account_fit_assessment(account: Account, intel: CompanyIntel | None = None) 
         score += min(8, 3 + len(signals))
         reasons.append("Public call-intel signals create a more relevant reason to call than the award alone.")
     else:
-        blockers.append("Run Public Intel to add recent announcements, interviews, podcasts, hiring, or LinkedIn-style public signals.")
+        blockers.append("Automatic Public Intel has not found recent announcements, interviews, podcasts, hiring, or LinkedIn-style public signals yet.")
 
     if pain_points:
         score += 5
@@ -4112,7 +4112,7 @@ def account_fit_assessment(account: Account, intel: CompanyIntel | None = None) 
         next_move = "Verify one named contact, then send a tailored first-touch using the call prep brief."
     elif score >= 65:
         tier = "Research first"
-        next_move = "Run Public Intel and add a verified contact before sequencing."
+        next_move = "Use the automatic research output, then create the full pursuit package when contact evidence is strong enough."
     else:
         tier = "Nurture"
         next_move = "Keep in nurture unless the agency, NAICS, or award value is strategically important."
@@ -4277,7 +4277,7 @@ def sam_context_lines(opportunities: tuple[SamOpportunity, ...]) -> list[str]:
             f"government POC {opportunity.point_of_contact}" if opportunity.point_of_contact else "",
         ]
         lines.append(" | ".join(part for part in parts if part))
-    return lines or ["Run SAM.gov enrichment to add notice, set-aside, contracting office, place-of-performance, and government POC context."]
+    return lines or ["Automatic SAM.gov enrichment has not added notice, set-aside, contracting office, place-of-performance, or government POC context yet."]
 
 
 def call_prep_sections(
@@ -4304,7 +4304,7 @@ def call_prep_sections(
     else:
         company_summary = (
             f"{account.company} recently won work tied to {primary.naics_description or primary.psc_description or 'federal contracting'}. "
-            "Run Public Intel to replace this with source-backed company research."
+            "Automatic Public Intel should replace this with source-backed company research when public sources are available."
         )
         why_won = (
             f"The award record points to fit around {primary.contract_focus}. USAspending does not expose evaluation rationale, "
@@ -4317,7 +4317,7 @@ def call_prep_sections(
             f"{' through ' + (top_sam.organization_path or top_sam.office) if (top_sam.organization_path or top_sam.office) else ''}."
         )
     else:
-        sam_won_context = "Run SAM.gov enrichment to add notice-level procurement context."
+        sam_won_context = "Automatic SAM.gov enrichment has not added notice-level procurement context yet."
 
     return {
         "headline": f"{account.company} | {assessment['tier']} | action score {assessment['score']}/100",
@@ -4341,7 +4341,7 @@ def call_prep_sections(
             f"{signal.signal_type}: {signal.call_angle}"
             for signal in signals[:4]
         ]
-        or ["No public call-intel signals are saved yet. Run Public Intel before using this as a live call brief."],
+        or ["No public call-intel signals are saved yet. Automatic Public Intel did not find a recent call trigger."],
         "sam_gov_context": sam_context_lines(sam_opportunities),
         "pain_points": [
             f"{point.pain_point} - ask: {point.recommended_question}"
@@ -4401,7 +4401,7 @@ def account_brief_sections(
     scanned_at = intel.scanned_at if isinstance(intel, CompanyIntel) else ""
     trust_gaps: list[str] = []
     if not isinstance(intel, CompanyIntel):
-        trust_gaps.append("Run Public Intel to replace award-only hypotheses with source-backed company research.")
+        trust_gaps.append("Automatic Public Intel has not replaced award-only hypotheses with source-backed company research yet.")
     if not email_ready:
         trust_gaps.append("Save or enrich at least one contact with a business email before launching cadence.")
     if not domain:
@@ -4714,7 +4714,7 @@ def build_full_pursuit_package(account: Account, sync_to_hubspot: bool = True) -
             "Use the source audit trail before sequencing.",
         )
     except Exception as exc:
-        add_step("Public Intel", "Needs review", f"Public scan failed: {exc}", "Run Public Intel manually or broaden the filters.")
+        add_step("Public Intel", "Needs review", f"Public scan failed: {exc}", "Broaden the filters or create the package again later.")
 
     if sam_enabled():
         try:
@@ -4760,7 +4760,7 @@ def build_full_pursuit_package(account: Account, sync_to_hubspot: bool = True) -
             "Hunter",
             "Needs review",
             " ".join(enrichment_messages) or "No email-ready contacts found.",
-            "Run Hunter manually or save a verified contact with a business email.",
+            "Use Create Full Pursuit Package again after a company domain or email-ready contact is available.",
         )
 
     if hubspot_enabled():
@@ -5215,6 +5215,66 @@ def enrich_account(account: Account) -> CompanyIntel:
     )
 
 
+def auto_public_intel(account: Account) -> CompanyIntel | None:
+    key = public_intel_key(account.company)
+    intel = st.session_state.get(key)
+    if isinstance(intel, CompanyIntel):
+        return intel
+    with st.spinner(f"Automatically scanning public sources for {account.company}..."):
+        try:
+            intel = enrich_account(account)
+        except Exception as exc:
+            st.warning(f"Automatic public intel scan could not complete: {exc}")
+            return None
+    st.session_state[key] = intel
+    return intel
+
+
+def auto_sam_context(account: Account) -> tuple[SamOpportunity, ...]:
+    sam_key = sam_intel_key(account.company)
+    sam_msg_key = sam_message_key(account.company)
+    sam_opportunities = st.session_state.get(sam_key, tuple())
+    if isinstance(sam_opportunities, tuple) and sam_opportunities:
+        return sam_opportunities
+    if not sam_enabled():
+        st.session_state[sam_msg_key] = "SAM_API_KEY is not configured."
+        return tuple()
+    with st.spinner(f"Automatically pulling SAM.gov context for {account.company}..."):
+        try:
+            sam_opportunities, sam_message = fetch_sam_opportunities(account)
+        except Exception as exc:
+            st.session_state[sam_msg_key] = f"SAM.gov enrichment failed: {exc}"
+            st.warning(str(st.session_state[sam_msg_key]))
+            return tuple()
+    st.session_state[sam_key] = sam_opportunities
+    st.session_state[sam_msg_key] = sam_message
+    return sam_opportunities
+
+
+def auto_hunter_contacts(
+    account: Account,
+    intel: CompanyIntel | None,
+    limit: int = 25,
+) -> tuple[HunterContact, ...]:
+    hunter_key = f"hunter_contacts_{account.company}"
+    hunter_message_key = f"hunter_message_{account.company}"
+    hunter_contacts = st.session_state.get(hunter_key, tuple())
+    if isinstance(hunter_contacts, tuple) and hunter_contacts:
+        return hunter_contacts
+    if not hunter_enabled():
+        st.session_state[hunter_message_key] = "HUNTER_API_KEY is not configured."
+        return tuple()
+    verified_contacts = load_verified_contacts(account.company)
+    domain, _, _ = resolve_hubspot_domain(account, intel, verified_contacts, allow_public_search=False)
+    if not domain and isinstance(intel, CompanyIntel) and intel.website:
+        domain = clean_company_domain(intel.website)
+    with st.spinner(f"Automatically checking Hunter contacts for {account.company}..."):
+        hunter_contacts, hunter_message = fetch_hunter_contacts(account.company, domain, limit)
+    st.session_state[hunter_key] = hunter_contacts
+    st.session_state[hunter_message_key] = hunter_message
+    return hunter_contacts
+
+
 def public_contacts_dataframe(intel: CompanyIntel) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -5440,7 +5500,7 @@ def demo_asset_pack(prospect: Prospect, intel: CompanyIntel | None = None) -> di
     else:
         pain_hypothesis = (
             f"The team likely needs to organize {prospect.contract_focus} while preserving reusable material for future bids. "
-            "Run Public Intel first to replace this with evidence-backed pain."
+            "Automatic Public Intel should replace this with evidence-backed pain when public sources are available."
         )
     return {
         "Opening scene": (
@@ -5710,13 +5770,6 @@ def render_sales_cockpit(account: Account) -> None:
 
 
 def render_source_audit_persistence(company: str, audit_df: pd.DataFrame, key_prefix: str) -> None:
-    save_cols = st.columns([0.26, 0.48, 0.26])
-    reviewer = save_cols[0].text_input("Reviewer / owner", key=f"{key_prefix}_audit_reviewer")
-    review_note = save_cols[1].text_input("Review note", key=f"{key_prefix}_audit_note", placeholder="Why this evidence is safe to use now")
-    if save_cols[2].button("Save audit snapshot", key=f"{key_prefix}_save_audit", disabled=audit_df.empty, use_container_width=True):
-        saved = save_source_audit_snapshot(company, audit_df, reviewer, review_note)
-        st.success(f"Saved {saved} source-audit row(s).")
-
     history_df = source_audit_history_dataframe(company)
     if not history_df.empty:
         with st.expander("Saved audit history"):
@@ -5728,6 +5781,8 @@ def render_source_audit_persistence(company: str, audit_df: pd.DataFrame, key_pr
                 mime="text/csv",
                 key=f"{key_prefix}_audit_history_download",
             )
+    else:
+        st.caption("Source evidence is generated automatically. Persistent audit snapshots are created from packaged workflows rather than manual save buttons.")
 
 
 st.set_page_config(
@@ -5997,14 +6052,14 @@ with st.sidebar:
         st.success("SAM API key configured")
     else:
         st.info("SAM API key missing")
-    st.caption("SAM.gov enrichment runs on demand for the active account.")
+    st.caption("SAM.gov enrichment runs automatically for the active account.")
 
     st.header("Hunter")
     if hunter_enabled():
         st.success("Hunter API key configured")
     else:
         st.info("Hunter API key missing")
-    st.caption("Hunter enrichment runs on demand in Contact Finder.")
+    st.caption("Hunter enrichment runs automatically in Contact Finder.")
 
     st.header("HubSpot")
     hubspot_ready, hubspot_message = hubspot_ping()
@@ -6023,11 +6078,7 @@ with st.sidebar:
     keyword = st.text_input("Keyword", placeholder="cyber, construction, satellite...")
     tier_filter = st.multiselect("Priority tiers", ["Tier 1", "Tier 2", "Tier 3"], default=["Tier 1", "Tier 2", "Tier 3"])
     active_only = st.checkbox("Active or starting soon only")
-    if st.button("Refresh live data"):
-        fetch_recent_awards.clear()
-        check_usaspending_freshness.clear()
-        st.rerun()
-    st.caption("Data comes from USAspending award search. SAM.gov Contract Awards can be added when you provide a SAM.gov public API key.")
+    st.caption("Data refreshes automatically when filters change. USAspending is the award source; SAM.gov context auto-loads when the API key is configured.")
 
 end_date = date.today()
 start_date = end_date - timedelta(days=lookback_days)
@@ -6059,7 +6110,7 @@ st.caption(
     f"Freshness gate: {freshness_icon} | Checked {freshness.checked_at} | "
     f"Latest source update: {freshness.latest_modified_date or 'none'} | "
     f"Latest award date: {freshness.latest_award_date or 'none'} | "
-    f"Full pull refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change or Refresh live data is clicked."
+    f"Full pull refresh: {st.session_state.get('last_refresh', 'not yet loaded')} | Cached for 30 minutes unless filters change."
 )
 
 if freshness.status == "Current":
@@ -6120,21 +6171,7 @@ tabs = st.tabs(["Account Radar", "Public Intel", "Contact Finder", "Call Prep", 
 with tabs[0]:
     st.subheader("Account Radar")
     if accounts:
-        st.markdown("### Company Buttons")
-        st.caption("Click a company here to update every tab and field that depends on the selected account.")
-        button_cols = st.columns(min(4, len(accounts)))
-        for index, account in enumerate(accounts[:12]):
-            with button_cols[index % len(button_cols)]:
-                is_active = account.company == active_account(accounts).company
-                label_prefix = "Selected" if is_active else "Use"
-                st.button(
-                    f"{label_prefix}: {account.company}",
-                    key=f"use_company_{index}_{account.company}",
-                    on_click=set_active_company,
-                    args=(account.company,),
-                    use_container_width=True,
-                )
-
+        st.caption("Use the Active company selector above; every tab auto-loads for that selected account.")
         dataframe_with_links(account_dataframe(accounts), width="stretch", hide_index=True)
 
         st.markdown("### SDR Action Queue")
@@ -6235,19 +6272,13 @@ with tabs[1]:
         st.caption("Pulls official SAM.gov award notices for procurement context. Government POCs are context for the notice, not SDR targets at the awardee company.")
         sam_key = sam_intel_key(selected_intel_account.company)
         sam_msg_key = sam_message_key(selected_intel_account.company)
-        sam_opportunities = st.session_state.get(sam_key, tuple())
-        if not isinstance(sam_opportunities, tuple()):
+        sam_opportunities = auto_sam_context(selected_intel_account)
+        if not isinstance(sam_opportunities, tuple):
             sam_opportunities = tuple()
-        sam_cols = st.columns([0.28, 0.72])
-        if sam_cols[0].button("Run SAM.gov enrichment", key=f"run_sam_{selected_intel_account.company}", disabled=not sam_enabled()):
-            with st.spinner("Searching SAM.gov award notices for procurement context..."):
-                sam_opportunities, sam_message = fetch_sam_opportunities(selected_intel_account)
-                st.session_state[sam_key] = sam_opportunities
-                st.session_state[sam_msg_key] = sam_message
         if not sam_enabled():
-            sam_cols[1].warning("Add SAM_API_KEY to Streamlit secrets to enable SAM.gov enrichment.")
+            st.warning("Add SAM_API_KEY to Streamlit secrets to enable SAM.gov enrichment.")
         else:
-            sam_cols[1].caption(st.session_state.get(sam_msg_key, "SAM.gov key is ready. Run enrichment for this active account."))
+            st.caption(st.session_state.get(sam_msg_key, "SAM.gov auto-enrichment is ready for this active account."))
         if sam_opportunities:
             dataframe_with_links(sam_opportunities_dataframe(sam_opportunities), width="stretch", hide_index=True)
             st.download_button(
@@ -6260,12 +6291,7 @@ with tabs[1]:
         elif st.session_state.get(sam_msg_key):
             st.info(str(st.session_state[sam_msg_key]))
 
-        run_scan = st.button("Run public scan", key=f"run_scan_{selected_intel_account.company}")
-        existing_intel = st.session_state.get(public_intel_key(selected_intel_account.company))
-        if run_scan:
-            with st.spinner("Scanning public sources for company intel and contact evidence..."):
-                existing_intel = enrich_account(selected_intel_account)
-                st.session_state[public_intel_key(selected_intel_account.company)] = existing_intel
+        existing_intel = auto_public_intel(selected_intel_account)
 
         if isinstance(existing_intel, CompanyIntel):
             pain_points = getattr(existing_intel, "pain_points", tuple())
@@ -6402,7 +6428,7 @@ with tabs[1]:
                 ]:
                     st.markdown(f'<div class="cadence-row">{html_escape(item)}</div>', unsafe_allow_html=True)
         else:
-            st.info("Click Run public scan to pull public-source company intel, source pages, and available business contact evidence for this account.")
+            st.info("Automatic public-source scan did not return company intel yet. Try a broader filter or create the full package.")
 
 
 with tabs[2]:
@@ -6426,10 +6452,8 @@ with tabs[2]:
         )
 
         st.markdown("### Best People To Contact")
-        st.caption("The app ranks the roles most likely to care about GovDash. Public scan results update the table below; otherwise each row gives the right LinkedIn search path.")
-        current_contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
-        if not isinstance(current_contact_intel, CompanyIntel):
-            current_contact_intel = None
+        st.caption("The app ranks the roles most likely to care about GovDash. Public research loads automatically for the active account.")
+        current_contact_intel = auto_public_intel(selected_contact_account)
         dataframe_with_links(people_to_contact_dataframe(selected_contact_account, current_contact_intel), width="stretch", hide_index=True)
 
         jump_links = " ".join(
@@ -6467,23 +6491,15 @@ with tabs[2]:
             recency_cols[2].metric("Blocked", int((verified_df["Sequence gate"] == "Do not sequence").sum()))
             recency_cols[3].metric("Source-backed", int(verified_df["Evidence grade"].astype(str).str.startswith("A").sum()))
             dataframe_with_links(verified_df, width="stretch", hide_index=True)
-            delete_options = {
-                f"{row['Name']} | {row['Title']} | ID {row['ID']}": int(row["ID"])
-                for _, row in verified_df.iterrows()
-            }
-            delete_choice = st.selectbox("Remove saved contact", [""] + list(delete_options.keys()), key=f"delete_verified_{selected_contact_account.company}")
-            if delete_choice and st.button("Delete selected verified contact", key=f"delete_verified_btn_{selected_contact_account.company}"):
-                delete_verified_contact(delete_options[delete_choice])
-                st.success("Verified contact removed.")
-                st.rerun()
+            st.caption("Verified contacts are maintained by enrichment/package workflows. Manual delete is hidden in automatic mode.")
         else:
             st.info("No verified contacts saved for this account yet.")
 
         st.markdown("### HubSpot Sync")
         st.caption(
-            "One click auto-detects the company domain, checks HubSpot for duplicates, and syncs the active company plus email-ready contacts. If no saved contact has an email, the app tries Hunter enrichment automatically."
+            "HubSpot matching status is shown here automatically. Company/contact writes happen from the Create Full Pursuit Package button in Account Brief."
         )
-        hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
+        hubspot_intel = current_contact_intel
         verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
         sync_result_key = hubspot_sync_result_key(selected_contact_account.company)
         hubspot_domain, hubspot_domain_source, _ = resolve_hubspot_domain(
@@ -6496,231 +6512,46 @@ with tabs[2]:
             st.session_state[hubspot_domain_key] = hubspot_domain
         elif hubspot_domain and not st.session_state.get(hubspot_domain_key):
             st.session_state[hubspot_domain_key] = hubspot_domain
-        hubspot_cols = st.columns([0.58, 0.42])
-        hubspot_cols[0].caption(
+        st.caption(
             f"Auto domain: {hubspot_domain or 'will search on click'}"
             f" | Source: {hubspot_domain_source if hubspot_domain else 'public website search'}"
             " | Duplicate check: automatic"
         )
         hs_matches = st.session_state.get(f"hubspot_duplicate_matches_{selected_contact_account.company}", [])
+        if not hs_matches and hubspot_enabled():
+            try:
+                hs_matches = hubspot_company_matches(selected_contact_account.company, hubspot_domain, limit=5)
+                st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = hs_matches
+            except requests.RequestException as exc:
+                st.warning(f"Automatic HubSpot duplicate check could not complete: {exc}")
         if isinstance(hs_matches, list) and hs_matches:
             st.caption("Latest automatic HubSpot duplicate-check results. Exact matches update; likely fuzzy duplicates are blocked for review.")
             dataframe_with_links(hubspot_company_matches_dataframe(hs_matches), width="stretch", hide_index=True)
-        if hubspot_cols[1].button(
-            "Sync company + contacts",
-            key=f"sync_hubspot_company_{selected_contact_account.company}",
-            disabled=not hubspot_enabled(),
-            use_container_width=True,
-        ):
-            with st.spinner("Auto-detecting company domain, checking HubSpot duplicates, and syncing..."):
-                resolved_domain, resolved_source, discovered_website = resolve_hubspot_domain(
-                    selected_contact_account,
-                    hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
-                    verified_contacts_for_sync,
-                    allow_public_search=True,
-                )
-                if resolved_domain:
-                    st.session_state[hubspot_domain_key] = resolved_domain
-                if discovered_website:
-                    st.caption(f"Found likely company website: {discovered_website}")
-                try:
-                    duplicate_matches = hubspot_company_matches(
-                        selected_contact_account.company,
-                        resolved_domain,
-                        limit=5,
-                    )
-                    st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = duplicate_matches
-                except requests.RequestException as exc:
-                    duplicate_matches = []
-                    st.warning(f"HubSpot duplicate check could not complete before sync: {exc}")
-            company_id, message = hubspot_upsert_company(selected_contact_account, resolved_domain)
-            if company_id:
-                st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
-                contacts_before_count = len(verified_contacts_for_sync)
-                email_ready_before = len(email_ready_contacts(verified_contacts_for_sync))
-                contacts_to_sync, enrichment_messages, imported_count = auto_import_hunter_contacts_for_hubspot(
-                    selected_contact_account,
-                    resolved_domain,
-                    verified_contacts_for_sync,
-                )
-                if contacts_to_sync != verified_contacts_for_sync:
-                    verified_contacts_for_sync = contacts_to_sync
-                synced_count, skipped_count, sync_errors = hubspot_sync_verified_contacts(contacts_to_sync, company_id)
-                domain_summary = (
-                    f"Domain source: {resolved_source}"
-                    if resolved_domain
-                    else "No company domain found; HubSpot was matched by company name"
-                )
-                sync_summary = f"{message} {domain_summary}. Company ID: {company_id}. Synced {synced_count} contact(s)"
-                if skipped_count:
-                    sync_summary += f"; skipped {skipped_count} without email"
-                st.success(sync_summary + ".")
-                st.session_state[sync_result_key] = {
-                    "checked_at": datetime.now().isoformat(timespec="seconds"),
-                    "company": selected_contact_account.company,
-                    "company_id": company_id,
-                    "company_message": message,
-                    "domain": resolved_domain,
-                    "domain_source": resolved_source,
-                    "domain_action": (
-                        "Use this domain for future duplicate checks."
-                        if resolved_domain
-                        else "Run Public Intel or Hunter enrichment to find the official website/domain."
-                    ),
-                    "duplicate_summary": summarize_hubspot_matches(duplicate_matches),
-                    "duplicate_action": (
-                        "Review likely duplicate company records before heavy sequencing."
-                        if duplicate_matches
-                        else "No duplicate review needed from this run."
-                    ),
-                    "contacts_before_count": contacts_before_count,
-                    "email_ready_before": email_ready_before,
-                    "contacts_after_count": len(contacts_to_sync),
-                    "imported_count": imported_count,
-                    "synced_count": synced_count,
-                    "skipped_count": skipped_count,
-                    "enrichment_messages": enrichment_messages,
-                    "errors": sync_errors,
-                    "contact_reason": (
-                        f"Started with {contacts_before_count} saved contact(s), {email_ready_before} with email. "
-                        f"Ended with {len(contacts_to_sync)} saved contact(s)."
-                    ),
-                    "contact_action": (
-                        "Open HubSpot and start the cadence for the synced contacts."
-                        if synced_count
-                        else "Save or enrich at least one contact with a business email, then sync again."
-                    ),
-                    "company_action": "Use this company record for contacts, notes, calls, and cadence tasks.",
-                }
-                for enrichment_message in enrichment_messages[:3]:
-                    if "No saved contacts" in enrichment_message or "No email-ready contacts" in enrichment_message:
-                        st.warning(enrichment_message)
-                    else:
-                        st.info(enrichment_message)
-                for error in sync_errors[:3]:
-                    st.warning(error)
-                if len(sync_errors) > 3:
-                    st.warning(f"{len(sync_errors) - 3} additional contact sync error(s) hidden.")
-            else:
-                st.session_state[sync_result_key] = {
-                    "checked_at": datetime.now().isoformat(timespec="seconds"),
-                    "company": selected_contact_account.company,
-                    "company_id": "",
-                    "company_message": message,
-                    "domain": resolved_domain,
-                    "domain_source": resolved_source,
-                    "domain_action": "Confirm the official company domain before creating a new HubSpot record.",
-                    "duplicate_summary": summarize_hubspot_matches(duplicate_matches),
-                    "duplicate_action": "Review the duplicate warning before syncing again.",
-                    "imported_count": 0,
-                    "synced_count": 0,
-                    "skipped_count": 0,
-                    "enrichment_messages": [],
-                    "errors": [message],
-                    "contact_reason": "Company sync did not complete, so contacts were not pushed.",
-                    "contact_action": "Resolve the company sync warning first.",
-                    "company_action": "Review the HubSpot duplicate or API error.",
-                }
-                if "Potential HubSpot duplicate" in message:
-                    st.warning(message)
-                else:
-                    st.error(message)
         sync_result = st.session_state.get(sync_result_key)
         if isinstance(sync_result, dict):
             render_hubspot_sync_result(sync_result)
         hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
-        hubspot_cols[0].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
+        st.caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
         if not hubspot_enabled():
             st.warning("Add HUBSPOT_ACCESS_TOKEN to Streamlit secrets to enable HubSpot sync.")
-        if verified_contacts_for_sync:
-            sync_options = {
-                f"{contact.full_name or contact.email} | {contact.title or 'No title'} | {contact.email or 'no email'}": contact.id
-                for contact in verified_contacts_for_sync
-            }
-            sync_choice = st.selectbox(
-                "Verified contact to sync",
-                [""] + list(sync_options.keys()),
-                key=f"hubspot_contact_choice_{selected_contact_account.company}",
-            )
-            if sync_choice and st.button(
-                "Sync selected contact to HubSpot",
-                key=f"sync_hubspot_contact_{selected_contact_account.company}",
-                disabled=not hubspot_enabled(),
-            ):
-                contact_id = sync_options[sync_choice]
-                contact = next((item for item in verified_contacts_for_sync if item.id == contact_id), None)
-                if contact is None:
-                    st.error("Could not find selected verified contact.")
-                else:
-                    if not hubspot_company_id:
-                        resolved_domain, _, _ = resolve_hubspot_domain(
-                            selected_contact_account,
-                            hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
-                            verified_contacts_for_sync,
-                            allow_public_search=True,
-                        )
-                        hubspot_company_id, _ = hubspot_upsert_company(selected_contact_account, resolved_domain)
-                        if hubspot_company_id:
-                            st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = hubspot_company_id
-                    synced_contact_id, message = hubspot_upsert_contact(contact, str(hubspot_company_id or ""))
-                    if synced_contact_id:
-                        st.success(f"{message} Contact ID: {synced_contact_id}")
-                    else:
-                        st.error(message)
-        else:
-            st.caption("Save or import at least one verified contact before syncing contacts to HubSpot.")
+        st.caption("To write companies, contacts, and cadence context into HubSpot, use Create Full Pursuit Package in Account Brief.")
 
         st.markdown("### Hunter Contact Enrichment")
-        st.caption("Uses Hunter Domain Search to find professional email addresses for the company domain/name. Review before saving to verified contacts.")
+        st.caption("Uses Hunter Domain Search automatically to find professional email addresses for the company domain/name. Contacts are written to CRM only when the full package workflow imports/syncs them.")
         hunter_key = f"hunter_contacts_{selected_contact_account.company}"
         hunter_message_key = f"hunter_message_{selected_contact_account.company}"
-        hunter_contacts = st.session_state.get(hunter_key, tuple())
+        hunter_contacts = auto_hunter_contacts(
+            selected_contact_account,
+            current_contact_intel if isinstance(current_contact_intel, CompanyIntel) else None,
+        )
         if not isinstance(hunter_contacts, tuple):
             hunter_contacts = tuple()
-        hunter_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
-        likely_domain = ""
-        if isinstance(hunter_intel, CompanyIntel) and hunter_intel.website:
-            likely_domain = clean_company_domain(hunter_intel.website)
-        hunter_cols = st.columns([0.34, 0.33, 0.33])
-        hunter_domain = hunter_cols[0].text_input(
-            "Company domain",
-            value=likely_domain,
-            placeholder="example.com",
-            key=f"hunter_domain_{selected_contact_account.company}",
-            help="Domain is best. Leave blank to let Hunter search by company name.",
-        )
-        hunter_limit = hunter_cols[1].number_input("Max Hunter contacts", min_value=5, max_value=50, value=25, step=5)
-        run_hunter = hunter_cols[2].button(
-            "Run Hunter enrichment",
-            key=f"run_hunter_{selected_contact_account.company}",
-            disabled=not hunter_enabled(),
-            use_container_width=True,
-        )
-        if run_hunter:
-            with st.spinner("Searching Hunter for professional contacts..."):
-                hunter_contacts, hunter_message = fetch_hunter_contacts(
-                    selected_contact_account.company,
-                    hunter_domain,
-                    int(hunter_limit),
-                )
-                st.session_state[hunter_key] = hunter_contacts
-                st.session_state[hunter_message_key] = hunter_message
         if not hunter_enabled():
             st.warning("Add HUNTER_API_KEY to Streamlit secrets to enable Hunter enrichment.")
         else:
-            st.caption(st.session_state.get(hunter_message_key, "Hunter is ready. Run enrichment for this active account."))
+            st.caption(st.session_state.get(hunter_message_key, "Hunter auto-enrichment is ready for this active account."))
         if hunter_contacts:
             dataframe_with_links(hunter_contacts_dataframe(hunter_contacts), width="stretch", hide_index=True)
-            save_options = hunter_contact_options(hunter_contacts)
-            save_choice = st.selectbox(
-                "Save Hunter contact as verified",
-                [""] + list(save_options.keys()),
-                key=f"save_hunter_choice_{selected_contact_account.company}",
-            )
-            if save_choice and st.button("Save selected Hunter contact", key=f"save_hunter_btn_{selected_contact_account.company}"):
-                save_hunter_contact(selected_contact_account.company, hunter_contacts[save_options[save_choice]])
-                st.success("Hunter contact saved to verified contacts.")
-                st.rerun()
             st.download_button(
                 "Download Hunter contacts CSV",
                 data=hunter_contacts_dataframe(hunter_contacts).to_csv(index=False),
@@ -6731,72 +6562,9 @@ with tabs[2]:
         elif st.session_state.get(hunter_message_key):
             st.info(str(st.session_state[hunter_message_key]))
 
-        with st.form(f"verified_contact_form_{selected_contact_account.company}"):
-            form_cols = st.columns(2)
-            verified_name = form_cols[0].text_input("Full name")
-            verified_title = form_cols[1].text_input("Current title")
-            contact_cols = st.columns(2)
-            verified_email = contact_cols[0].text_input("Verified business email")
-            verified_phone = contact_cols[1].text_input("Verified business phone")
-            link_cols = st.columns(2)
-            verified_linkedin = link_cols[0].text_input("LinkedIn URL")
-            verified_source = link_cols[1].text_input("Verification source URL")
-            status_cols = st.columns(2)
-            verified_status = status_cols[0].selectbox(
-                "Verification status",
-                ["Verified current role", "Imported for verification", "Needs recheck", "Do not sequence"],
-            )
-            verified_source_type = status_cols[1].selectbox(
-                "Source type",
-                ["Manual verification", "Apollo", "ZoomInfo", "Hunter", "Clay", "People Data Labs", "Clearbit", "LinkedIn", "Other"],
-            )
-            reviewer_cols = st.columns(2)
-            verified_by = reviewer_cols[0].text_input("Verified by / owner")
-            verification_method = reviewer_cols[1].selectbox(
-                "Verification method",
-                ["Manual source review", "LinkedIn profile checked", "Vendor enrichment checked", "Email domain matched", "Phone/direct dial checked", "Other"],
-            )
-            verified_notes = st.text_area("Verification notes", placeholder="Where did this come from? What did you verify?")
-            submitted_verified = st.form_submit_button("Save verified contact")
-            if submitted_verified:
-                if verified_name.strip():
-                    save_verified_contact(
-                        selected_contact_account.company,
-                        verified_name,
-                        verified_title,
-                        verified_email,
-                        verified_phone,
-                        verified_linkedin,
-                        verified_source,
-                        verified_source_type,
-                        verified_status,
-                        verified_notes,
-                        verified_by,
-                        verification_method,
-                    )
-                    st.success("Verified contact saved.")
-                    st.rerun()
-                else:
-                    st.error("Full name is required to save a verified contact.")
+        st.caption("Manual contact entry/import is hidden in automatic mode. Use Create Full Pursuit Package to import and sync email-ready contacts.")
 
-        uploaded_contacts = st.file_uploader(
-            "Import verified contacts CSV",
-            type=["csv"],
-            key=f"verified_upload_{selected_contact_account.company}",
-            help="Accepted columns: company, full_name/name, title, email, phone, linkedin_url/linkedin, source_url/source, source_type, verification_status/status, verified_by/reviewer, verification_method/method, notes.",
-        )
-        if uploaded_contacts is not None:
-            try:
-                imported = import_verified_contacts_csv(uploaded_contacts, selected_contact_account.company)
-                st.success(f"Imported {imported} verified contact(s). Refresh or change tabs to see the updated saved-contact table.")
-            except Exception as exc:
-                st.error(f"Could not import contacts: {exc}")
-
-        contact_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
-        if st.button("Scan public sources for actual contacts", key=f"contact_scan_{selected_contact_account.company}"):
-            with st.spinner("Searching public pages for named contacts, emails, and phone numbers..."):
-                contact_intel = enrich_account(selected_contact_account)
-                st.session_state[public_intel_key(selected_contact_account.company)] = contact_intel
+        contact_intel = current_contact_intel
 
         if isinstance(contact_intel, CompanyIntel):
             summary = contact_quality_summary(selected_contact_account, contact_intel)
@@ -6862,7 +6630,7 @@ with tabs[2]:
         elif isinstance(contact_intel, CompanyIntel):
             st.info("The scan did not find a verified named contact. Use the role-based LinkedIn and company search links above and keep the account in Researching.")
         else:
-            st.caption("Run the scan to populate public names, LinkedIn profile signals, business emails, business phones, and source evidence when available.")
+            st.caption("Public contact scanning runs automatically for the active account when public sources are available.")
 
         saved_audit_history = source_audit_history_dataframe(selected_contact_account.company)
         if not saved_audit_history.empty:
@@ -6908,10 +6676,8 @@ with tabs[3]:
         st.info("No accounts to prep. Adjust filters on the left to load recent award winners.")
     else:
         selected_prep_account = active_account(accounts)
-        prep_intel = st.session_state.get(public_intel_key(selected_prep_account.company))
-        if not isinstance(prep_intel, CompanyIntel):
-            prep_intel = None
-        prep_sam = st.session_state.get(sam_intel_key(selected_prep_account.company), tuple())
+        prep_intel = auto_public_intel(selected_prep_account)
+        prep_sam = auto_sam_context(selected_prep_account)
         if not isinstance(prep_sam, tuple):
             prep_sam = tuple()
         sections = call_prep_sections(selected_prep_account, prep_intel, prep_sam)
@@ -6937,7 +6703,7 @@ with tabs[3]:
         prep_metrics[4].metric("Pain signals", int(assessment["pain_count"]))
 
         if prep_intel is None:
-            st.warning("Run Public Intel for this account to replace generic hypotheses with source-backed company signals before a live call.")
+            st.warning("Automatic public intel did not complete; this brief may contain award-based hypotheses.")
 
         prep_cols = st.columns([0.55, 0.45])
         with prep_cols[0]:
@@ -7109,7 +6875,7 @@ with tabs[4]:
 
             st.markdown("### Best Contact")
             best_target = contact_targets(selected_account)[0]
-            crm_intel = st.session_state.get(public_intel_key(selected_account.company))
+            crm_intel = auto_public_intel(selected_account)
             best_contact = best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)
             best_contact_body = (
                 f"{best_contact['name']}"
@@ -7197,31 +6963,7 @@ with tabs[4]:
                 st.warning(f"Compliance gate blocked launch for {selected_cadence_contact.full_name}: {cadence_gate}. Update the verified contact before launching cadence.")
         with st.expander("Preview cadence tasks"):
             dataframe_with_links(cadence_preview_dataframe(cadence_activities), width="stretch", hide_index=True)
-        if st.button(
-            "Launch 14-Day Cadence",
-            key=f"launch_cadence_{selected_account.company}",
-            disabled=not bool(cadence_contact.strip()) or not bool(verified_names) or cadence_gate != "Ready to sequence",
-            use_container_width=True,
-        ):
-            saved_count = save_cadence_activities(cadence_activities)
-            if sync_cadence_to_hubspot:
-                resolved_activity_domain, _, _ = resolve_hubspot_domain(
-                    selected_account,
-                    crm_intel if isinstance(crm_intel, CompanyIntel) else None,
-                    crm_verified_contacts,
-                    allow_public_search=True,
-                )
-                synced_count, sync_errors = hubspot_sync_cadence(selected_account, cadence_activities, resolved_activity_domain)
-                if sync_errors:
-                    st.session_state[activity_flash_key] = (
-                        f"HubSpot warning: Created {saved_count} Application 0 cadence activities and {synced_count} HubSpot task(s). "
-                        f"First HubSpot issue: {sync_errors[0]}"
-                    )
-                else:
-                    st.session_state[activity_flash_key] = f"Launched cadence: created {saved_count} Application 0 activities and {synced_count} HubSpot tasks."
-            else:
-                st.session_state[activity_flash_key] = f"Launched cadence: created {saved_count} Application 0 activities."
-            st.rerun()
+        st.caption("Cadence tasks are prepared automatically. Use Create Full Pursuit Package to write synced package context; manual cadence launch is hidden in automatic mode.")
 
         loaded_activities = load_crm_activities(selected_account.company)
         activity_df = pd.DataFrame(
@@ -7244,105 +6986,7 @@ with tabs[4]:
             st.info("No activities logged for this account yet.")
         else:
             dataframe_with_links(activity_df, width="stretch", hide_index=True)
-            activity_options = {
-                f"{activity.activity_type} | {activity.due_date or 'no due date'} | {activity.subject} | ID {activity.id}": activity.id
-                for activity in loaded_activities
-            }
-            activity_by_id = {activity.id: activity for activity in loaded_activities}
-            activity_cols = st.columns(3)
-            complete_choice = activity_cols[0].selectbox("Mark activity complete", [""] + list(activity_options.keys()), key=f"complete_activity_{selected_account.company}")
-            if complete_choice and activity_cols[0].button("Complete selected activity", key=f"complete_activity_btn_{selected_account.company}"):
-                update_crm_activity_completed(activity_options[complete_choice], True)
-                st.success("Activity marked complete.")
-                st.rerun()
-            delete_choice = activity_cols[1].selectbox("Delete activity", [""] + list(activity_options.keys()), key=f"delete_activity_{selected_account.company}")
-            if delete_choice and activity_cols[1].button("Delete selected activity", key=f"delete_activity_btn_{selected_account.company}"):
-                delete_crm_activity(activity_options[delete_choice])
-                st.success("Activity deleted.")
-                st.rerun()
-            sync_choice = activity_cols[2].selectbox("Sync activity to HubSpot", [""] + list(activity_options.keys()), key=f"sync_activity_{selected_account.company}")
-            if sync_choice and activity_cols[2].button(
-                "Push selected activity",
-                key=f"sync_activity_btn_{selected_account.company}",
-                disabled=not hubspot_enabled(),
-            ):
-                selected_activity = activity_by_id.get(activity_options[sync_choice])
-                if selected_activity is None:
-                    st.error("Could not find selected activity.")
-                else:
-                    if not hubspot_activity_domain:
-                        resolved_activity_domain, _, _ = resolve_hubspot_domain(
-                            selected_account,
-                            crm_intel if isinstance(crm_intel, CompanyIntel) else None,
-                            crm_verified_contacts,
-                            allow_public_search=True,
-                        )
-                        synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, resolved_activity_domain)
-                    else:
-                        synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, hubspot_activity_domain)
-                    if synced_id:
-                        st.success(sync_message)
-                    else:
-                        st.error(sync_message)
-
-        with st.form(f"activity_form_{selected_account.company}"):
-            activity_form_cols = st.columns(3)
-            activity_type = activity_form_cols[0].selectbox("Activity type", ["Email", "Call", "LinkedIn", "Research", "Demo follow-up", "Task", "Note"])
-            activity_due = activity_form_cols[1].date_input("Activity due date", value=next_step)
-            activity_completed = activity_form_cols[2].checkbox("Already complete")
-            activity_contact = st.text_input("Contact", value=default_contact)
-            activity_subject = st.text_input("Subject", value=f"{next_action}: {selected_account.company}")
-            activity_outcome = st.selectbox("Outcome", ["", "Planned", "Completed", "No answer", "Left voicemail", "Replied", "Meeting booked", "Needs research", "Disqualified"])
-            activity_notes = st.text_area("Activity notes", placeholder="What happened, what did they say, or what should happen next?")
-            sync_new_activity = st.checkbox(
-                "Also create this activity in HubSpot",
-                value=hubspot_enabled(),
-                disabled=not hubspot_enabled(),
-                help="Creates a HubSpot task, note, or call and associates it to the company plus matching verified contact when possible.",
-            )
-            submitted_activity = st.form_submit_button("Log activity")
-            if submitted_activity:
-                save_crm_activity(
-                    selected_account.company,
-                    activity_type,
-                    activity_contact,
-                    activity_subject,
-                    activity_outcome,
-                    activity_notes,
-                    activity_due.isoformat(),
-                    activity_completed,
-                )
-                if sync_new_activity:
-                    activity_for_hubspot = CrmActivity(
-                        id=0,
-                        company=selected_account.company,
-                        activity_type=activity_type,
-                        contact_name=activity_contact,
-                        subject=activity_subject,
-                        outcome=activity_outcome,
-                        notes=activity_notes,
-                        due_date=activity_due.isoformat(),
-                        completed=activity_completed,
-                        created_at=datetime.now().isoformat(timespec="seconds"),
-                        updated_at=datetime.now().isoformat(timespec="seconds"),
-                    )
-                    if not hubspot_activity_domain:
-                        resolved_activity_domain, _, _ = resolve_hubspot_domain(
-                            selected_account,
-                            crm_intel if isinstance(crm_intel, CompanyIntel) else None,
-                            crm_verified_contacts,
-                            allow_public_search=True,
-                        )
-                        synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, resolved_activity_domain)
-                    else:
-                        synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, hubspot_activity_domain)
-                    if synced_id:
-                        st.session_state[activity_flash_key] = f"Activity saved and synced to HubSpot. {sync_message}"
-                    else:
-                        st.session_state[activity_flash_key] = f"HubSpot warning: Activity saved locally, but HubSpot sync failed. {sync_message}"
-                else:
-                    st.session_state[activity_flash_key] = "Activity saved."
-                st.rerun()
+        st.caption("Manual activity logging and activity sync are hidden in automatic mode. Package creation prepares the next workflow and HubSpot context.")
 
         st.markdown("### Recommended Cadence")
         cadence_cols = st.columns(2)
@@ -7400,7 +7044,7 @@ with tabs[5]:
         )
 
         st.markdown("### Demo Asset Pack")
-        demo_intel = st.session_state.get(public_intel_key(selected_demo_account.company))
+        demo_intel = auto_public_intel(selected_demo_account)
         pack = demo_asset_pack(selected_demo, demo_intel if isinstance(demo_intel, CompanyIntel) else None)
         for label, body in pack.items():
             st.markdown(
@@ -7445,7 +7089,7 @@ with tabs[6]:
         selected_sequence_account = active_account(accounts)
         selected_sequence = selected_sequence_account.primary
         st.caption(f"Using active company: {selected_sequence_account.company}")
-        sequence_intel = st.session_state.get(public_intel_key(selected_sequence_account.company))
+        sequence_intel = auto_public_intel(selected_sequence_account)
         sequence_signals = getattr(sequence_intel, "account_signals", tuple()) if isinstance(sequence_intel, CompanyIntel) else tuple()
 
         st.markdown("### Relevant Call Intel")
@@ -7462,7 +7106,7 @@ with tabs[6]:
                     unsafe_allow_html=True,
                 )
         else:
-            st.caption("Run Public Intel scan first to populate announcements, LinkedIn updates, podcasts, interviews, and other call triggers.")
+            st.caption("Automatic public-intel scan did not find announcements, LinkedIn updates, podcasts, interviews, or other call triggers yet.")
 
         sequence_pains = getattr(sequence_intel, "pain_points", tuple()) if isinstance(sequence_intel, CompanyIntel) else tuple()
         st.markdown("### Pain Points To Validate")
@@ -7479,7 +7123,7 @@ with tabs[6]:
                     unsafe_allow_html=True,
                 )
         else:
-            st.caption("Run Public Intel scan first to populate evidence-backed or industry-benchmark pain points.")
+            st.caption("Automatic public-intel scan did not find evidence-backed or industry-benchmark pain points yet.")
 
         st.markdown("### First-Touch Email")
         st.code(outreach_copy(selected_sequence), language="text")
@@ -7504,10 +7148,8 @@ with tabs[7]:
         st.info("No accounts to brief. Adjust filters on the left to load recent award winners.")
     else:
         selected_brief_account = active_account(accounts)
-        brief_intel = st.session_state.get(public_intel_key(selected_brief_account.company))
-        if not isinstance(brief_intel, CompanyIntel):
-            brief_intel = None
-        brief_sam = st.session_state.get(sam_intel_key(selected_brief_account.company), tuple())
+        brief_intel = auto_public_intel(selected_brief_account)
+        brief_sam = auto_sam_context(selected_brief_account)
         if not isinstance(brief_sam, tuple):
             brief_sam = tuple()
         brief = account_brief_sections(selected_brief_account, brief_intel, brief_sam)
@@ -7563,7 +7205,7 @@ with tabs[7]:
         brief_metrics[5].metric("Pain signals", int(assessment_brief["pain_count"]))
 
         if brief_intel is None:
-            st.warning("Run Public Intel to upgrade this from an award-based brief to a source-backed account brief.")
+            st.warning("Automatic public intel did not complete; this may remain an award-based brief.")
 
         brief_cols = st.columns([0.52, 0.48])
         with brief_cols[0]:
@@ -7738,9 +7380,9 @@ with tabs[8]:
     st.markdown("### HubSpot Sync")
     st.write(
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
-        "No domain typing or separate duplicate-check button is needed: the app auto-detects the company domain from company intel, verified-contact email domains, or public website search when the SDR clicks sync. "
-        "During the same click, the app checks HubSpot by domain, exact name, and fuzzy name-token matches so exact matches update and likely duplicates are blocked for review. "
-        "If no saved verified contact has an email and Hunter is configured, the same sync click attempts Hunter enrichment, imports up to five email-ready contacts as review-needed records, and syncs them to HubSpot. "
+        "No domain typing or separate duplicate-check button is needed: the app auto-detects the company domain from company intel, verified-contact email domains, or public website search. "
+        "Create Full Pursuit Package is the explicit write action: it checks HubSpot by domain, exact name, and fuzzy name-token matches so exact matches update and likely duplicates are blocked for review. "
+        "If no saved verified contact has an email and Hunter is configured, package creation attempts Hunter enrichment, imports up to five email-ready contacts as review-needed records, and syncs them to HubSpot. "
         "After each sync, Contact Finder shows a Last HubSpot Sync Results panel with the domain decision, duplicate result, company ID, contact counts, skipped contacts, errors, and next action. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
@@ -7750,7 +7392,7 @@ with tabs[8]:
     st.write(
         "The Account Brief tab packages the active company into one SDR-ready brief: executive summary, company research, contract trigger, best contact, "
         "pain points to validate, call intel, GovDash demo angle, CRM state, trust gaps, sources, and downloadable Markdown/PDF versions. "
-        "The Create Full Pursuit Package button can run Public Intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, brief generation, and cadence prep from one workflow."
+        "Public Intel, SAM.gov enrichment, Hunter enrichment, duplicate checking, and tab content auto-load for the active account; Create Full Pursuit Package is the one explicit action for package generation and CRM/HubSpot writes."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

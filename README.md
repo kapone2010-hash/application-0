@@ -11,19 +11,19 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Ranks accounts by GovDash fit, recent award value, number of awards, agencies, NAICS/PSC, and follow-on signals.
 - Adds a dynamic SDR action queue that blends award fit, verified contacts, public call-intel signals, pain evidence, open tasks, and contact readiness.
 - Lists award details, UEI, public address, NAICS/PSC, agency, amount, and dates.
-- Scans public web sources for company descriptions, likely website, source pages, public business emails/phones, named contacts, call-intel signals, evidence-backed pain points, and public LinkedIn result signals when available.
-- Enriches active accounts with SAM.gov award-notice context when `SAM_API_KEY` is configured, including notice type, solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, government POC, and source links when available.
+- Automatically scans public web sources for company descriptions, likely website, source pages, public business emails/phones, named contacts, call-intel signals, evidence-backed pain points, and public LinkedIn result signals when available.
+- Automatically enriches active accounts with SAM.gov award-notice context when `SAM_API_KEY` is configured, including notice type, solicitation number, set-aside, NAICS/PSC, contracting organization, place of performance, government POC, and source links when available.
 - Explains what the company won and gives a reasoned hypothesis for why it may have won, without pretending USAspending exposes evaluation rationale.
 - Generates public research links for company site, leadership, LinkedIn, news, USAspending, and SAM.gov.
 - Ranks the best contact targets for each account, explains why each role matters, and gives source-backed public contacts, LinkedIn profile-result signals, and search links to verify named people.
-- Uses Hunter.io contact enrichment when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
+- Uses Hunter.io contact enrichment automatically when `HUNTER_API_KEY` is configured, ranking professional emails by role relevance, confidence, verification status, phone availability, and source evidence.
 - Scores contact-list freshness and relevance before SDR use, including source freshness, role match, named-person status, business email/phone availability, and next verification step.
 - Adds a verified-contact Sequence Gate with verified age, evidence grade, and SDR action so reps know whether a person is ready to sequence, needs recheck, or should be blocked.
 - Adds confidence labels across major account, contact, pain-point, call-intel, source-audit, Hunter, HubSpot, SAM.gov, and pursuit-package tables so SDRs can distinguish official sources, verified sources, vendor enrichment, public sources, hypotheses, stale data, and items needing review.
 - Adds a selected-account sales cockpit with readiness state, action score, contact readiness, domain status, HubSpot link status, award value, call signals, pain signals, and next best action.
 - Builds a source audit trail for contacts, pain points, call-intel signals, and scanned pages with source URL, capture/verification timestamp, evidence snippet, audit status, and SDR action.
 - Persists source-audit snapshots with reviewer/owner and review-note fields so evidence can be defended after outreach.
-- Saves verified contacts from manual research or enrichment CSV exports so verified people outrank public web guesses.
+- Saves verified contacts from enrichment/package workflows so verified people outrank public web guesses.
 - Syncs active companies, verified contacts, individual CRM activities, and one-click 14-day cadence task launches into HubSpot when `HUBSPOT_ACCESS_TOKEN` is configured and the private app has the needed activity scopes.
 - Pulls call-relevance signals beyond the award, including public LinkedIn updates/search signals, announcements, past press releases, podcasts/interviews, hiring/growth, partnerships, webinars, and leadership changes when public sources expose them.
 - Categorizes each account by industry and separates company-specific pain evidence from industry benchmark pain points that SDRs should verify on the call.
@@ -32,7 +32,7 @@ A Streamlit prototype for finding government contractors that recently won publi
 - Adds CRM-style fields for status, owner, cadence stage, email/call tracking, outcomes, next step date, persona, notes, and activity/task logging.
 - Persists CRM fields, verified contacts, and activity history in Supabase when configured, with a local SQLite fallback (`application0_crm.sqlite3`).
 - Creates a GovDash demo asset pack, award-specific demo flow, discovery questions, email copy, call opener, and a 14-day sequence.
-- Creates a one-click full pursuit package that runs public intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, account brief generation, and cadence prep for the active company.
+- Keeps package creation as the main explicit action: one click runs public intel, SAM.gov enrichment, Hunter enrichment, HubSpot duplicate/sync, account brief generation, and cadence prep for the active company.
 - Exports account radar, award-level records, public intel, and CRM-ready cadence CSVs.
 - Shows product gaps and recommended next upgrades such as verified enrichment, SAM.gov detail, durable CRM storage, and activity sync.
 

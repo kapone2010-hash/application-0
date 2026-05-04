@@ -4,7 +4,7 @@ import os
 import sqlite3
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from time import monotonic, sleep
@@ -1144,6 +1144,163 @@ def hubspot_sync_verified_contacts(
         else:
             errors.append(f"{contact.full_name or contact.email}: {message}")
     return synced, skipped, errors
+
+
+def hubspot_timestamp(value: str = "") -> str:
+    parsed_date = parse_iso_date(value)
+    if parsed_date:
+        return f"{parsed_date.isoformat()}T14:00:00Z"
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def hubspot_activity_body(activity: CrmActivity, account: Account) -> str:
+    parts = [
+        f"Application 0 activity for {account.company}",
+        f"Type: {activity.activity_type}",
+        f"Contact: {activity.contact_name or 'Not specified'}",
+        f"Outcome: {activity.outcome or 'Not specified'}",
+        f"Due date: {activity.due_date or 'Not specified'}",
+        f"Completed: {'yes' if activity.completed else 'no'}",
+        "",
+        activity.notes or activity.subject,
+    ]
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+def hubspot_task_type(activity_type: str) -> str:
+    normalized = activity_type.lower()
+    if normalized == "call":
+        return "CALL"
+    if normalized == "email":
+        return "EMAIL"
+    return "TODO"
+
+
+def hubspot_call_status(activity: CrmActivity) -> str:
+    outcome = activity.outcome.lower()
+    if "no answer" in outcome:
+        return "NO_ANSWER"
+    if "bad number" in outcome:
+        return "FAILED"
+    if "left voicemail" in outcome or "completed" in outcome or "connected" in outcome or activity.completed:
+        return "COMPLETED"
+    return "QUEUED"
+
+
+def hubspot_activity_kind(activity: CrmActivity) -> str:
+    activity_type = activity.activity_type.lower()
+    if activity_type == "note":
+        return "notes"
+    if activity_type == "call" and (activity.completed or activity.outcome):
+        return "calls"
+    return "tasks"
+
+
+def hubspot_activity_properties(activity: CrmActivity, account: Account, kind: str) -> dict[str, str]:
+    body = hubspot_activity_body(activity, account)
+    subject = activity.subject or f"{activity.activity_type}: {account.company}"
+    timestamp = hubspot_timestamp(activity.due_date)
+    if kind == "notes":
+        return {
+            "hs_timestamp": hubspot_timestamp(activity.created_at),
+            "hs_note_body": body,
+        }
+    if kind == "calls":
+        return {
+            "hs_timestamp": timestamp,
+            "hs_call_title": subject,
+            "hs_call_body": body,
+            "hs_call_status": hubspot_call_status(activity),
+            "hs_call_direction": "OUTBOUND",
+        }
+    return {
+        "hs_timestamp": timestamp,
+        "hs_task_subject": subject,
+        "hs_task_body": body,
+        "hs_task_status": "COMPLETED" if activity.completed else "NOT_STARTED",
+        "hs_task_type": hubspot_task_type(activity.activity_type),
+        "hs_task_priority": "HIGH" if activity.activity_type.lower() in {"call", "demo follow-up"} else "MEDIUM",
+    }
+
+
+def hubspot_activity_paths(kind: str) -> tuple[str, ...]:
+    return (
+        f"/crm/objects/2026-03/{kind}",
+        f"/crm/v3/objects/{kind}",
+    )
+
+
+def hubspot_create_activity(kind: str, properties: dict[str, str]) -> tuple[str, str]:
+    last_error = ""
+    for path in hubspot_activity_paths(kind):
+        try:
+            created = hubspot_request("POST", path, json={"properties": properties})
+            return str(created.get("id") or ""), f"HubSpot {kind[:-1]} created."
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            body = exc.response.text[:180] if exc.response is not None else str(exc)
+            last_error = f"HTTP {status}: {body}"
+            if status not in {404, 405}:
+                break
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            break
+    return "", f"HubSpot {kind[:-1]} sync failed. {last_error}"
+
+
+def hubspot_associate_default(from_type: str, from_id: str, to_type: str, to_id: str) -> str:
+    if not from_id or not to_id:
+        return "No association attempted."
+    for source_type in (from_type, from_type.rstrip("s")):
+        for target_type in (to_type, to_type.rstrip("s")):
+            try:
+                hubspot_request(
+                    "PUT",
+                    f"/crm/v4/objects/{source_type}/{from_id}/associations/default/{target_type}/{to_id}",
+                )
+                return f"Associated {source_type} to {target_type}."
+            except requests.RequestException:
+                continue
+    return "Activity created, but automatic association was not available."
+
+
+def verified_contact_for_activity(company: str, contact_name: str) -> VerifiedContact | None:
+    clean_name = (contact_name or "").strip().lower()
+    if not clean_name:
+        return None
+    for contact in load_verified_contacts(company):
+        if contact.full_name.strip().lower() == clean_name:
+            return contact
+    for contact in load_verified_contacts(company):
+        if clean_name in contact.full_name.strip().lower() or contact.full_name.strip().lower() in clean_name:
+            return contact
+    return None
+
+
+def hubspot_sync_activity(account: Account, activity: CrmActivity, domain: str = "") -> tuple[str, str]:
+    if not hubspot_enabled():
+        return "", "HubSpot token is not configured."
+    company_id, company_message = hubspot_upsert_company(account, domain)
+    if not company_id:
+        return "", company_message
+
+    contact = verified_contact_for_activity(account.company, activity.contact_name)
+    contact_id = ""
+    contact_message = ""
+    if contact is not None and contact.email:
+        contact_id, contact_message = hubspot_upsert_contact(contact, company_id)
+
+    kind = hubspot_activity_kind(activity)
+    activity_id, activity_message = hubspot_create_activity(kind, hubspot_activity_properties(activity, account, kind))
+    if not activity_id:
+        return "", activity_message
+
+    association_messages = [hubspot_associate_default(kind, activity_id, "companies", company_id)]
+    if contact_id:
+        association_messages.append(hubspot_associate_default(kind, activity_id, "contacts", contact_id))
+
+    details = "; ".join(part for part in [company_message, contact_message, *association_messages] if part)
+    return activity_id, f"{activity_message} ID: {activity_id}. {details}"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -3496,8 +3653,8 @@ def product_gap_dataframe() -> pd.DataFrame:
             },
             {
                 "Gap": "Email/call activity automation",
-                "Why it matters": "The app syncs companies/contacts to HubSpot but does not yet send emails, log calls, or sync tasks/notes automatically.",
-                "Recommended update": "Add HubSpot activity scopes when available, or connect Gmail/Outlook/sequencing tools with opt-out/compliance controls.",
+                "Why it matters": "The app can create HubSpot tasks, notes, and calls from CRM Cadence when the private app has activity scopes, but it does not send email or run a compliant outbound sequence.",
+                "Recommended update": "Connect Gmail/Outlook or a sequencing tool with opt-out handling, consent/compliance controls, and reply tracking.",
                 "Priority": "Medium",
             },
             {
@@ -5399,17 +5556,65 @@ with tabs[4]:
         dataframe_with_links(to_dataframe(list(selected_account.prospects)), width="stretch", hide_index=True)
 
         st.markdown("### Activity Timeline & Tasks")
-        st.caption("Log calls, emails, LinkedIn touches, research tasks, and demo follow-ups. These activity rows are saved in the local CRM database.")
-        activity_df = crm_activities_dataframe(selected_account.company)
+        st.caption("Log calls, emails, LinkedIn touches, research tasks, and demo follow-ups. These activity rows are saved in Application 0 and can be pushed to the HubSpot timeline when scopes allow it.")
+        activity_flash_key = f"activity_flash_{selected_account.company}"
+        activity_flash = st.session_state.pop(activity_flash_key, "")
+        if activity_flash:
+            if str(activity_flash).startswith("HubSpot warning:"):
+                st.warning(str(activity_flash).replace("HubSpot warning: ", "", 1))
+            else:
+                st.success(str(activity_flash))
+
+        crm_verified_contacts = load_verified_contacts(selected_account.company)
+        activity_hubspot_domain, activity_hubspot_domain_source = suggested_hubspot_domain(
+            selected_account,
+            crm_intel if isinstance(crm_intel, CompanyIntel) else None,
+            crm_verified_contacts,
+        )
+        activity_domain_key = f"activity_hubspot_domain_{selected_account.company}"
+        if activity_domain_key not in st.session_state:
+            st.session_state[activity_domain_key] = activity_hubspot_domain
+        elif activity_hubspot_domain and not st.session_state.get(activity_domain_key):
+            st.session_state[activity_domain_key] = activity_hubspot_domain
+
+        hubspot_activity_cols = st.columns([0.38, 0.62])
+        hubspot_activity_domain = hubspot_activity_cols[0].text_input(
+            "HubSpot activity company domain",
+            placeholder="example.com",
+            key=activity_domain_key,
+        )
+        hubspot_activity_cols[1].caption(
+            f"HubSpot activity sync is {'ready' if hubspot_enabled() else 'disabled until HUBSPOT_ACCESS_TOKEN is configured'}. "
+            f"Domain suggestion: {activity_hubspot_domain_source if activity_hubspot_domain else 'public search fallback'}."
+        )
+
+        loaded_activities = load_crm_activities(selected_account.company)
+        activity_df = pd.DataFrame(
+            [
+                {
+                    "ID": activity.id,
+                    "Done": activity.completed,
+                    "Due date": activity.due_date,
+                    "Type": activity.activity_type,
+                    "Contact": activity.contact_name,
+                    "Subject": activity.subject,
+                    "Outcome": activity.outcome,
+                    "Notes": activity.notes,
+                    "Created": activity.created_at,
+                }
+                for activity in loaded_activities
+            ]
+        )
         if activity_df.empty:
             st.info("No activities logged for this account yet.")
         else:
             dataframe_with_links(activity_df, width="stretch", hide_index=True)
             activity_options = {
-                f"{row['Type']} | {row['Due date'] or 'no due date'} | {row['Subject']} | ID {row['ID']}": int(row["ID"])
-                for _, row in activity_df.iterrows()
+                f"{activity.activity_type} | {activity.due_date or 'no due date'} | {activity.subject} | ID {activity.id}": activity.id
+                for activity in loaded_activities
             }
-            activity_cols = st.columns(2)
+            activity_by_id = {activity.id: activity for activity in loaded_activities}
+            activity_cols = st.columns(3)
             complete_choice = activity_cols[0].selectbox("Mark activity complete", [""] + list(activity_options.keys()), key=f"complete_activity_{selected_account.company}")
             if complete_choice and activity_cols[0].button("Complete selected activity", key=f"complete_activity_btn_{selected_account.company}"):
                 update_crm_activity_completed(activity_options[complete_choice], True)
@@ -5420,8 +5625,23 @@ with tabs[4]:
                 delete_crm_activity(activity_options[delete_choice])
                 st.success("Activity deleted.")
                 st.rerun()
+            sync_choice = activity_cols[2].selectbox("Sync activity to HubSpot", [""] + list(activity_options.keys()), key=f"sync_activity_{selected_account.company}")
+            if sync_choice and activity_cols[2].button(
+                "Push selected activity",
+                key=f"sync_activity_btn_{selected_account.company}",
+                disabled=not hubspot_enabled(),
+            ):
+                selected_activity = activity_by_id.get(activity_options[sync_choice])
+                if selected_activity is None:
+                    st.error("Could not find selected activity.")
+                else:
+                    synced_id, sync_message = hubspot_sync_activity(selected_account, selected_activity, hubspot_activity_domain)
+                    if synced_id:
+                        st.success(sync_message)
+                    else:
+                        st.error(sync_message)
 
-        verified_names = [contact.full_name for contact in load_verified_contacts(selected_account.company) if contact.full_name]
+        verified_names = [contact.full_name for contact in crm_verified_contacts if contact.full_name]
         default_contact = verified_names[0] if verified_names else best_contact_summary(selected_account, crm_intel if isinstance(crm_intel, CompanyIntel) else None)["name"]
         with st.form(f"activity_form_{selected_account.company}"):
             activity_form_cols = st.columns(3)
@@ -5432,6 +5652,12 @@ with tabs[4]:
             activity_subject = st.text_input("Subject", value=f"{next_action}: {selected_account.company}")
             activity_outcome = st.selectbox("Outcome", ["", "Planned", "Completed", "No answer", "Left voicemail", "Replied", "Meeting booked", "Needs research", "Disqualified"])
             activity_notes = st.text_area("Activity notes", placeholder="What happened, what did they say, or what should happen next?")
+            sync_new_activity = st.checkbox(
+                "Also create this activity in HubSpot",
+                value=hubspot_enabled(),
+                disabled=not hubspot_enabled(),
+                help="Creates a HubSpot task, note, or call and associates it to the company plus matching verified contact when possible.",
+            )
             submitted_activity = st.form_submit_button("Log activity")
             if submitted_activity:
                 save_crm_activity(
@@ -5444,7 +5670,27 @@ with tabs[4]:
                     activity_due.isoformat(),
                     activity_completed,
                 )
-                st.success("Activity saved.")
+                if sync_new_activity:
+                    activity_for_hubspot = CrmActivity(
+                        id=0,
+                        company=selected_account.company,
+                        activity_type=activity_type,
+                        contact_name=activity_contact,
+                        subject=activity_subject,
+                        outcome=activity_outcome,
+                        notes=activity_notes,
+                        due_date=activity_due.isoformat(),
+                        completed=activity_completed,
+                        created_at=datetime.now().isoformat(timespec="seconds"),
+                        updated_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    synced_id, sync_message = hubspot_sync_activity(selected_account, activity_for_hubspot, hubspot_activity_domain)
+                    if synced_id:
+                        st.session_state[activity_flash_key] = f"Activity saved and synced to HubSpot. {sync_message}"
+                    else:
+                        st.session_state[activity_flash_key] = f"HubSpot warning: Activity saved locally, but HubSpot sync failed. {sync_message}"
+                else:
+                    st.session_state[activity_flash_key] = "Activity saved."
                 st.rerun()
 
         st.markdown("### Recommended Cadence")
@@ -5650,7 +5896,8 @@ with tabs[7]:
     st.write(
         "When `HUBSPOT_ACCESS_TOKEN` is configured, Contact Finder can sync the active company and every verified contact with an email to HubSpot in one click. "
         "The company domain is pre-filled from company intel or verified-contact email domains, then falls back to public website search if needed. "
-        "This first HubSpot integration uses company/contact scopes only; notes, tasks, and cadence activities remain in Application 0 and Supabase until the HubSpot account exposes activity scopes."
+        "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
+        "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."
     )
     st.markdown("### Gaps & Recommended Updates")
     dataframe_with_links(product_gap_dataframe(), width="stretch", hide_index=True)

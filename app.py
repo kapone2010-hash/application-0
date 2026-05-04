@@ -1962,12 +1962,12 @@ def auto_import_hunter_contacts_for_hubspot(
     domain: str,
     existing_contacts: tuple[VerifiedContact, ...],
     limit: int = 5,
-) -> tuple[tuple[VerifiedContact, ...], list[str]]:
+) -> tuple[tuple[VerifiedContact, ...], list[str], int]:
     messages: list[str] = []
     if email_ready_contacts(existing_contacts):
-        return existing_contacts, messages
+        return existing_contacts, messages, 0
     if not hunter_enabled():
-        return existing_contacts, ["No saved contacts have an email yet, and Hunter is not configured."]
+        return existing_contacts, ["No saved contacts have an email yet, and Hunter is not configured."], 0
 
     hunter_contacts, hunter_message = fetch_hunter_contacts(account.company, domain, limit=max(limit * 2, 10))
     messages.append(hunter_message)
@@ -2004,9 +2004,91 @@ def auto_import_hunter_contacts_for_hubspot(
 
     if imported:
         messages.append(f"Auto-imported {imported} Hunter contact(s) with email because no email-ready contacts were saved.")
-        return load_verified_contacts(account.company), messages
+        return load_verified_contacts(account.company), messages, imported
     messages.append("No email-ready contacts were found to sync. Run Contact Finder enrichment or save a verified contact with an email.")
-    return existing_contacts, messages
+    return existing_contacts, messages, 0
+
+
+def hubspot_sync_result_key(company: str) -> str:
+    return f"hubspot_sync_result_{company}"
+
+
+def summarize_hubspot_matches(matches: list[dict[str, str]]) -> str:
+    if not matches:
+        return "No duplicate company matches returned."
+    exact = [
+        match
+        for match in matches
+        if "domain match" in str(match.get("reason", "")).lower()
+        or "exact name match" in str(match.get("reason", "")).lower()
+    ]
+    if exact:
+        names = ", ".join(str(match.get("name") or match.get("id") or "HubSpot company") for match in exact[:3])
+        return f"{len(matches)} match(es), including exact domain/name match: {names}."
+    names = ", ".join(str(match.get("name") or match.get("id") or "HubSpot company") for match in matches[:3])
+    return f"{len(matches)} possible fuzzy match(es): {names}."
+
+
+def hubspot_sync_result_dataframe(result: dict[str, object]) -> pd.DataFrame:
+    rows = [
+        {
+            "Step": "Domain",
+            "Result": str(result.get("domain") or "Not found"),
+            "Why": str(result.get("domain_source") or "No source returned"),
+            "Next action": str(result.get("domain_action") or ""),
+        },
+        {
+            "Step": "Duplicate check",
+            "Result": str(result.get("duplicate_summary") or ""),
+            "Why": "HubSpot search ran before the company sync.",
+            "Next action": str(result.get("duplicate_action") or ""),
+        },
+        {
+            "Step": "Company sync",
+            "Result": str(result.get("company_message") or ""),
+            "Why": f"HubSpot company ID: {result.get('company_id') or 'not created'}",
+            "Next action": str(result.get("company_action") or ""),
+        },
+        {
+            "Step": "Contact sync",
+            "Result": (
+                f"{int(result.get('synced_count') or 0)} synced, "
+                f"{int(result.get('imported_count') or 0)} auto-imported, "
+                f"{int(result.get('skipped_count') or 0)} skipped"
+            ),
+            "Why": str(result.get("contact_reason") or ""),
+            "Next action": str(result.get("contact_action") or ""),
+        },
+    ]
+    errors = result.get("errors")
+    if isinstance(errors, list) and errors:
+        rows.append(
+            {
+                "Step": "Errors",
+                "Result": f"{len(errors)} issue(s)",
+                "Why": "; ".join(str(error) for error in errors[:3]),
+                "Next action": "Open the source contact, fix the email/permission issue, and sync again.",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_hubspot_sync_result(result: dict[str, object]) -> None:
+    st.markdown("#### Last HubSpot Sync Results")
+    checked_at = str(result.get("checked_at") or "")
+    if checked_at:
+        st.caption(f"Last run: {checked_at}")
+    result_cols = st.columns(4)
+    result_cols[0].metric("Company ID", str(result.get("company_id") or "None"))
+    result_cols[1].metric("Contacts synced", int(result.get("synced_count") or 0))
+    result_cols[2].metric("Auto-imported", int(result.get("imported_count") or 0))
+    result_cols[3].metric("Skipped", int(result.get("skipped_count") or 0))
+    dataframe_with_links(hubspot_sync_result_dataframe(result), width="stretch", hide_index=True)
+    enrichment_messages = result.get("enrichment_messages")
+    if isinstance(enrichment_messages, list) and enrichment_messages:
+        with st.expander("Enrichment detail", expanded=False):
+            for message in enrichment_messages[:5]:
+                st.write(str(message))
 
 
 def verified_contact_to_public(contact: VerifiedContact) -> PublicContact:
@@ -4321,7 +4403,7 @@ def people_to_contact_dataframe(account: Account, intel: CompanyIntel | None = N
                 "Likely title": best.title if best else target.title,
                 "Email": best.email if best else "",
                 "Phone": best.phone if best else "",
-                "Confidence": best.confidence if best else "",
+                "Confidence": best.confidence if best else 0,
                 "Contact status": quality.status,
                 "Contact score": quality.score,
                 "Sequence gate": "Ready to sequence" if quality.status == "Verified" and quality.freshness in {"Fresh", "Likely recent"} else quality.status,
@@ -5708,6 +5790,7 @@ with tabs[2]:
         )
         hubspot_intel = st.session_state.get(public_intel_key(selected_contact_account.company))
         verified_contacts_for_sync = load_verified_contacts(selected_contact_account.company)
+        sync_result_key = hubspot_sync_result_key(selected_contact_account.company)
         hubspot_domain, hubspot_domain_source, _ = resolve_hubspot_domain(
             selected_contact_account,
             hubspot_intel if isinstance(hubspot_intel, CompanyIntel) else None,
@@ -5746,17 +5829,21 @@ with tabs[2]:
                 if discovered_website:
                     st.caption(f"Found likely company website: {discovered_website}")
                 try:
-                    st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = hubspot_company_matches(
+                    duplicate_matches = hubspot_company_matches(
                         selected_contact_account.company,
                         resolved_domain,
                         limit=5,
                     )
+                    st.session_state[f"hubspot_duplicate_matches_{selected_contact_account.company}"] = duplicate_matches
                 except requests.RequestException as exc:
+                    duplicate_matches = []
                     st.warning(f"HubSpot duplicate check could not complete before sync: {exc}")
             company_id, message = hubspot_upsert_company(selected_contact_account, resolved_domain)
             if company_id:
                 st.session_state[f"hubspot_company_id_{selected_contact_account.company}"] = company_id
-                contacts_to_sync, enrichment_messages = auto_import_hunter_contacts_for_hubspot(
+                contacts_before_count = len(verified_contacts_for_sync)
+                email_ready_before = len(email_ready_contacts(verified_contacts_for_sync))
+                contacts_to_sync, enrichment_messages, imported_count = auto_import_hunter_contacts_for_hubspot(
                     selected_contact_account,
                     resolved_domain,
                     verified_contacts_for_sync,
@@ -5773,6 +5860,43 @@ with tabs[2]:
                 if skipped_count:
                     sync_summary += f"; skipped {skipped_count} without email"
                 st.success(sync_summary + ".")
+                st.session_state[sync_result_key] = {
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                    "company": selected_contact_account.company,
+                    "company_id": company_id,
+                    "company_message": message,
+                    "domain": resolved_domain,
+                    "domain_source": resolved_source,
+                    "domain_action": (
+                        "Use this domain for future duplicate checks."
+                        if resolved_domain
+                        else "Run Public Intel or Hunter enrichment to find the official website/domain."
+                    ),
+                    "duplicate_summary": summarize_hubspot_matches(duplicate_matches),
+                    "duplicate_action": (
+                        "Review likely duplicate company records before heavy sequencing."
+                        if duplicate_matches
+                        else "No duplicate review needed from this run."
+                    ),
+                    "contacts_before_count": contacts_before_count,
+                    "email_ready_before": email_ready_before,
+                    "contacts_after_count": len(contacts_to_sync),
+                    "imported_count": imported_count,
+                    "synced_count": synced_count,
+                    "skipped_count": skipped_count,
+                    "enrichment_messages": enrichment_messages,
+                    "errors": sync_errors,
+                    "contact_reason": (
+                        f"Started with {contacts_before_count} saved contact(s), {email_ready_before} with email. "
+                        f"Ended with {len(contacts_to_sync)} saved contact(s)."
+                    ),
+                    "contact_action": (
+                        "Open HubSpot and start the cadence for the synced contacts."
+                        if synced_count
+                        else "Save or enrich at least one contact with a business email, then sync again."
+                    ),
+                    "company_action": "Use this company record for contacts, notes, calls, and cadence tasks.",
+                }
                 for enrichment_message in enrichment_messages[:3]:
                     if "No saved contacts" in enrichment_message or "No email-ready contacts" in enrichment_message:
                         st.warning(enrichment_message)
@@ -5783,10 +5907,32 @@ with tabs[2]:
                 if len(sync_errors) > 3:
                     st.warning(f"{len(sync_errors) - 3} additional contact sync error(s) hidden.")
             else:
+                st.session_state[sync_result_key] = {
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                    "company": selected_contact_account.company,
+                    "company_id": "",
+                    "company_message": message,
+                    "domain": resolved_domain,
+                    "domain_source": resolved_source,
+                    "domain_action": "Confirm the official company domain before creating a new HubSpot record.",
+                    "duplicate_summary": summarize_hubspot_matches(duplicate_matches),
+                    "duplicate_action": "Review the duplicate warning before syncing again.",
+                    "imported_count": 0,
+                    "synced_count": 0,
+                    "skipped_count": 0,
+                    "enrichment_messages": [],
+                    "errors": [message],
+                    "contact_reason": "Company sync did not complete, so contacts were not pushed.",
+                    "contact_action": "Resolve the company sync warning first.",
+                    "company_action": "Review the HubSpot duplicate or API error.",
+                }
                 if "Potential HubSpot duplicate" in message:
                     st.warning(message)
                 else:
                     st.error(message)
+        sync_result = st.session_state.get(sync_result_key)
+        if isinstance(sync_result, dict):
+            render_hubspot_sync_result(sync_result)
         hubspot_company_id = st.session_state.get(f"hubspot_company_id_{selected_contact_account.company}", "")
         hubspot_cols[0].caption(f"Company ID: {hubspot_company_id or 'not synced yet'}")
         if not hubspot_enabled():
@@ -6693,6 +6839,7 @@ with tabs[7]:
         "No domain typing or separate duplicate-check button is needed: the app auto-detects the company domain from company intel, verified-contact email domains, or public website search when the SDR clicks sync. "
         "During the same click, the app checks HubSpot by domain, exact name, and fuzzy name-token matches so exact matches update and likely duplicates are blocked for review. "
         "If no saved verified contact has an email and Hunter is configured, the same sync click attempts Hunter enrichment, imports up to five email-ready contacts as review-needed records, and syncs them to HubSpot. "
+        "After each sync, Contact Finder shows a Last HubSpot Sync Results panel with the domain decision, duplicate result, company ID, contact counts, skipped contacts, errors, and next action. "
         "CRM Cadence can also create HubSpot tasks, notes, and calls when the private app has the needed activity scopes. "
         "The 14-day cadence launcher creates six dated follow-up activities locally and matching HubSpot tasks in one click. "
         "If HubSpot denies an activity object, Application 0 still saves the row in Supabase/local storage and shows a warning."

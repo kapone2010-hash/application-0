@@ -22,6 +22,7 @@ DB_PATH = Path(__file__).with_name("salon_assistant.sqlite3")
 SALON_NAME = os.getenv("SALON_NAME", "Luxe Chair Salon")
 SALON_PHONE = os.getenv("SALON_PHONE", "(555) 014-2233")
 SALON_TIMEZONE = os.getenv("SALON_TIMEZONE", "America/New_York")
+DEFAULT_SALON_SLUG = os.getenv("SALON_SLUG", "luxe-chair")
 SALON_STAFF_PASSCODE = os.getenv("SALON_STAFF_PASSCODE", "")
 WEBHOOK_SECRET = os.getenv("SALON_WEBHOOK_SECRET", "")
 PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "Not configured")
@@ -108,6 +109,32 @@ APPOINTMENT_EXTRA_COLUMNS = {
     "calendar_event_ref": "TEXT DEFAULT ''",
     "cancellation_deadline": "TEXT DEFAULT ''",
 }
+TENANT_TABLES = [
+    "services",
+    "stylists",
+    "clients",
+    "conversations",
+    "messages",
+    "appointments",
+    "stylist_notifications",
+    "staff_users",
+    "consent_events",
+    "webhook_events",
+    "payment_requests",
+    "calendar_sync_events",
+    "appointment_reminders",
+    "audit_events",
+]
+SALON_EXTRA_COLUMNS = {
+    "sms_from_number": "TEXT DEFAULT ''",
+    "twilio_account_sid": "TEXT DEFAULT ''",
+    "twilio_from_number": "TEXT DEFAULT ''",
+    "booking_provider": "TEXT DEFAULT ''",
+    "payment_provider": "TEXT DEFAULT ''",
+    "payment_checkout_base_url": "TEXT DEFAULT ''",
+    "database_url": "TEXT DEFAULT ''",
+    "active": "INTEGER DEFAULT 1",
+}
 SERVICE_SYNONYMS = {
     "silk press": ["silk", "press", "straighten"],
     "cut and style": ["cut", "trim", "haircut", "style"],
@@ -149,12 +176,141 @@ def ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def migrate_legacy_unique_tables(connection: sqlite3.Connection) -> None:
+    schemas = {
+        "services": """
+            CREATE TABLE services_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                base_price REAL NOT NULL,
+                price_notes TEXT DEFAULT '',
+                deposit_required INTEGER DEFAULT 0,
+                deposit_amount REAL DEFAULT 0,
+                cancellation_window_hours INTEGER DEFAULT 24,
+                requires_consultation INTEGER DEFAULT 0,
+                prep_notes TEXT DEFAULT ''
+            )
+        """,
+        "stylists": """
+            CREATE TABLE stylists_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL,
+                specialties TEXT NOT NULL,
+                phone TEXT DEFAULT '',
+                email TEXT DEFAULT '',
+                active INTEGER DEFAULT 1
+            )
+        """,
+        "clients": """
+            CREATE TABLE clients_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                consent_status TEXT DEFAULT 'Unknown',
+                consent_source TEXT DEFAULT '',
+                consent_updated_at TEXT DEFAULT '',
+                opt_out_at TEXT DEFAULT ''
+            )
+        """,
+    }
+    copy_columns = {
+        "services": [
+            "id",
+            "salon_id",
+            "name",
+            "category",
+            "duration_minutes",
+            "base_price",
+            "price_notes",
+            "deposit_required",
+            "deposit_amount",
+            "cancellation_window_hours",
+            "requires_consultation",
+            "prep_notes",
+        ],
+        "stylists": ["id", "salon_id", "name", "specialties", "phone", "email", "active"],
+        "clients": [
+            "id",
+            "salon_id",
+            "name",
+            "phone",
+            "notes",
+            "created_at",
+            "consent_status",
+            "consent_source",
+            "consent_updated_at",
+            "opt_out_at",
+        ],
+    }
+    for table, schema in schemas.items():
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not table_sql or "UNIQUE" not in str(table_sql["sql"]).upper():
+            continue
+        ensure_columns(connection, table, {"salon_id": "INTEGER NOT NULL DEFAULT 1"})
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(f"DROP TABLE IF EXISTS {table}_new")
+        connection.execute(schema)
+        existing = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        columns = [column for column in copy_columns[table] if column in existing]
+        col_text = ", ".join(columns)
+        connection.execute(f"INSERT INTO {table}_new ({col_text}) SELECT {col_text} FROM {table}")
+        connection.execute(f"DROP TABLE {table}")
+        connection.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
+def create_tenant_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_salons_slug ON salons(slug)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_services_salon ON services(salon_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_stylists_salon ON stylists(salon_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_clients_salon_phone ON clients(salon_id, phone)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_conversations_salon ON conversations(salon_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, appointment_date)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_salon ON messages(salon_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_webhook_events_salon ON webhook_events(salon_id)")
+
+
 def init_db() -> None:
     with connect() as connection:
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS salons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                sms_from_number TEXT DEFAULT '',
+                twilio_account_sid TEXT DEFAULT '',
+                twilio_from_number TEXT DEFAULT '',
+                booking_provider TEXT DEFAULT '',
+                payment_provider TEXT DEFAULT '',
+                payment_checkout_base_url TEXT DEFAULT '',
+                database_url TEXT DEFAULT '',
+                active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        ensure_columns(connection, "salons", SALON_EXTRA_COLUMNS)
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL UNIQUE,
                 category TEXT NOT NULL,
                 duration_minutes INTEGER NOT NULL,
@@ -167,6 +323,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS stylists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL UNIQUE,
                 specialties TEXT NOT NULL,
                 phone TEXT DEFAULT '',
@@ -179,6 +336,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS clients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL,
                 phone TEXT NOT NULL UNIQUE,
                 notes TEXT DEFAULT '',
@@ -190,6 +348,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 client_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 last_intent TEXT DEFAULT '',
@@ -204,6 +363,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 conversation_id INTEGER NOT NULL,
                 sender TEXT NOT NULL,
                 body TEXT NOT NULL,
@@ -218,6 +378,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS appointments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 client_id INTEGER NOT NULL,
                 service_id INTEGER NOT NULL,
                 stylist_id INTEGER NOT NULL,
@@ -236,6 +397,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS stylist_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 stylist_id INTEGER NOT NULL,
                 appointment_id INTEGER,
                 client_id INTEGER NOT NULL,
@@ -252,6 +414,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS staff_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL,
                 role TEXT NOT NULL,
                 phone TEXT DEFAULT '',
@@ -265,6 +428,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS consent_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 client_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
                 source TEXT NOT NULL,
@@ -278,6 +442,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS webhook_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 provider TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 phone TEXT NOT NULL,
@@ -293,6 +458,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS payment_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 appointment_id INTEGER NOT NULL,
                 provider TEXT NOT NULL,
                 amount REAL NOT NULL,
@@ -307,6 +473,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS calendar_sync_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 appointment_id INTEGER NOT NULL,
                 provider TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -321,6 +488,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS appointment_reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 appointment_id INTEGER NOT NULL,
                 reminder_type TEXT NOT NULL,
                 scheduled_for TEXT NOT NULL,
@@ -335,6 +503,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                salon_id INTEGER NOT NULL DEFAULT 1,
                 actor TEXT NOT NULL,
                 action TEXT NOT NULL,
                 entity_type TEXT NOT NULL,
@@ -344,14 +513,117 @@ def init_db() -> None:
             )
             """
         )
+        migrate_legacy_unique_tables(connection)
+        for table in TENANT_TABLES:
+            ensure_columns(connection, table, {"salon_id": "INTEGER NOT NULL DEFAULT 1"})
         ensure_columns(connection, "services", SERVICE_EXTRA_COLUMNS)
         ensure_columns(connection, "clients", CLIENT_EXTRA_COLUMNS)
         ensure_columns(connection, "appointments", APPOINTMENT_EXTRA_COLUMNS)
+        seed_salons(connection)
+        create_tenant_indexes(connection)
         seed_defaults(connection)
 
 
+def seed_salons(connection: sqlite3.Connection) -> None:
+    if connection.execute("SELECT COUNT(*) FROM salons").fetchone()[0] == 0:
+        timestamp = now_iso()
+        connection.execute(
+            """
+            INSERT INTO salons (
+                name, slug, phone, timezone, sms_from_number, twilio_from_number,
+                booking_provider, payment_provider, payment_checkout_base_url,
+                database_url, active, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                SALON_NAME,
+                DEFAULT_SALON_SLUG,
+                SALON_PHONE,
+                SALON_TIMEZONE,
+                os.getenv("TWILIO_FROM_NUMBER", ""),
+                os.getenv("TWILIO_FROM_NUMBER", ""),
+                BOOKING_PROVIDER,
+                PAYMENT_PROVIDER,
+                os.getenv("PAYMENT_CHECKOUT_BASE_URL", ""),
+                HOSTED_DATABASE_URL,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO salons (
+                name, slug, phone, timezone, sms_from_number, twilio_from_number,
+                booking_provider, payment_provider, active, created_at
+            )
+            VALUES (?, ?, ?, ?, '', '', 'Not configured', 'Not configured', 1, ?)
+            """,
+            ("Demo Braids Studio", "demo-braids", "(555) 014-7788", SALON_TIMEZONE, timestamp),
+        )
+
+
+def salons_df(active_only: bool = True) -> pd.DataFrame:
+    where = "WHERE active = 1" if active_only else ""
+    return load_df(f"SELECT * FROM salons {where} ORDER BY name")
+
+
+def default_salon_id() -> int:
+    with connect() as connection:
+        row = connection.execute("SELECT id FROM salons WHERE active = 1 ORDER BY id LIMIT 1").fetchone()
+    return int(row["id"]) if row else 1
+
+
+def active_salon_id() -> int:
+    try:
+        return int(st.session_state.get("active_salon_id") or default_salon_id())
+    except Exception:
+        return default_salon_id()
+
+
+def salon_by_id(salon_id: int | None = None) -> sqlite3.Row | None:
+    sid = salon_id or active_salon_id()
+    with connect() as connection:
+        return connection.execute("SELECT * FROM salons WHERE id = ?", (sid,)).fetchone()
+
+
+def salon_settings(salon_id: int | None = None) -> dict[str, str]:
+    salon = salon_by_id(salon_id)
+    if not salon:
+        return {
+            "name": SALON_NAME,
+            "phone": SALON_PHONE,
+            "timezone": SALON_TIMEZONE,
+            "sms_from_number": os.getenv("TWILIO_FROM_NUMBER", ""),
+            "twilio_from_number": os.getenv("TWILIO_FROM_NUMBER", ""),
+            "booking_provider": BOOKING_PROVIDER,
+            "payment_provider": PAYMENT_PROVIDER,
+            "payment_checkout_base_url": os.getenv("PAYMENT_CHECKOUT_BASE_URL", ""),
+            "database_url": HOSTED_DATABASE_URL,
+        }
+    return {
+        "name": str(salon["name"] or SALON_NAME),
+        "phone": str(salon["phone"] or SALON_PHONE),
+        "timezone": str(salon["timezone"] or SALON_TIMEZONE),
+        "sms_from_number": str(salon["sms_from_number"] or ""),
+        "twilio_from_number": str(salon["twilio_from_number"] or ""),
+        "booking_provider": str(salon["booking_provider"] or BOOKING_PROVIDER),
+        "payment_provider": str(salon["payment_provider"] or PAYMENT_PROVIDER),
+        "payment_checkout_base_url": str(salon["payment_checkout_base_url"] or os.getenv("PAYMENT_CHECKOUT_BASE_URL", "")),
+        "database_url": str(salon["database_url"] or HOSTED_DATABASE_URL),
+    }
+
+
+def scoped_df(query: str, params: Iterable[object] = (), salon_id: int | None = None) -> pd.DataFrame:
+    return load_df(query, (salon_id or active_salon_id(), *tuple(params)))
+
+
 def seed_defaults(connection: sqlite3.Connection) -> None:
-    if connection.execute("SELECT COUNT(*) FROM services").fetchone()[0] == 0:
+    for salon_row in connection.execute("SELECT id, name FROM salons WHERE active = 1").fetchall():
+        seed_defaults_for_salon(connection, int(salon_row["id"]))
+
+
+def seed_defaults_for_salon(connection: sqlite3.Connection, salon_id: int) -> None:
+    if connection.execute("SELECT COUNT(*) FROM services WHERE salon_id = ?", (salon_id,)).fetchone()[0] == 0:
         services = [
             ("Silk press", "Styling", 90, 85, "Starting price. Add trim or treatment after consultation."),
             ("Cut and style", "Cut", 60, 65, "Includes consultation, shampoo, cut, and finish."),
@@ -366,12 +638,12 @@ def seed_defaults(connection: sqlite3.Connection) -> None:
         ]
         connection.executemany(
             """
-            INSERT INTO services (name, category, duration_minutes, base_price, price_notes)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO services (salon_id, name, category, duration_minutes, base_price, price_notes)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            services,
+            [(salon_id, *service) for service in services],
         )
-    if connection.execute("SELECT COUNT(*) FROM stylists").fetchone()[0] == 0:
+    if connection.execute("SELECT COUNT(*) FROM stylists WHERE salon_id = ?", (salon_id,)).fetchone()[0] == 0:
         stylists = [
             ("Maya", "Cuts, silk press, treatments", "(555) 013-1001", "maya@example.com", 1),
             ("Janelle", "Color, balayage, root touch-up", "(555) 013-1002", "janelle@example.com", 1),
@@ -379,26 +651,26 @@ def seed_defaults(connection: sqlite3.Connection) -> None:
         ]
         connection.executemany(
             """
-            INSERT INTO stylists (name, specialties, phone, email, active)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            stylists,
-        )
-    if connection.execute("SELECT COUNT(*) FROM staff_users").fetchone()[0] == 0:
-        connection.executemany(
-            """
-            INSERT INTO staff_users (name, role, phone, email, active, created_at)
+            INSERT INTO stylists (salon_id, name, specialties, phone, email, active)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
+            [(salon_id, *stylist) for stylist in stylists],
+        )
+    if connection.execute("SELECT COUNT(*) FROM staff_users WHERE salon_id = ?", (salon_id,)).fetchone()[0] == 0:
+        connection.executemany(
+            """
+            INSERT INTO staff_users (salon_id, name, role, phone, email, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
             [
-                ("Salon owner", "Owner", "", "owner@example.com", 1, now_iso()),
-                ("Front desk", "Front desk", "", "frontdesk@example.com", 1, now_iso()),
+                (salon_id, "Salon owner", "Owner", "", "owner@example.com", 1, now_iso()),
+                (salon_id, "Front desk", "Front desk", "", "frontdesk@example.com", 1, now_iso()),
             ],
         )
-    apply_default_service_policies(connection)
+    apply_default_service_policies(connection, salon_id)
 
 
-def apply_default_service_policies(connection: sqlite3.Connection) -> None:
+def apply_default_service_policies(connection: sqlite3.Connection, salon_id: int) -> None:
     policies = {
         "Silk press": (0, 0, 24, 0, "Arrive with hair detangled when possible."),
         "Cut and style": (0, 0, 24, 0, "Bring inspiration photos if changing shape."),
@@ -420,9 +692,9 @@ def apply_default_service_policies(connection: sqlite3.Connection) -> None:
                 cancellation_window_hours = CASE WHEN cancellation_window_hours = 24 THEN ? ELSE cancellation_window_hours END,
                 requires_consultation = CASE WHEN requires_consultation = 0 THEN ? ELSE requires_consultation END,
                 prep_notes = CASE WHEN prep_notes = '' THEN ? ELSE prep_notes END
-            WHERE name = ?
+            WHERE salon_id = ? AND name = ?
             """,
-            values + (service_name,),
+            values + (salon_id, service_name),
         )
 
 
@@ -442,21 +714,34 @@ def execute(query: str, params: Iterable[object] = ()) -> int:
         return int(cursor.lastrowid)
 
 
-def record_audit(action: str, entity_type: str, entity_id: object, details: str = "") -> None:
+def record_audit(
+    action: str,
+    entity_type: str,
+    entity_id: object,
+    details: str = "",
+    salon_id: int | None = None,
+) -> None:
     try:
         actor = st.session_state.get("staff_name", "System")
     except Exception:
         actor = "System"
     execute(
         """
-        INSERT INTO audit_events (actor, action, entity_type, entity_id, details, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO audit_events (salon_id, actor, action, entity_type, entity_id, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (actor, action, entity_type, str(entity_id), details, now_iso()),
+        (salon_id or active_salon_id(), actor, action, entity_type, str(entity_id), details, now_iso()),
     )
 
 
-def log_consent_event(client_id: int, event_type: str, source: str, notes: str = "") -> None:
+def log_consent_event(
+    client_id: int,
+    event_type: str,
+    source: str,
+    notes: str = "",
+    salon_id: int | None = None,
+) -> None:
+    sid = salon_id or active_salon_id()
     timestamp = now_iso()
     status = {
         "opt_in": "Opted in",
@@ -468,38 +753,51 @@ def log_consent_event(client_id: int, event_type: str, source: str, notes: str =
     with connect() as connection:
         connection.execute(
             """
-            INSERT INTO consent_events (client_id, event_type, source, notes, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO consent_events (salon_id, client_id, event_type, source, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (client_id, event_type, source, notes, timestamp),
+            (sid, client_id, event_type, source, notes, timestamp),
         )
         connection.execute(
             """
             UPDATE clients
             SET consent_status = ?, consent_source = ?, consent_updated_at = ?, opt_out_at = ?
-            WHERE id = ?
+            WHERE id = ? AND salon_id = ?
             """,
-            (status, source, timestamp, opt_out_at, client_id),
+            (status, source, timestamp, opt_out_at, client_id, sid),
         )
         connection.commit()
 
 
-def client_by_conversation(conversation_id: int) -> sqlite3.Row | None:
+def client_by_conversation(conversation_id: int, salon_id: int | None = None) -> sqlite3.Row | None:
+    sid = salon_id or salon_id_for_conversation(conversation_id)
     with connect() as connection:
         return connection.execute(
             """
             SELECT clients.*
             FROM conversations
             JOIN clients ON clients.id = conversations.client_id
-            WHERE conversations.id = ?
+            WHERE conversations.id = ? AND conversations.salon_id = ?
             """,
-            (conversation_id,),
+            (conversation_id, sid),
         ).fetchone()
 
 
-def texting_allowed(client_id: int, message_type: str = "transactional") -> bool:
+def salon_id_for_conversation(conversation_id: int) -> int:
     with connect() as connection:
-        row = connection.execute("SELECT consent_status FROM clients WHERE id = ?", (client_id,)).fetchone()
+        row = connection.execute(
+            "SELECT salon_id FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+    return int(row["salon_id"]) if row else active_salon_id()
+
+
+def texting_allowed(client_id: int, message_type: str = "transactional", salon_id: int | None = None) -> bool:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT consent_status FROM clients WHERE id = ? AND salon_id = ?",
+            (client_id, salon_id or active_salon_id()),
+        ).fetchone()
     if not row:
         return False
     status = str(row["consent_status"] or "Unknown")
@@ -512,61 +810,76 @@ def texting_allowed(client_id: int, message_type: str = "transactional") -> bool
 
 def handle_stop_help_reply(conversation_id: int, message: str) -> str | None:
     text = message.strip().lower()
-    client = client_by_conversation(conversation_id)
+    sid = salon_id_for_conversation(conversation_id)
+    client = client_by_conversation(conversation_id, sid)
     if not client:
         return None
     if text in STOP_KEYWORDS:
-        log_consent_event(int(client["id"]), "opt_out", "client_sms", "Client sent STOP-style keyword.")
+        log_consent_event(int(client["id"]), "opt_out", "client_sms", "Client sent STOP-style keyword.", sid)
         execute(
-            "UPDATE conversations SET status = 'Opted out', last_intent = 'opt_out', updated_at = ? WHERE id = ?",
-            (now_iso(), conversation_id),
+            "UPDATE conversations SET status = 'Opted out', last_intent = 'opt_out', updated_at = ? WHERE id = ? AND salon_id = ?",
+            (now_iso(), conversation_id, sid),
         )
-        reply = f"You have been opted out of texts from {SALON_NAME}. Call {SALON_PHONE} if you need help."
+        settings = salon_settings(sid)
+        reply = f"You have been opted out of texts from {settings['name']}. Call {settings['phone']} if you need help."
         add_assistant_message(conversation_id, reply, message_type="compliance")
         return "opt_out"
     if text in HELP_KEYWORDS:
         execute(
-            "UPDATE conversations SET last_intent = 'help', updated_at = ? WHERE id = ?",
-            (now_iso(), conversation_id),
+            "UPDATE conversations SET last_intent = 'help', updated_at = ? WHERE id = ? AND salon_id = ?",
+            (now_iso(), conversation_id, sid),
         )
-        reply = f"{SALON_NAME}: call {SALON_PHONE} for help. Reply STOP to opt out of texts."
+        settings = salon_settings(sid)
+        reply = f"{settings['name']}: call {settings['phone']} for help. Reply STOP to opt out of texts."
         add_assistant_message(conversation_id, reply, message_type="compliance")
         return "help"
     return None
 
 
-def get_or_create_client(name: str, phone: str) -> int:
+def get_or_create_client(name: str, phone: str, salon_id: int | None = None) -> int:
+    sid = salon_id or active_salon_id()
     phone = normalize_phone(phone)
     with connect() as connection:
-        row = connection.execute("SELECT id FROM clients WHERE phone = ?", (phone,)).fetchone()
+        row = connection.execute(
+            "SELECT id FROM clients WHERE phone = ? AND salon_id = ?",
+            (phone, sid),
+        ).fetchone()
         if row:
             connection.execute(
-                "UPDATE clients SET name = CASE WHEN name = '' THEN ? ELSE name END WHERE id = ?",
-                (name.strip(), row["id"]),
+                "UPDATE clients SET name = CASE WHEN name = '' THEN ? ELSE name END WHERE id = ? AND salon_id = ?",
+                (name.strip(), row["id"], sid),
             )
             return int(row["id"])
         cursor = connection.execute(
             """
-            INSERT INTO clients (name, phone, notes, created_at)
-            VALUES (?, ?, '', ?)
+            INSERT INTO clients (salon_id, name, phone, notes, created_at)
+            VALUES (?, ?, ?, '', ?)
             """,
-            (name.strip() or "New client", phone, now_iso()),
+            (sid, name.strip() or "New client", phone, now_iso()),
         )
         connection.commit()
         return int(cursor.lastrowid)
 
 
-def create_missed_call(name: str, phone: str, consent_basis: str = "transactional_missed_call") -> int:
-    client_id = get_or_create_client(name, phone)
+def create_missed_call(
+    name: str,
+    phone: str,
+    consent_basis: str = "transactional_missed_call",
+    salon_id: int | None = None,
+) -> int:
+    sid = salon_id or active_salon_id()
+    settings = salon_settings(sid)
+    client_id = get_or_create_client(name, phone, sid)
     timestamp = now_iso()
     if consent_basis == "opted_in":
-        log_consent_event(client_id, "opt_in", "missed_call_form", "Staff marked client as opted in.")
+        log_consent_event(client_id, "opt_in", "missed_call_form", "Staff marked client as opted in.", sid)
     elif consent_basis == "transactional_missed_call":
         log_consent_event(
             client_id,
             "transactional_okay",
             "missed_call_form",
             "Client called the salon; first response is treated as transactional in this demo.",
+            sid,
         )
     with connect() as connection:
         status = "Consent review" if consent_basis == "unknown_manual_review" else "Waiting for client"
@@ -578,38 +891,43 @@ def create_missed_call(name: str, phone: str, consent_basis: str = "transactiona
             (client_id, status, timestamp, timestamp),
         )
         conversation_id = int(cursor.lastrowid)
-        reply = DEFAULT_REPLY.format(client_name=name.strip() or "there", salon_name=SALON_NAME)
-        delivery_status = "blocked: consent review" if consent_basis == "unknown_manual_review" else sms_status_for(reply)
+        connection.execute(
+            "UPDATE conversations SET salon_id = ? WHERE id = ? AND client_id = ?",
+            (sid, conversation_id, client_id),
+        )
+        reply = DEFAULT_REPLY.format(client_name=name.strip() or "there", salon_name=settings["name"])
+        delivery_status = "blocked: consent review" if consent_basis == "unknown_manual_review" else sms_status_for(reply, sid)
         connection.execute(
             """
-            INSERT INTO messages (conversation_id, sender, body, channel, created_at, delivery_status)
-            VALUES (?, 'Salon assistant', ?, 'sms', ?, ?)
+            INSERT INTO messages (salon_id, conversation_id, sender, body, channel, created_at, delivery_status)
+            VALUES (?, ?, 'Salon assistant', ?, 'sms', ?, ?)
             """,
-            (conversation_id, reply, timestamp, delivery_status),
+            (sid, conversation_id, reply, timestamp, delivery_status),
         )
         connection.commit()
-    record_audit("missed_call_created", "conversation", conversation_id, f"Consent basis: {consent_basis}")
+    record_audit("missed_call_created", "conversation", conversation_id, f"Consent basis: {consent_basis}", sid)
     return conversation_id
 
 
 def add_client_reply(conversation_id: int, message: str) -> str:
     intent = detect_intent(message)
     timestamp = now_iso()
+    sid = salon_id_for_conversation(conversation_id)
     with connect() as connection:
         connection.execute(
             """
-            INSERT INTO messages (conversation_id, sender, body, channel, created_at, delivery_status)
-            VALUES (?, 'Client', ?, 'sms', ?, 'received')
+            INSERT INTO messages (salon_id, conversation_id, sender, body, channel, created_at, delivery_status)
+            VALUES (?, ?, 'Client', ?, 'sms', ?, 'received')
             """,
-            (conversation_id, message.strip(), timestamp),
+            (sid, conversation_id, message.strip(), timestamp),
         )
         connection.execute(
             """
             UPDATE conversations
             SET status = 'Needs booking review', last_intent = ?, last_message = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND salon_id = ?
             """,
-            (intent, message.strip(), timestamp, conversation_id),
+            (intent, message.strip(), timestamp, conversation_id, sid),
         )
         connection.commit()
     compliance_intent = handle_stop_help_reply(conversation_id, message)
@@ -620,22 +938,23 @@ def add_client_reply(conversation_id: int, message: str) -> str:
 
 def add_assistant_message(conversation_id: int, message: str, message_type: str = "transactional") -> None:
     timestamp = now_iso()
-    client = client_by_conversation(conversation_id)
-    if client and not texting_allowed(int(client["id"]), message_type):
+    sid = salon_id_for_conversation(conversation_id)
+    client = client_by_conversation(conversation_id, sid)
+    if client and not texting_allowed(int(client["id"]), message_type, sid):
         delivery_status = "blocked: opted out"
     else:
-        delivery_status = sms_status_for(message)
+        delivery_status = sms_status_for(message, sid)
     with connect() as connection:
         connection.execute(
             """
-            INSERT INTO messages (conversation_id, sender, body, channel, created_at, delivery_status)
-            VALUES (?, 'Salon assistant', ?, 'sms', ?, ?)
+            INSERT INTO messages (salon_id, conversation_id, sender, body, channel, created_at, delivery_status)
+            VALUES (?, ?, 'Salon assistant', ?, 'sms', ?, ?)
             """,
-            (conversation_id, message.strip(), timestamp, delivery_status),
+            (sid, conversation_id, message.strip(), timestamp, delivery_status),
         )
         connection.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (timestamp, conversation_id),
+            "UPDATE conversations SET updated_at = ? WHERE id = ? AND salon_id = ?",
+            (timestamp, conversation_id, sid),
         )
         connection.commit()
 
@@ -647,6 +966,11 @@ def normalize_phone(phone: str) -> str:
     if len(digits) == 11 and digits.startswith("1"):
         return f"+{digits}"
     return phone.strip()
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "salon"
 
 
 def detect_intent(message: str) -> str:
@@ -669,7 +993,7 @@ def detect_intent(message: str) -> str:
 
 
 def match_services(message: str, limit: int = 4) -> list[ServiceMatch]:
-    services = load_df("SELECT * FROM services ORDER BY category, name")
+    services = scoped_df("SELECT * FROM services WHERE salon_id = ? ORDER BY category, name")
     text = message.lower()
     matches: list[ServiceMatch] = []
     for row in services.to_dict("records"):
@@ -714,7 +1038,7 @@ def quote_for_matches(matches: list[ServiceMatch]) -> str:
 
 
 def active_stylists() -> pd.DataFrame:
-    return load_df("SELECT * FROM stylists WHERE active = 1 ORDER BY name")
+    return scoped_df("SELECT * FROM stylists WHERE salon_id = ? AND active = 1 ORDER BY name")
 
 
 def conversations() -> pd.DataFrame:
@@ -732,8 +1056,11 @@ def conversations() -> pd.DataFrame:
             c.updated_at
         FROM conversations c
         JOIN clients ON clients.id = c.client_id
+        WHERE c.salon_id = ?
         ORDER BY c.updated_at DESC
         """
+        ,
+        (active_salon_id(),),
     )
 
 
@@ -742,10 +1069,10 @@ def conversation_messages(conversation_id: int) -> pd.DataFrame:
         """
         SELECT sender, body, channel, delivery_status, created_at
         FROM messages
-        WHERE conversation_id = ?
+        WHERE conversation_id = ? AND salon_id = ?
         ORDER BY id
         """,
-        (conversation_id,),
+        (conversation_id, salon_id_for_conversation(conversation_id)),
     )
 
 
@@ -756,20 +1083,26 @@ def selected_conversation(conversation_id: int) -> sqlite3.Row | None:
             SELECT c.*, clients.name AS client_name, clients.phone
             FROM conversations c
             JOIN clients ON clients.id = c.client_id
-            WHERE c.id = ?
+            WHERE c.id = ? AND c.salon_id = ?
             """,
-            (conversation_id,),
+            (conversation_id, active_salon_id()),
         ).fetchone()
 
 
 def service_by_id(service_id: int) -> sqlite3.Row | None:
     with connect() as connection:
-        return connection.execute("SELECT * FROM services WHERE id = ?", (service_id,)).fetchone()
+        return connection.execute(
+            "SELECT * FROM services WHERE id = ? AND salon_id = ?",
+            (service_id, active_salon_id()),
+        ).fetchone()
 
 
 def stylist_by_id(stylist_id: int) -> sqlite3.Row | None:
     with connect() as connection:
-        return connection.execute("SELECT * FROM stylists WHERE id = ?", (stylist_id,)).fetchone()
+        return connection.execute(
+            "SELECT * FROM stylists WHERE id = ? AND salon_id = ?",
+            (stylist_id, active_salon_id()),
+        ).fetchone()
 
 
 def parse_display_time(value: str) -> time | None:
@@ -787,9 +1120,9 @@ def booked_intervals(stylist_id: int, target_date: date) -> list[tuple[datetime,
         SELECT appointments.appointment_time, services.duration_minutes
         FROM appointments
         JOIN services ON services.id = appointments.service_id
-        WHERE stylist_id = ? AND appointment_date = ? AND status != 'Cancelled'
+        WHERE appointments.salon_id = ? AND stylist_id = ? AND appointment_date = ? AND status != 'Cancelled'
         """,
-        (stylist_id, target_date.isoformat()),
+        (active_salon_id(), stylist_id, target_date.isoformat()),
     )
     intervals: list[tuple[datetime, datetime]] = []
     for row in df.to_dict("records"):
@@ -822,30 +1155,33 @@ def service_deposit_status(service: sqlite3.Row | None) -> tuple[str, float]:
     return "Not required", 0.0
 
 
-def build_payment_link(appointment_id: int, amount: float) -> str:
+def build_payment_link(appointment_id: int, amount: float, salon_id: int | None = None) -> str:
     if amount <= 0:
         return ""
-    base = os.getenv("PAYMENT_CHECKOUT_BASE_URL", "").strip()
+    base = salon_settings(salon_id)["payment_checkout_base_url"].strip()
     if base:
         return f"{base.rstrip('/')}/appointment-{appointment_id}"
     return f"demo://deposit/appointment-{appointment_id}"
 
 
-def create_payment_request(appointment_id: int, amount: float) -> str:
+def create_payment_request(appointment_id: int, amount: float, salon_id: int | None = None) -> str:
     if amount <= 0:
         return ""
-    link = build_payment_link(appointment_id, amount)
+    sid = salon_id or active_salon_id()
+    settings = salon_settings(sid)
+    link = build_payment_link(appointment_id, amount, sid)
     execute(
         """
-        INSERT INTO payment_requests (appointment_id, provider, amount, status, payment_link, created_at)
-        VALUES (?, ?, ?, 'Pending', ?, ?)
+        INSERT INTO payment_requests (salon_id, appointment_id, provider, amount, status, payment_link, created_at)
+        VALUES (?, ?, ?, ?, 'Pending', ?, ?)
         """,
-        (appointment_id, PAYMENT_PROVIDER, amount, link, now_iso()),
+        (sid, appointment_id, settings["payment_provider"], amount, link, now_iso()),
     )
     return link
 
 
-def appointment_detail(appointment_id: int) -> sqlite3.Row | None:
+def appointment_detail(appointment_id: int, salon_id: int | None = None) -> sqlite3.Row | None:
+    sid = salon_id or active_salon_id()
     with connect() as connection:
         return connection.execute(
             """
@@ -862,9 +1198,9 @@ def appointment_detail(appointment_id: int) -> sqlite3.Row | None:
             JOIN clients ON clients.id = a.client_id
             JOIN services ON services.id = a.service_id
             JOIN stylists ON stylists.id = a.stylist_id
-            WHERE a.id = ?
+            WHERE a.id = ? AND a.salon_id = ?
             """,
-            (appointment_id,),
+            (appointment_id, sid),
         ).fetchone()
 
 
@@ -875,6 +1211,8 @@ def create_appointment_reminders(appointment_id: int) -> None:
     start_time = parse_display_time(str(detail["appointment_time"]))
     if not start_time:
         return
+    sid = int(detail["salon_id"])
+    settings = salon_settings(sid)
     appointment_at = datetime.combine(date.fromisoformat(str(detail["appointment_date"])), start_time)
     reminder_specs = [
         ("Confirmation", datetime.now() + timedelta(minutes=5)),
@@ -882,24 +1220,24 @@ def create_appointment_reminders(appointment_id: int) -> None:
     ]
     with connect() as connection:
         existing = connection.execute(
-            "SELECT COUNT(*) FROM appointment_reminders WHERE appointment_id = ?",
-            (appointment_id,),
+            "SELECT COUNT(*) FROM appointment_reminders WHERE appointment_id = ? AND salon_id = ?",
+            (appointment_id, sid),
         ).fetchone()[0]
         if existing:
             return
         for reminder_type, scheduled_for in reminder_specs:
             message = (
-                f"{SALON_NAME}: reminder for {detail['service_name']} with {detail['stylist_name']} "
+                f"{settings['name']}: reminder for {detail['service_name']} with {detail['stylist_name']} "
                 f"on {detail['appointment_date']} at {detail['appointment_time']}. Reply STOP to opt out."
             )
             connection.execute(
                 """
                 INSERT INTO appointment_reminders (
-                    appointment_id, reminder_type, scheduled_for, status, message, created_at
+                    salon_id, appointment_id, reminder_type, scheduled_for, status, message, created_at
                 )
-                VALUES (?, ?, ?, 'Queued', ?, ?)
+                VALUES (?, ?, ?, ?, 'Queued', ?, ?)
                 """,
-                (appointment_id, reminder_type, scheduled_for.replace(microsecond=0).isoformat(), message, now_iso()),
+                (sid, appointment_id, reminder_type, scheduled_for.replace(microsecond=0).isoformat(), message, now_iso()),
             )
         connection.commit()
 
@@ -908,25 +1246,26 @@ def sync_appointment_to_calendar(appointment_id: int) -> tuple[str, str]:
     detail = appointment_detail(appointment_id)
     if not detail:
         return "Error", "Appointment not found"
-    provider = BOOKING_PROVIDER
+    sid = int(detail["salon_id"])
+    provider = salon_settings(sid)["booking_provider"]
     external_ref = f"local-{appointment_id}"
     status = "Ready for external sync" if provider != "Not configured" else "ICS ready"
     details = "Calendar provider is configured." if provider != "Not configured" else "No calendar provider configured; use the ICS export."
     with connect() as connection:
         connection.execute(
             """
-            INSERT INTO calendar_sync_events (appointment_id, provider, status, external_ref, details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO calendar_sync_events (salon_id, appointment_id, provider, status, external_ref, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (appointment_id, provider, status, external_ref, details, now_iso()),
+            (sid, appointment_id, provider, status, external_ref, details, now_iso()),
         )
         connection.execute(
             """
             UPDATE appointments
             SET calendar_sync_status = ?, calendar_event_ref = ?
-            WHERE id = ?
+            WHERE id = ? AND salon_id = ?
             """,
-            (status, external_ref, appointment_id),
+            (status, external_ref, appointment_id, sid),
         )
         connection.commit()
     return status, details
@@ -998,16 +1337,18 @@ def create_appointment(
     cancellation_hours = int(service["cancellation_window_hours"] or 24) if service else 24
     cancellation_deadline = cancellation_deadline_for(appointment_date, appointment_time, cancellation_hours)
     timestamp = now_iso()
+    sid = int(conversation["salon_id"])
     with connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO appointments (
-                client_id, service_id, stylist_id, appointment_date, appointment_time,
+                salon_id, client_id, service_id, stylist_id, appointment_date, appointment_time,
                 status, client_request, created_at, deposit_status, deposit_amount, cancellation_deadline
             )
-            VALUES (?, ?, ?, ?, ?, 'Booked', ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'Booked', ?, ?, ?, ?, ?)
             """,
             (
+                sid,
                 int(conversation["client_id"]),
                 service_id,
                 stylist_id,
@@ -1022,17 +1363,17 @@ def create_appointment(
         )
         appointment_id = int(cursor.lastrowid)
         connection.execute(
-            "UPDATE conversations SET status = 'Booked', updated_at = ? WHERE id = ?",
-            (timestamp, conversation_id),
+            "UPDATE conversations SET status = 'Booked', updated_at = ? WHERE id = ? AND salon_id = ?",
+            (timestamp, conversation_id, sid),
         )
         connection.commit()
-    payment_link = create_payment_request(appointment_id, deposit_amount)
+    payment_link = create_payment_request(appointment_id, deposit_amount, sid)
     if payment_link:
-        execute("UPDATE appointments SET payment_link = ? WHERE id = ?", (payment_link, appointment_id))
+        execute("UPDATE appointments SET payment_link = ? WHERE id = ? AND salon_id = ?", (payment_link, appointment_id, sid))
     create_stylist_notification(appointment_id)
     create_appointment_reminders(appointment_id)
     sync_appointment_to_calendar(appointment_id)
-    record_audit("appointment_booked", "appointment", appointment_id, f"Deposit status: {deposit_status}")
+    record_audit("appointment_booked", "appointment", appointment_id, f"Deposit status: {deposit_status}", sid)
     return appointment_id
 
 
@@ -1042,6 +1383,7 @@ def create_stylist_notification(appointment_id: int) -> None:
             """
             SELECT
                 a.id,
+                a.salon_id,
                 a.client_request,
                 a.appointment_date,
                 a.appointment_time,
@@ -1079,25 +1421,30 @@ def create_stylist_notification(appointment_id: int) -> None:
         connection.execute(
             """
             INSERT INTO stylist_notifications (
-                stylist_id, appointment_id, client_id, summary, status, created_at
+                salon_id, stylist_id, appointment_id, client_id, summary, status, created_at
             )
-            VALUES (?, ?, ?, ?, 'Ready to send', ?)
+            VALUES (?, ?, ?, ?, ?, 'Ready to send', ?)
             """,
-            (row["stylist_id"], appointment_id, row["client_id"], summary, now_iso()),
+            (row["salon_id"], row["stylist_id"], appointment_id, row["client_id"], summary, now_iso()),
         )
         connection.commit()
 
 
-def sms_status_for(message: str) -> str:
+def sms_status_for(message: str, salon_id: int | None = None) -> str:
     if not message.strip():
         return "blank"
-    return "ready for provider" if sms_provider_ready() else "simulated"
+    return "ready for provider" if sms_provider_ready(salon_id) else "simulated"
 
 
-def send_sms_with_twilio(to_phone: str, body: str) -> tuple[bool, str]:
+def send_sms_with_twilio(to_phone: str, body: str, salon_id: int | None = None) -> tuple[bool, str]:
     sid = os.getenv("TWILIO_ACCOUNT_SID", "")
     token = os.getenv("TWILIO_AUTH_TOKEN", "")
-    from_number = os.getenv("TWILIO_FROM_NUMBER", "")
+    settings = salon_settings(salon_id)
+    from_number = (
+        settings.get("twilio_from_number")
+        or settings.get("sms_from_number")
+        or os.getenv("TWILIO_FROM_NUMBER", "")
+    )
     if not all((sid, token, from_number)):
         return False, "SMS provider is not configured. This message is simulated in the demo."
     response = requests.post(
@@ -1118,25 +1465,49 @@ def verify_webhook_signature(payload: str, signature: str) -> str:
     return "verified" if hmac.compare_digest(expected, signature.strip()) else "failed"
 
 
+def salon_id_for_phone(phone: str) -> int:
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return active_salon_id()
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, phone, sms_from_number, twilio_from_number
+            FROM salons
+            WHERE active = 1
+            ORDER BY id
+            """
+        ).fetchall()
+    raw = phone.strip()
+    for row in rows:
+        for column in ("phone", "sms_from_number", "twilio_from_number"):
+            candidate = str(row[column] or "").strip()
+            if candidate and (candidate == raw or normalize_phone(candidate) == normalized):
+                return int(row["id"])
+    return active_salon_id()
+
+
 def process_missed_call_webhook(payload: dict[str, object], signature: str = "") -> int:
     raw_payload = json.dumps(payload, sort_keys=True)
     signature_status = verify_webhook_signature(raw_payload, signature)
     phone = str(payload.get("phone") or payload.get("From") or payload.get("caller") or "").strip()
+    salon_phone = str(payload.get("salon_phone") or payload.get("To") or payload.get("Called") or "").strip()
+    sid = int(payload.get("salon_id") or salon_id_for_phone(salon_phone))
     client_name = str(payload.get("name") or payload.get("CallerName") or "New client").strip()
     provider = str(payload.get("provider") or "manual_webhook")
     if not phone:
         raise ValueError("Webhook payload must include a phone number.")
-    conversation_id = create_missed_call(client_name, phone, consent_basis="transactional_missed_call")
+    conversation_id = create_missed_call(client_name, phone, consent_basis="transactional_missed_call", salon_id=sid)
     execute(
         """
         INSERT INTO webhook_events (
-            provider, event_type, phone, client_name, payload, signature_status, conversation_id, created_at
+            salon_id, provider, event_type, phone, client_name, payload, signature_status, conversation_id, created_at
         )
-        VALUES (?, 'missed_call', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'missed_call', ?, ?, ?, ?, ?, ?)
         """,
-        (provider, normalize_phone(phone), client_name, raw_payload, signature_status, conversation_id, now_iso()),
+        (sid, provider, normalize_phone(phone), client_name, raw_payload, signature_status, conversation_id, now_iso()),
     )
-    record_audit("webhook_missed_call_processed", "conversation", conversation_id, signature_status)
+    record_audit("webhook_missed_call_processed", "conversation", conversation_id, signature_status, sid)
     return conversation_id
 
 
@@ -1144,29 +1515,94 @@ def process_inbound_sms_webhook(payload: dict[str, object], signature: str = "")
     raw_payload = json.dumps(payload, sort_keys=True)
     signature_status = verify_webhook_signature(raw_payload, signature)
     phone = normalize_phone(str(payload.get("phone") or payload.get("From") or ""))
+    salon_phone = str(payload.get("salon_phone") or payload.get("To") or "").strip()
+    sid = int(payload.get("salon_id") or salon_id_for_phone(salon_phone))
     body = str(payload.get("body") or payload.get("Body") or "")
     if not phone or not body:
         raise ValueError("Inbound SMS payload must include phone and body.")
-    inbox = conversations()
-    if inbox.empty or phone not in set(inbox["phone"].tolist()):
-        conversation_id = create_missed_call("New client", phone, consent_basis="transactional_missed_call")
+    inbox = load_df(
+        """
+        SELECT c.id, clients.phone
+        FROM conversations c
+        JOIN clients ON clients.id = c.client_id
+        WHERE c.salon_id = ? AND clients.phone = ?
+        ORDER BY c.updated_at DESC
+        LIMIT 1
+        """,
+        (sid, phone),
+    )
+    if inbox.empty:
+        conversation_id = create_missed_call("New client", phone, consent_basis="transactional_missed_call", salon_id=sid)
     else:
-        conversation_id = int(inbox.loc[inbox["phone"] == phone, "id"].iloc[0])
+        conversation_id = int(inbox.iloc[0]["id"])
     intent = add_client_reply(conversation_id, body)
     execute(
         """
         INSERT INTO webhook_events (
-            provider, event_type, phone, client_name, payload, signature_status, conversation_id, created_at
+            salon_id, provider, event_type, phone, client_name, payload, signature_status, conversation_id, created_at
         )
-        VALUES (?, 'inbound_sms', ?, '', ?, ?, ?, ?)
+        VALUES (?, ?, 'inbound_sms', ?, '', ?, ?, ?, ?)
         """,
-        (str(payload.get("provider") or "manual_webhook"), phone, raw_payload, signature_status, conversation_id, now_iso()),
+        (sid, str(payload.get("provider") or "manual_webhook"), phone, raw_payload, signature_status, conversation_id, now_iso()),
     )
-    record_audit("webhook_sms_processed", "conversation", conversation_id, intent)
+    record_audit("webhook_sms_processed", "conversation", conversation_id, intent, sid)
     return intent
 
 
+def save_salons(edited: pd.DataFrame) -> None:
+    with connect() as connection:
+        for row in edited.to_dict("records"):
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            salon_id = row.get("id")
+            slug = slugify(str(row.get("slug") or name))
+            values = (
+                name,
+                slug,
+                str(row.get("phone") or "").strip(),
+                str(row.get("timezone") or SALON_TIMEZONE).strip() or SALON_TIMEZONE,
+                str(row.get("sms_from_number") or "").strip(),
+                str(row.get("twilio_from_number") or "").strip(),
+                str(row.get("booking_provider") or "Not configured").strip() or "Not configured",
+                str(row.get("payment_provider") or "Not configured").strip() or "Not configured",
+                str(row.get("payment_checkout_base_url") or "").strip(),
+                str(row.get("database_url") or "").strip(),
+                1 if bool(row.get("active", True)) else 0,
+            )
+            if pd.isna(salon_id):
+                connection.execute(
+                    """
+                    INSERT INTO salons (
+                        name, slug, phone, timezone, sms_from_number, twilio_from_number,
+                        booking_provider, payment_provider, payment_checkout_base_url,
+                        database_url, active, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values + (now_iso(),),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE salons
+                    SET name = ?, slug = ?, phone = ?, timezone = ?, sms_from_number = ?,
+                        twilio_from_number = ?, booking_provider = ?, payment_provider = ?,
+                        payment_checkout_base_url = ?, database_url = ?, active = ?
+                    WHERE id = ?
+                    """,
+                    values + (int(salon_id),),
+                )
+        active_count = connection.execute("SELECT COUNT(*) FROM salons WHERE active = 1").fetchone()[0]
+        if int(active_count) == 0:
+            connection.execute(
+                "UPDATE salons SET active = 1 WHERE id = (SELECT MIN(id) FROM salons)"
+            )
+        connection.commit()
+
+
 def save_services(edited: pd.DataFrame) -> None:
+    sid = active_salon_id()
     required = [
         "id",
         "name",
@@ -1191,13 +1627,14 @@ def save_services(edited: pd.DataFrame) -> None:
                 connection.execute(
                     """
                     INSERT INTO services (
-                        name, category, duration_minutes, base_price, price_notes,
+                        salon_id, name, category, duration_minutes, base_price, price_notes,
                         deposit_required, deposit_amount, cancellation_window_hours,
                         requires_consultation, prep_notes
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        sid,
                         str(row["name"]),
                         str(row["category"]),
                         int(row["duration_minutes"]),
@@ -1217,7 +1654,7 @@ def save_services(edited: pd.DataFrame) -> None:
                     SET name = ?, category = ?, duration_minutes = ?, base_price = ?, price_notes = ?,
                         deposit_required = ?, deposit_amount = ?, cancellation_window_hours = ?,
                         requires_consultation = ?, prep_notes = ?
-                    WHERE id = ?
+                    WHERE id = ? AND salon_id = ?
                     """,
                     (
                         str(row["name"]),
@@ -1231,12 +1668,14 @@ def save_services(edited: pd.DataFrame) -> None:
                         1 if bool(row.get("requires_consultation", False)) else 0,
                         str(row.get("prep_notes") or ""),
                         int(service_id),
+                        sid,
                     ),
                 )
         connection.commit()
 
 
 def save_stylists(edited: pd.DataFrame) -> None:
+    sid = active_salon_id()
     with connect() as connection:
         for row in edited.to_dict("records"):
             stylist_id = row.get("id")
@@ -1250,24 +1689,25 @@ def save_stylists(edited: pd.DataFrame) -> None:
             if pd.isna(stylist_id):
                 connection.execute(
                     """
-                    INSERT INTO stylists (name, specialties, phone, email, active)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO stylists (salon_id, name, specialties, phone, email, active)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    values,
+                    (sid,) + values,
                 )
             else:
                 connection.execute(
                     """
                     UPDATE stylists
                     SET name = ?, specialties = ?, phone = ?, email = ?, active = ?
-                    WHERE id = ?
+                    WHERE id = ? AND salon_id = ?
                     """,
-                    values + (int(stylist_id),),
+                    values + (int(stylist_id), sid),
                 )
         connection.commit()
 
 
 def save_staff_users(edited: pd.DataFrame) -> None:
+    sid = active_salon_id()
     with connect() as connection:
         for row in edited.to_dict("records"):
             staff_id = row.get("id")
@@ -1281,34 +1721,39 @@ def save_staff_users(edited: pd.DataFrame) -> None:
             if pd.isna(staff_id):
                 connection.execute(
                     """
-                    INSERT INTO staff_users (name, role, phone, email, active, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO staff_users (salon_id, name, role, phone, email, active, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    values + (now_iso(),),
+                    (sid,) + values + (now_iso(),),
                 )
             else:
                 connection.execute(
                     """
                     UPDATE staff_users
                     SET name = ?, role = ?, phone = ?, email = ?, active = ?
-                    WHERE id = ?
+                    WHERE id = ? AND salon_id = ?
                     """,
-                    values + (int(staff_id),),
+                    values + (int(staff_id), sid),
                 )
         connection.commit()
 
 
-def sms_provider_ready() -> bool:
-    return all(
-        os.getenv(key)
-        for key in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER")
+def sms_provider_ready(salon_id: int | None = None) -> bool:
+    settings = salon_settings(salon_id)
+    from_number = (
+        settings.get("twilio_from_number")
+        or settings.get("sms_from_number")
+        or os.getenv("TWILIO_FROM_NUMBER", "")
     )
+    return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN") and from_number)
 
 
 def setup_readiness_items() -> list[tuple[str, bool, str]]:
-    services = load_df("SELECT COUNT(*) AS count FROM services")
-    stylists = load_df("SELECT COUNT(*) AS count FROM stylists WHERE active = 1")
-    staff = load_df("SELECT COUNT(*) AS count FROM staff_users WHERE active = 1")
+    sid = active_salon_id()
+    settings = salon_settings(sid)
+    services = load_df("SELECT COUNT(*) AS count FROM services WHERE salon_id = ?", (sid,))
+    stylists = load_df("SELECT COUNT(*) AS count FROM stylists WHERE salon_id = ? AND active = 1", (sid,))
+    staff = load_df("SELECT COUNT(*) AS count FROM staff_users WHERE salon_id = ? AND active = 1", (sid,))
     return [
         (
             "Service menu",
@@ -1322,7 +1767,7 @@ def setup_readiness_items() -> list[tuple[str, bool, str]]:
         ),
         (
             "SMS provider",
-            sms_provider_ready(),
+            sms_provider_ready(sid),
             "Twilio credentials are required before texts send outside the demo.",
         ),
         (
@@ -1332,7 +1777,7 @@ def setup_readiness_items() -> list[tuple[str, bool, str]]:
         ),
         (
             "Hosted database",
-            bool(HOSTED_DATABASE_URL),
+            bool(settings["database_url"]),
             "Set SALON_DATABASE_URL or SUPABASE_URL for production storage and backups.",
         ),
         (
@@ -1347,12 +1792,12 @@ def setup_readiness_items() -> list[tuple[str, bool, str]]:
         ),
         (
             "Calendar sync",
-            BOOKING_PROVIDER != "Not configured",
+            settings["booking_provider"] != "Not configured",
             "Set BOOKING_PROVIDER after choosing Google Calendar, Square, Fresha, or another system.",
         ),
         (
             "Payment links",
-            PAYMENT_PROVIDER != "Not configured",
+            settings["payment_provider"] != "Not configured",
             "Set PAYMENT_PROVIDER and checkout base URL before collecting deposits.",
         ),
     ]
@@ -1441,11 +1886,11 @@ def upcoming_appointments(limit: int = 6) -> pd.DataFrame:
         JOIN clients ON clients.id = a.client_id
         JOIN services ON services.id = a.service_id
         JOIN stylists ON stylists.id = a.stylist_id
-        WHERE a.status != 'Cancelled'
+        WHERE a.salon_id = ? AND a.status != 'Cancelled'
         ORDER BY a.appointment_date, a.appointment_time
         LIMIT ?
         """,
-        (limit,),
+        (active_salon_id(), limit),
     )
 
 
@@ -1456,10 +1901,12 @@ def analytics_summary() -> dict[str, float]:
         SELECT appointments.*, services.base_price
         FROM appointments
         JOIN services ON services.id = appointments.service_id
-        WHERE appointments.status != 'Cancelled'
+        WHERE appointments.salon_id = ? AND appointments.status != 'Cancelled'
         """
+        ,
+        (active_salon_id(),),
     )
-    messages_df = load_df("SELECT * FROM messages")
+    messages_df = load_df("SELECT * FROM messages WHERE salon_id = ?", (active_salon_id(),))
     missed_calls = len(conversations_df)
     bookings = len(appointments_df)
     replies = 0
@@ -1672,15 +2119,21 @@ def render_header() -> None:
         """,
         unsafe_allow_html=True,
     )
-    provider_ready = sms_provider_ready()
+    all_salons = salons_df(active_only=True)
+    if not all_salons.empty:
+        salon_ids = all_salons["id"].tolist()
+        if st.session_state.get("active_salon_id") not in salon_ids:
+            st.session_state["active_salon_id"] = int(salon_ids[0])
+    active_settings = salon_settings()
+    provider_ready = sms_provider_ready(active_salon_id())
     provider_label = "SMS provider ready" if provider_ready else "Simulation mode"
     provider_class = "status-good" if provider_ready else "status-warn"
     st.markdown(
         f"""
         <section class="app-hero">
             <div class="hero-label">Front desk command center</div>
-            <h1>{escape(SALON_NAME)} missed-call concierge</h1>
-            <p>{escape(SALON_PHONE)} | Capture missed calls, answer price questions, book appointments, and brief stylists from one responsive workspace.</p>
+            <h1>{escape(active_settings['name'])} missed-call concierge</h1>
+            <p>{escape(active_settings['phone'])} | Capture missed calls, answer price questions, book appointments, and brief stylists from one responsive workspace.</p>
             <div style="margin-top:0.72rem;">
                 <span class="status-pill {provider_class}">{provider_label}</span>
             </div>
@@ -1695,8 +2148,24 @@ def render_header() -> None:
         unsafe_allow_html=True,
     )
     with st.sidebar:
+        if not all_salons.empty:
+            st.markdown("### Active salon")
+            salon_ids = [int(item) for item in all_salons["id"].tolist()]
+            current_salon_id = active_salon_id()
+            selected_index = salon_ids.index(current_salon_id) if current_salon_id in salon_ids else 0
+            selected_salon = st.selectbox(
+                "Salon workspace",
+                options=salon_ids,
+                index=selected_index,
+                format_func=lambda item: all_salons.loc[all_salons["id"] == item, "name"].iloc[0],
+            )
+            if int(selected_salon) != active_salon_id():
+                st.session_state["active_salon_id"] = int(selected_salon)
+                st.rerun()
+            st.caption("All clients, services, bookings, webhooks, and analytics are scoped to this salon.")
+            st.divider()
         st.markdown("### Salon setup")
-        st.caption(f"{SALON_NAME} | {SALON_PHONE}")
+        st.caption(f"{active_settings['name']} | {active_settings['phone']}")
         st.markdown(status_badge("SMS live", "good" if provider_ready else "warn"), unsafe_allow_html=True)
         st.caption("SMS sends for real only after provider credentials and consent rules are configured.")
         st.divider()
@@ -1707,10 +2176,14 @@ def render_header() -> None:
 
 
 def render_metrics() -> None:
+    sid = active_salon_id()
     inbox = conversations()
-    appointments = load_df("SELECT * FROM appointments WHERE status = 'Booked'")
-    notifications = load_df("SELECT * FROM stylist_notifications WHERE status = 'Ready to send'")
-    clients = load_df("SELECT * FROM clients")
+    appointments = load_df("SELECT * FROM appointments WHERE salon_id = ? AND status = 'Booked'", (sid,))
+    notifications = load_df(
+        "SELECT * FROM stylist_notifications WHERE salon_id = ? AND status = 'Ready to send'",
+        (sid,),
+    )
+    clients = load_df("SELECT * FROM clients WHERE salon_id = ?", (sid,))
     today_bookings = 0
     if not appointments.empty:
         today_bookings = int((appointments["appointment_date"] == date.today().isoformat()).sum())
@@ -1935,7 +2408,7 @@ def render_booking_tab() -> None:
         else:
             st.info("No exact service match yet. Choose from the full menu below.")
 
-        services = load_df("SELECT * FROM services ORDER BY category, name")
+        services = load_df("SELECT * FROM services WHERE salon_id = ? ORDER BY category, name", (active_salon_id(),))
         default_service_id = matches[0].id if matches else int(services.iloc[0]["id"])
         service_id = st.selectbox(
             "Service",
@@ -2013,8 +2486,11 @@ def render_booking_tab() -> None:
         JOIN clients ON clients.id = a.client_id
         JOIN services ON services.id = a.service_id
         JOIN stylists ON stylists.id = a.stylist_id
+        WHERE a.salon_id = ?
         ORDER BY a.appointment_date, a.appointment_time
         """
+        ,
+        (active_salon_id(),),
     )
     st.dataframe(appointments, hide_index=True, width="stretch")
 
@@ -2034,8 +2510,11 @@ def render_notifications_tab() -> None:
         FROM stylist_notifications n
         JOIN stylists ON stylists.id = n.stylist_id
         JOIN clients ON clients.id = n.client_id
+        WHERE n.salon_id = ?
         ORDER BY n.created_at DESC
         """
+        ,
+        (active_salon_id(),),
     )
     if notifications.empty:
         st.info("No stylist notifications yet.")
@@ -2050,24 +2529,28 @@ def render_notifications_tab() -> None:
     st.text_area("Stylist message", value=row["summary"], height=120)
     col1, col2 = st.columns(2)
     if col1.button("Mark as sent", width="stretch"):
-        execute("UPDATE stylist_notifications SET status = 'Sent' WHERE id = ?", (int(notification_id),))
+        execute(
+            "UPDATE stylist_notifications SET status = 'Sent' WHERE id = ? AND salon_id = ?",
+            (int(notification_id), active_salon_id()),
+        )
         st.success("Notification marked as sent.")
         st.rerun()
     if col2.button("Simulate SMS to stylist", width="stretch"):
         stylist = load_df(
             """
-            SELECT stylists.phone
+            SELECT stylists.phone, n.salon_id
             FROM stylist_notifications n
             JOIN stylists ON stylists.id = n.stylist_id
-            WHERE n.id = ?
+            WHERE n.id = ? AND n.salon_id = ?
             """,
-            (int(notification_id),),
+            (int(notification_id), active_salon_id()),
         )
         to_phone = str(stylist.iloc[0]["phone"]) if not stylist.empty else ""
-        ok, status = send_sms_with_twilio(to_phone, str(row["summary"]))
+        notification_salon_id = int(stylist.iloc[0]["salon_id"]) if not stylist.empty else active_salon_id()
+        ok, status = send_sms_with_twilio(to_phone, str(row["summary"]), notification_salon_id)
         execute(
-            "UPDATE stylist_notifications SET status = ? WHERE id = ?",
-            ("Sent" if ok else "Provider not configured", int(notification_id)),
+            "UPDATE stylist_notifications SET status = ? WHERE id = ? AND salon_id = ?",
+            ("Sent" if ok else "Provider not configured", int(notification_id), active_salon_id()),
         )
         st.info(status)
         st.rerun()
@@ -2078,9 +2561,34 @@ def render_admin_tab() -> None:
     if not role_allows_admin():
         st.warning("Only Owner/Admin roles can edit salon database settings.")
         return
-    services = load_df("SELECT * FROM services ORDER BY id")
-    stylists = load_df("SELECT * FROM stylists ORDER BY id")
-    staff_users = load_df("SELECT * FROM staff_users ORDER BY id")
+
+    st.markdown("#### Salon workspaces")
+    salons = salons_df(active_only=False)
+    edited_salons = st.data_editor(
+        salons,
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        disabled=["id", "created_at"],
+        column_config={
+            "id": st.column_config.NumberColumn("id"),
+            "active": st.column_config.CheckboxColumn(),
+            "timezone": st.column_config.TextColumn(help="Example: America/New_York"),
+            "phone": st.column_config.TextColumn(help="Public salon phone number."),
+            "twilio_from_number": st.column_config.TextColumn(help="Texting number for this salon, usually E.164 like +15550142233."),
+        },
+        key="salons_editor",
+    )
+    if st.button("Save salon workspaces"):
+        save_salons(edited_salons)
+        st.success("Salon workspaces saved.")
+        st.rerun()
+    st.caption("Each workspace has its own clients, conversations, service menu, stylists, bookings, webhooks, and analytics.")
+
+    sid = active_salon_id()
+    services = load_df("SELECT * FROM services WHERE salon_id = ? ORDER BY id", (sid,))
+    stylists = load_df("SELECT * FROM stylists WHERE salon_id = ? ORDER BY id", (sid,))
+    staff_users = load_df("SELECT * FROM staff_users WHERE salon_id = ? ORDER BY id", (sid,))
     st.markdown("#### Services and prices")
     edited_services = st.data_editor(
         services,
@@ -2225,12 +2733,15 @@ def render_launch_plan_tab() -> None:
 def render_consent_tab() -> None:
     st.subheader("Consent and Compliance")
     st.write("Track permission, STOP/HELP responses, and the audit trail before turning on real texting.")
+    sid = active_salon_id()
     clients = load_df(
         """
         SELECT id, name, phone, consent_status, consent_source, consent_updated_at, opt_out_at
         FROM clients
+        WHERE salon_id = ?
         ORDER BY created_at DESC
-        """
+        """,
+        (sid,),
     )
     if clients.empty:
         st.info("No clients yet.")
@@ -2244,18 +2755,18 @@ def render_consent_tab() -> None:
     selected = clients.loc[clients["id"] == client_id].iloc[0]
     col1, col2, col3 = st.columns(3)
     if col1.button("Mark opted in", width="stretch"):
-        log_consent_event(int(client_id), "opt_in", "staff_manual", "Staff confirmed permission to text.")
-        record_audit("consent_opt_in", "client", client_id)
+        log_consent_event(int(client_id), "opt_in", "staff_manual", "Staff confirmed permission to text.", sid)
+        record_audit("consent_opt_in", "client", client_id, salon_id=sid)
         st.success("Client marked opted in.")
         st.rerun()
     if col2.button("Mark transactional only", width="stretch"):
-        log_consent_event(int(client_id), "transactional_okay", "staff_manual", "Transactional service replies only.")
-        record_audit("consent_transactional", "client", client_id)
+        log_consent_event(int(client_id), "transactional_okay", "staff_manual", "Transactional service replies only.", sid)
+        record_audit("consent_transactional", "client", client_id, salon_id=sid)
         st.success("Client marked transactional only.")
         st.rerun()
     if col3.button("Mark opted out", width="stretch"):
-        log_consent_event(int(client_id), "opt_out", "staff_manual", "Staff manually opted client out.")
-        record_audit("consent_opt_out", "client", client_id)
+        log_consent_event(int(client_id), "opt_out", "staff_manual", "Staff manually opted client out.", sid)
+        record_audit("consent_opt_out", "client", client_id, salon_id=sid)
         st.success("Client marked opted out.")
         st.rerun()
     st.caption(f"Current status for {selected['name']}: {selected['consent_status']}")
@@ -2263,10 +2774,10 @@ def render_consent_tab() -> None:
         """
         SELECT event_type, source, notes, created_at
         FROM consent_events
-        WHERE client_id = ?
+        WHERE client_id = ? AND salon_id = ?
         ORDER BY created_at DESC
         """,
-        (int(client_id),),
+        (int(client_id), sid),
     )
     st.markdown("#### Consent event history")
     st.dataframe(events, hide_index=True, width="stretch")
@@ -2275,11 +2786,13 @@ def render_consent_tab() -> None:
 def render_integrations_tab() -> None:
     st.subheader("Integrations")
     st.write("Use this screen to prepare the external pieces without hiding which provider is still simulated.")
+    sid = active_salon_id()
+    settings = salon_settings(sid)
     cols = st.columns(4)
-    cols[0].metric("SMS", "Ready" if sms_provider_ready() else "Simulated")
+    cols[0].metric("SMS", "Ready" if sms_provider_ready(sid) else "Simulated")
     cols[1].metric("Webhook", "Ready" if WEBHOOK_SECRET else "Needs secret")
-    cols[2].metric("Calendar", BOOKING_PROVIDER)
-    cols[3].metric("Payments", PAYMENT_PROVIDER)
+    cols[2].metric("Calendar", settings["booking_provider"])
+    cols[3].metric("Payments", settings["payment_provider"])
 
     st.markdown("#### Missed-call webhook test")
     sample_payload = {
@@ -2287,6 +2800,9 @@ def render_integrations_tab() -> None:
         "event_type": "missed_call",
         "name": "Jordan Lee",
         "phone": "404-555-0101",
+        "body": "What are braid prices?",
+        "salon_phone": settings["phone"],
+        "salon_id": sid,
         "call_id": "demo-call-001",
     }
     payload_text = st.text_area("Webhook payload JSON", value=json.dumps(sample_payload, indent=2), height=150)
@@ -2318,7 +2834,7 @@ def render_integrations_tab() -> None:
             appointments["id"].tolist(),
             format_func=lambda item: f"#{item} | {appointments.loc[appointments['id'] == item, 'client'].iloc[0]} | {appointments.loc[appointments['id'] == item, 'appointment_date'].iloc[0]}",
         )
-        detail = appointment_detail(int(appointment_id))
+        detail = appointment_detail(int(appointment_id), sid)
         if detail:
             st.download_button(
                 "Download ICS calendar event",
@@ -2335,8 +2851,10 @@ def render_integrations_tab() -> None:
         """
         SELECT appointment_id, reminder_type, scheduled_for, status, message
         FROM appointment_reminders
+        WHERE salon_id = ?
         ORDER BY scheduled_for
-        """
+        """,
+        (sid,),
     )
     st.markdown("#### Reminder queue")
     st.dataframe(reminders, hide_index=True, width="stretch")
@@ -2346,9 +2864,11 @@ def render_integrations_tab() -> None:
         """
         SELECT provider, event_type, phone, signature_status, conversation_id, created_at
         FROM webhook_events
+        WHERE salon_id = ?
         ORDER BY created_at DESC
         LIMIT 25
-        """
+        """,
+        (sid,),
     )
     st.dataframe(webhook_events, hide_index=True, width="stretch")
 
@@ -2378,10 +2898,11 @@ def render_analytics_tab() -> None:
         SELECT services.name AS service, COUNT(*) AS bookings, SUM(services.base_price) AS starting_revenue
         FROM appointments
         JOIN services ON services.id = appointments.service_id
-        WHERE appointments.status != 'Cancelled'
+        WHERE appointments.salon_id = ? AND appointments.status != 'Cancelled'
         GROUP BY services.name
         ORDER BY bookings DESC, starting_revenue DESC
-        """
+        """,
+        (active_salon_id(),),
     )
     st.markdown("#### Bookings by service")
     st.dataframe(by_service, hide_index=True, width="stretch")
@@ -2390,9 +2911,11 @@ def render_analytics_tab() -> None:
         """
         SELECT actor, action, entity_type, entity_id, details, created_at
         FROM audit_events
+        WHERE salon_id = ?
         ORDER BY created_at DESC
         LIMIT 30
-        """
+        """,
+        (active_salon_id(),),
     )
     st.markdown("#### Audit trail")
     st.dataframe(audit, hide_index=True, width="stretch")

@@ -21,6 +21,8 @@ A Streamlit prototype for hair salons that turns a missed call into an automatic
 - Includes a launch plan tab that separates app work from outside setup such as phone-provider registration and consent policy.
 - Uses local SQLite storage by default so the demo runs without cloud setup.
 - Is browser-based and responsive, so it can be used on phones, tablets, and desktop screens.
+- Supports multiple salon workspaces from one app, with separate services, clients, conversations, bookings, webhook logs, consent records, staff, and analytics.
+- Routes webhook traffic to the right salon by `salon_id` or by the phone number the client called/texted.
 
 ## Run Locally
 
@@ -42,6 +44,7 @@ $env:TWILIO_ACCOUNT_SID='your_account_sid'
 $env:TWILIO_AUTH_TOKEN='your_auth_token'
 $env:TWILIO_FROM_NUMBER='+15550142233'
 $env:SALON_NAME='Your Salon Name'
+$env:SALON_SLUG='your-salon'
 $env:SALON_PHONE='Your Salon Phone'
 $env:SALON_STAFF_PASSCODE='choose-a-staff-passcode'
 $env:SALON_WEBHOOK_SECRET='shared-webhook-signing-secret'
@@ -52,6 +55,19 @@ $env:PAYMENT_CHECKOUT_BASE_URL='https://payments.example.com'
 ```
 
 In production, the missed-call trigger should come from a phone provider webhook. Twilio, RingCentral, OpenPhone, GoHighLevel, Square Appointments, Fresha, or another salon phone/booking system can be connected depending on what the salon already uses.
+
+## Multi-Salon Setup
+
+The sidebar selector controls the active salon workspace. Owner/Admin users can add more salons in the `Admin Database` tab under `Salon workspaces`.
+
+For each salon, enter:
+
+- Salon name, slug, public phone, and timezone.
+- The Twilio/from number that belongs to that salon.
+- Booking provider, payment provider, checkout URL, and hosted database URL when those are ready.
+- That salon's service menu, stylists, staff users, and policy details.
+
+When webhooks arrive, the app uses `salon_id` first when present. If there is no `salon_id`, it matches the provider's `To`, `Called`, or `salon_phone` value against each salon's phone/from-number fields.
 
 ## Optional Webhook Receiver
 
@@ -71,7 +87,7 @@ Use `X-Salon-Signature` with an HMAC SHA-256 signature of the JSON payload when 
 
 ## Production Storage
 
-`production_schema.sql` is a hosted Postgres/Supabase starting point for the production tables. The Streamlit demo still uses SQLite locally, but the schema now defines the production shape for salons, staff, clients, consent events, messages, appointments, webhooks, payments, reminders, calendar sync, and audit events.
+`production_schema.sql` is a hosted Postgres/Supabase starting point for the production tables. The Streamlit demo still uses SQLite locally, but the schema now defines the production shape for multi-salon tenancy across salons, staff, clients, consent events, messages, appointments, webhooks, payments, reminders, calendar sync, and audit events.
 
 ## Parts Codex Can Write
 
@@ -88,6 +104,7 @@ Use `X-Salon-Signature` with an HMAC SHA-256 signature of the JSON payload when 
 - Owner analytics.
 - Provider adapters for SMS, calendar, email, or CRM tools.
 - Deployment instructions.
+- Multi-salon tenant scoping and admin screens.
 
 ## Parts That Need Outside Setup
 

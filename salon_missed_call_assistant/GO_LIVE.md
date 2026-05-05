@@ -46,6 +46,7 @@ Set these on both services when relevant:
 
 ```text
 SALON_NAME=
+SALON_SLUG=
 SALON_PHONE=
 SALON_TIMEZONE=America/New_York
 SALON_STAFF_PASSCODE=
@@ -62,6 +63,8 @@ SALON_DATABASE_URL=
 
 Use a long random value for `SALON_WEBHOOK_SECRET`. Use a staff-only passcode for `SALON_STAFF_PASSCODE`.
 
+For more than one salon, use these values as the first/default salon. After the dashboard is live, add the other salons from `Admin Database` -> `Salon workspaces` and give each salon its own phone/from-number values.
+
 ## 4. Configure the Phone Provider
 
 Point the phone/SMS provider to the webhook service:
@@ -73,7 +76,20 @@ Point the phone/SMS provider to the webhook service:
 The app expects JSON payloads. If your provider sends form data instead, add a provider-specific adapter in `webhook_receiver.py`.
 Twilio inbound SMS webhooks send `application/x-www-form-urlencoded` data, which `webhook_receiver.py` accepts.
 
-## 5. Move Storage Off Local SQLite
+For multi-salon routing, include `salon_id` in custom webhooks when possible. If the provider cannot include that, make sure its `To`, `Called`, or `salon_phone` field matches the salon's saved phone, `sms_from_number`, or `twilio_from_number`.
+
+## 5. Add Additional Salons
+
+In the dashboard:
+
+1. Open `Admin Database`.
+2. Add or edit rows under `Salon workspaces`.
+3. Save each salon's name, slug, public phone, timezone, SMS/from number, booking provider, payment provider, checkout URL, and database URL.
+4. Switch the sidebar to that salon.
+5. Enter that salon's services, stylists, staff users, deposits, cancellation windows, and prep notes.
+6. Test one missed-call webhook and one inbound SMS for that salon before turning on live traffic.
+
+## 6. Move Storage Off Local SQLite
 
 The live demo can run with local SQLite, but production client records should move to hosted Postgres/Supabase. Start from:
 
@@ -83,7 +99,7 @@ salon_missed_call_assistant/production_schema.sql
 
 After creating the hosted database, put the connection string in `SALON_DATABASE_URL`. The current app still uses local SQLite for the demo runtime, so the next production engineering step is wiring the app's persistence layer to Postgres.
 
-## 6. Domain and Access
+## 7. Domain and Access
 
 For real salon use:
 
@@ -92,7 +108,7 @@ For real salon use:
 - Do not share the dashboard link publicly.
 - Use the webhook URL only inside the phone provider settings.
 
-## 7. Final Launch Checklist
+## 8. Final Launch Checklist
 
 - Phone number purchased or connected.
 - SMS carrier registration completed.
@@ -100,6 +116,7 @@ For real salon use:
 - Twilio or phone-provider credentials entered.
 - Real salon services, deposits, durations, and cancellation windows entered.
 - Real stylists and staff users entered.
+- Each additional salon created with its own phone/from-number and service menu.
 - Hosted database selected and connected.
 - Payment provider selected and deposit policy approved.
 - Booking/calendar provider selected.

@@ -1,8 +1,17 @@
 CREATE TABLE salons (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    timezone TEXT NOT NULL,
-    phone_number TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    phone TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    sms_from_number TEXT DEFAULT '',
+    twilio_account_sid TEXT DEFAULT '',
+    twilio_from_number TEXT DEFAULT '',
+    booking_provider TEXT DEFAULT 'Not configured',
+    payment_provider TEXT DEFAULT 'Not configured',
+    payment_checkout_base_url TEXT DEFAULT '',
+    database_url TEXT DEFAULT '',
+    active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -35,6 +44,7 @@ CREATE TABLE clients (
 
 CREATE TABLE consent_events (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     client_id BIGINT NOT NULL REFERENCES clients(id),
     event_type TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -55,7 +65,8 @@ CREATE TABLE services (
     requires_consultation BOOLEAN NOT NULL DEFAULT false,
     prep_notes TEXT DEFAULT '',
     price_notes TEXT DEFAULT '',
-    active BOOLEAN NOT NULL DEFAULT true
+    active BOOLEAN NOT NULL DEFAULT true,
+    UNIQUE (salon_id, name)
 );
 
 CREATE TABLE stylists (
@@ -65,11 +76,13 @@ CREATE TABLE stylists (
     specialties TEXT NOT NULL,
     phone TEXT DEFAULT '',
     email TEXT DEFAULT '',
-    active BOOLEAN NOT NULL DEFAULT true
+    active BOOLEAN NOT NULL DEFAULT true,
+    UNIQUE (salon_id, name)
 );
 
 CREATE TABLE conversations (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     client_id BIGINT NOT NULL REFERENCES clients(id),
     status TEXT NOT NULL,
     last_intent TEXT DEFAULT '',
@@ -80,6 +93,7 @@ CREATE TABLE conversations (
 
 CREATE TABLE messages (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     conversation_id BIGINT NOT NULL REFERENCES conversations(id),
     sender TEXT NOT NULL,
     body TEXT NOT NULL,
@@ -91,6 +105,7 @@ CREATE TABLE messages (
 
 CREATE TABLE appointments (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     client_id BIGINT NOT NULL REFERENCES clients(id),
     service_id BIGINT NOT NULL REFERENCES services(id),
     stylist_id BIGINT NOT NULL REFERENCES stylists(id),
@@ -107,8 +122,20 @@ CREATE TABLE appointments (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE stylist_notifications (
+    id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
+    stylist_id BIGINT NOT NULL REFERENCES stylists(id),
+    appointment_id BIGINT REFERENCES appointments(id),
+    client_id BIGINT NOT NULL REFERENCES clients(id),
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE webhook_events (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     provider TEXT NOT NULL,
     event_type TEXT NOT NULL,
     phone TEXT NOT NULL,
@@ -121,6 +148,7 @@ CREATE TABLE webhook_events (
 
 CREATE TABLE payment_requests (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     appointment_id BIGINT NOT NULL REFERENCES appointments(id),
     provider TEXT NOT NULL,
     amount NUMERIC(10,2) NOT NULL,
@@ -131,6 +159,7 @@ CREATE TABLE payment_requests (
 
 CREATE TABLE calendar_sync_events (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     appointment_id BIGINT NOT NULL REFERENCES appointments(id),
     provider TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -141,6 +170,7 @@ CREATE TABLE calendar_sync_events (
 
 CREATE TABLE appointment_reminders (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     appointment_id BIGINT NOT NULL REFERENCES appointments(id),
     reminder_type TEXT NOT NULL,
     scheduled_for TIMESTAMPTZ NOT NULL,
@@ -151,6 +181,7 @@ CREATE TABLE appointment_reminders (
 
 CREATE TABLE audit_events (
     id BIGSERIAL PRIMARY KEY,
+    salon_id BIGINT NOT NULL REFERENCES salons(id),
     actor TEXT NOT NULL,
     action TEXT NOT NULL,
     entity_type TEXT NOT NULL,
@@ -158,3 +189,13 @@ CREATE TABLE audit_events (
     details TEXT DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX idx_services_salon ON services(salon_id);
+CREATE INDEX idx_stylists_salon ON stylists(salon_id);
+CREATE INDEX idx_clients_salon_phone ON clients(salon_id, phone_e164);
+CREATE INDEX idx_conversations_salon ON conversations(salon_id);
+CREATE INDEX idx_messages_salon ON messages(salon_id);
+CREATE INDEX idx_appointments_salon_date ON appointments(salon_id, appointment_date);
+CREATE INDEX idx_notifications_salon ON stylist_notifications(salon_id);
+CREATE INDEX idx_webhook_events_salon ON webhook_events(salon_id);
+CREATE INDEX idx_audit_events_salon ON audit_events(salon_id);

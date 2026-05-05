@@ -14,6 +14,7 @@ venv/
 # Older local projects/artifacts not part of Application 0
 /agents/
 /foia_triage/
-/tests/
+/tests/*
+!/tests/test_salon_core.py
 /opt-in-guess-who-game/
 /chris_brown_usher_concert_program.md

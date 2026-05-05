@@ -19,7 +19,7 @@ CREATE TABLE staff_users (
     id BIGSERIAL PRIMARY KEY,
     salon_id BIGINT NOT NULL REFERENCES salons(id),
     name TEXT NOT NULL,
-    email TEXT NOT NULL,
+    email TEXT DEFAULT '',
     phone TEXT DEFAULT '',
     role TEXT NOT NULL,
     auth_provider_user_id TEXT DEFAULT '',
@@ -31,7 +31,7 @@ CREATE TABLE clients (
     id BIGSERIAL PRIMARY KEY,
     salon_id BIGINT NOT NULL REFERENCES salons(id),
     name TEXT NOT NULL,
-    phone_e164 TEXT NOT NULL,
+    phone TEXT NOT NULL,
     email TEXT DEFAULT '',
     consent_status TEXT NOT NULL DEFAULT 'Unknown',
     consent_source TEXT DEFAULT '',
@@ -39,7 +39,7 @@ CREATE TABLE clients (
     opt_out_at TIMESTAMPTZ,
     notes TEXT DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (salon_id, phone_e164)
+    UNIQUE (salon_id, phone)
 );
 
 CREATE TABLE consent_events (
@@ -192,7 +192,7 @@ CREATE TABLE audit_events (
 
 CREATE INDEX idx_services_salon ON services(salon_id);
 CREATE INDEX idx_stylists_salon ON stylists(salon_id);
-CREATE INDEX idx_clients_salon_phone ON clients(salon_id, phone_e164);
+CREATE INDEX idx_clients_salon_phone ON clients(salon_id, phone);
 CREATE INDEX idx_conversations_salon ON conversations(salon_id);
 CREATE INDEX idx_messages_salon ON messages(salon_id);
 CREATE INDEX idx_appointments_salon_date ON appointments(salon_id, appointment_date);

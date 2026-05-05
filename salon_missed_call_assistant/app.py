@@ -25,6 +25,7 @@ SALON_TIMEZONE = os.getenv("SALON_TIMEZONE", "America/New_York")
 DEFAULT_SALON_SLUG = os.getenv("SALON_SLUG", "luxe-chair")
 SALON_STAFF_PASSCODE = os.getenv("SALON_STAFF_PASSCODE", "")
 WEBHOOK_SECRET = os.getenv("SALON_WEBHOOK_SECRET", "")
+REQUIRE_WEBHOOK_SECRET = os.getenv("SALON_REQUIRE_WEBHOOK_SECRET", "").lower() in {"1", "true", "yes"}
 PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "Not configured")
 BOOKING_PROVIDER = os.getenv("BOOKING_PROVIDER", "Not configured")
 HOSTED_DATABASE_URL = os.getenv("SALON_DATABASE_URL") or os.getenv("SUPABASE_URL") or ""
@@ -135,6 +136,21 @@ SALON_EXTRA_COLUMNS = {
     "database_url": "TEXT DEFAULT ''",
     "active": "INTEGER DEFAULT 1",
 }
+STAFF_EXTRA_COLUMNS = {
+    "auth_provider_user_id": "TEXT DEFAULT ''",
+}
+SALON_SETUP_FIELDS = [
+    "name",
+    "slug",
+    "phone",
+    "timezone",
+    "sms_from_number",
+    "twilio_from_number",
+    "booking_provider",
+    "payment_provider",
+    "payment_checkout_base_url",
+    "database_url",
+]
 SERVICE_SYNONYMS = {
     "silk press": ["silk", "press", "straighten"],
     "cut and style": ["cut", "trim", "haircut", "style"],
@@ -274,9 +290,9 @@ def migrate_legacy_unique_tables(connection: sqlite3.Connection) -> None:
 
 def create_tenant_indexes(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_salons_slug ON salons(slug)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_services_salon ON services(salon_id)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_stylists_salon ON stylists(salon_id)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_clients_salon_phone ON clients(salon_id, phone)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_services_salon_name ON services(salon_id, name)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stylists_salon_name ON stylists(salon_id, name)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_salon_phone ON clients(salon_id, phone)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_conversations_salon ON conversations(salon_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, appointment_date)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_salon ON messages(salon_id)")
@@ -292,16 +308,16 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 slug TEXT NOT NULL,
                 phone TEXT NOT NULL,
-                timezone TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'America/New_York',
                 sms_from_number TEXT DEFAULT '',
                 twilio_account_sid TEXT DEFAULT '',
                 twilio_from_number TEXT DEFAULT '',
-                booking_provider TEXT DEFAULT '',
-                payment_provider TEXT DEFAULT '',
+                booking_provider TEXT DEFAULT 'Not configured',
+                payment_provider TEXT DEFAULT 'Not configured',
                 payment_checkout_base_url TEXT DEFAULT '',
                 database_url TEXT DEFAULT '',
                 active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -311,7 +327,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 salon_id INTEGER NOT NULL DEFAULT 1,
-                name TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
                 category TEXT NOT NULL,
                 duration_minutes INTEGER NOT NULL,
                 base_price REAL NOT NULL,
@@ -324,7 +340,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS stylists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 salon_id INTEGER NOT NULL DEFAULT 1,
-                name TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
                 specialties TEXT NOT NULL,
                 phone TEXT DEFAULT '',
                 email TEXT DEFAULT '',
@@ -338,7 +354,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 salon_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL,
-                phone TEXT NOT NULL UNIQUE,
+                phone TEXT NOT NULL,
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             )
@@ -419,6 +435,7 @@ def init_db() -> None:
                 role TEXT NOT NULL,
                 phone TEXT DEFAULT '',
                 email TEXT DEFAULT '',
+                auth_provider_user_id TEXT DEFAULT '',
                 active INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL
             )
@@ -519,6 +536,7 @@ def init_db() -> None:
         ensure_columns(connection, "services", SERVICE_EXTRA_COLUMNS)
         ensure_columns(connection, "clients", CLIENT_EXTRA_COLUMNS)
         ensure_columns(connection, "appointments", APPOINTMENT_EXTRA_COLUMNS)
+        ensure_columns(connection, "staff_users", STAFF_EXTRA_COLUMNS)
         seed_salons(connection)
         create_tenant_indexes(connection)
         seed_defaults(connection)
@@ -971,6 +989,24 @@ def normalize_phone(phone: str) -> str:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "salon"
+
+
+def unique_slug_for_salon(connection: sqlite3.Connection, base_slug: str, salon_id: int | None = None) -> str:
+    slug = slugify(base_slug)
+    candidate = slug
+    suffix = 2
+    while True:
+        if salon_id:
+            row = connection.execute(
+                "SELECT id FROM salons WHERE slug = ? AND id != ?",
+                (candidate, salon_id),
+            ).fetchone()
+        else:
+            row = connection.execute("SELECT id FROM salons WHERE slug = ?", (candidate,)).fetchone()
+        if not row:
+            return candidate
+        candidate = f"{slug}-{suffix}"
+        suffix += 1
 
 
 def detect_intent(message: str) -> str:
@@ -1465,10 +1501,18 @@ def verify_webhook_signature(payload: str, signature: str) -> str:
     return "verified" if hmac.compare_digest(expected, signature.strip()) else "failed"
 
 
-def salon_id_for_phone(phone: str) -> int:
+def webhook_signature_allowed(signature_status: str) -> bool:
+    if signature_status == "failed":
+        return False
+    if REQUIRE_WEBHOOK_SECRET and signature_status != "verified":
+        return False
+    return True
+
+
+def salon_id_for_phone(phone: str, fallback_to_active: bool = True) -> int | None:
     normalized = normalize_phone(phone)
     if not normalized:
-        return active_salon_id()
+        return active_salon_id() if fallback_to_active else None
     with connect() as connection:
         rows = connection.execute(
             """
@@ -1484,15 +1528,35 @@ def salon_id_for_phone(phone: str) -> int:
             candidate = str(row[column] or "").strip()
             if candidate and (candidate == raw or normalize_phone(candidate) == normalized):
                 return int(row["id"])
-    return active_salon_id()
+    return active_salon_id() if fallback_to_active else None
+
+
+def resolve_webhook_salon_id(payload: dict[str, object], salon_phone: str) -> int:
+    explicit_salon_id = payload.get("salon_id")
+    if explicit_salon_id not in (None, ""):
+        try:
+            sid = int(explicit_salon_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Webhook salon_id must be a number.") from exc
+        if salon_by_id(sid):
+            return sid
+        raise ValueError(f"Webhook salon_id {sid} is not configured.")
+    matched_salon_id = salon_id_for_phone(salon_phone, fallback_to_active=False)
+    if matched_salon_id:
+        return matched_salon_id
+    raise ValueError(
+        "Webhook could not be matched to a salon. Include salon_id or configure the salon phone/from-number."
+    )
 
 
 def process_missed_call_webhook(payload: dict[str, object], signature: str = "") -> int:
     raw_payload = json.dumps(payload, sort_keys=True)
     signature_status = verify_webhook_signature(raw_payload, signature)
+    if not webhook_signature_allowed(signature_status):
+        raise ValueError("Webhook signature verification failed or is required.")
     phone = str(payload.get("phone") or payload.get("From") or payload.get("caller") or "").strip()
     salon_phone = str(payload.get("salon_phone") or payload.get("To") or payload.get("Called") or "").strip()
-    sid = int(payload.get("salon_id") or salon_id_for_phone(salon_phone))
+    sid = resolve_webhook_salon_id(payload, salon_phone)
     client_name = str(payload.get("name") or payload.get("CallerName") or "New client").strip()
     provider = str(payload.get("provider") or "manual_webhook")
     if not phone:
@@ -1514,9 +1578,11 @@ def process_missed_call_webhook(payload: dict[str, object], signature: str = "")
 def process_inbound_sms_webhook(payload: dict[str, object], signature: str = "") -> str:
     raw_payload = json.dumps(payload, sort_keys=True)
     signature_status = verify_webhook_signature(raw_payload, signature)
+    if not webhook_signature_allowed(signature_status):
+        raise ValueError("Webhook signature verification failed or is required.")
     phone = normalize_phone(str(payload.get("phone") or payload.get("From") or ""))
     salon_phone = str(payload.get("salon_phone") or payload.get("To") or "").strip()
-    sid = int(payload.get("salon_id") or salon_id_for_phone(salon_phone))
+    sid = resolve_webhook_salon_id(payload, salon_phone)
     body = str(payload.get("body") or payload.get("Body") or "")
     if not phone or not body:
         raise ValueError("Inbound SMS payload must include phone and body.")
@@ -1556,14 +1622,15 @@ def save_salons(edited: pd.DataFrame) -> None:
             if not name:
                 continue
             salon_id = row.get("id")
-            slug = slugify(str(row.get("slug") or name))
+            existing_salon_id = None if pd.isna(salon_id) else int(salon_id)
+            slug = unique_slug_for_salon(connection, str(row.get("slug") or name), existing_salon_id)
             values = (
                 name,
                 slug,
-                str(row.get("phone") or "").strip(),
+                normalize_phone(str(row.get("phone") or "").strip()),
                 str(row.get("timezone") or SALON_TIMEZONE).strip() or SALON_TIMEZONE,
-                str(row.get("sms_from_number") or "").strip(),
-                str(row.get("twilio_from_number") or "").strip(),
+                normalize_phone(str(row.get("sms_from_number") or "").strip()),
+                normalize_phone(str(row.get("twilio_from_number") or "").strip()),
                 str(row.get("booking_provider") or "Not configured").strip() or "Not configured",
                 str(row.get("payment_provider") or "Not configured").strip() or "Not configured",
                 str(row.get("payment_checkout_base_url") or "").strip(),
@@ -1746,6 +1813,131 @@ def sms_provider_ready(salon_id: int | None = None) -> bool:
         or os.getenv("TWILIO_FROM_NUMBER", "")
     )
     return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN") and from_number)
+
+
+def has_real_phone(value: str) -> bool:
+    digits = re.sub(r"\D+", "", value or "")
+    return len(digits) >= 10 and not digits.startswith("555")
+
+
+def salon_setup_report(salon_id: int | None = None) -> list[dict[str, object]]:
+    sid = salon_id or active_salon_id()
+    settings = salon_settings(sid)
+    services = load_df("SELECT COUNT(*) AS count FROM services WHERE salon_id = ?", (sid,))
+    stylists = load_df("SELECT COUNT(*) AS count FROM stylists WHERE salon_id = ? AND active = 1", (sid,))
+    staff = load_df("SELECT COUNT(*) AS count FROM staff_users WHERE salon_id = ? AND active = 1", (sid,))
+    clients = load_df("SELECT COUNT(*) AS count FROM clients WHERE salon_id = ?", (sid,))
+    service_count = int(services.iloc[0]["count"])
+    stylist_count = int(stylists.iloc[0]["count"])
+    staff_count = int(staff.iloc[0]["count"])
+    client_count = int(clients.iloc[0]["count"])
+    rows = [
+        {
+            "area": "Salon profile",
+            "status": "Ready" if has_real_phone(settings["phone"]) else "Needs real phone",
+            "category": "Local setup",
+            "next_step": "Add the salon's real public phone number in Admin Database.",
+            "ready": has_real_phone(settings["phone"]),
+        },
+        {
+            "area": "Service menu",
+            "status": "Ready" if service_count else "Missing",
+            "category": "Local setup",
+            "next_step": "Add services, durations, starting prices, deposits, and prep notes.",
+            "ready": service_count > 0,
+        },
+        {
+            "area": "Stylists",
+            "status": "Ready" if stylist_count else "Missing",
+            "category": "Local setup",
+            "next_step": "Add at least one active stylist with specialty and phone details.",
+            "ready": stylist_count > 0,
+        },
+        {
+            "area": "Staff access",
+            "status": "Ready" if SALON_STAFF_PASSCODE and staff_count else "Demo mode",
+            "category": "Production safety",
+            "next_step": "Set SALON_STAFF_PASSCODE and confirm staff users before using real client data.",
+            "ready": bool(SALON_STAFF_PASSCODE) and staff_count > 0,
+        },
+        {
+            "area": "SMS sender",
+            "status": "Ready" if sms_provider_ready(sid) else "Simulated",
+            "category": "External account",
+            "next_step": "Add Twilio account SID, auth token, and this salon's from-number.",
+            "ready": sms_provider_ready(sid),
+        },
+        {
+            "area": "Webhook security",
+            "status": "Ready" if WEBHOOK_SECRET else "Needs secret",
+            "category": "Production safety",
+            "next_step": "Set SALON_WEBHOOK_SECRET before accepting live provider callbacks.",
+            "ready": bool(WEBHOOK_SECRET),
+        },
+        {
+            "area": "Consent policy",
+            "status": "Approved" if os.getenv("SALON_CONSENT_POLICY_APPROVED") else "Needs approval",
+            "category": "Owner/legal",
+            "next_step": "Approve missed-call texting, STOP, HELP, and message-frequency language.",
+            "ready": bool(os.getenv("SALON_CONSENT_POLICY_APPROVED")),
+        },
+        {
+            "area": "Hosted database",
+            "status": "Ready" if settings["database_url"] else "Local SQLite",
+            "category": "Production storage",
+            "next_step": "Connect Supabase/Postgres before storing live client records long-term.",
+            "ready": bool(settings["database_url"]),
+        },
+        {
+            "area": "Calendar provider",
+            "status": "Ready" if settings["booking_provider"] != "Not configured" else "ICS export only",
+            "category": "External account",
+            "next_step": "Choose Google Calendar, Square, Fresha, Vagaro, or GlossGenius.",
+            "ready": settings["booking_provider"] != "Not configured",
+        },
+        {
+            "area": "Payment provider",
+            "status": "Ready" if settings["payment_provider"] != "Not configured" else "Not connected",
+            "category": "External account",
+            "next_step": "Choose Square, Stripe, or another provider before collecting deposits.",
+            "ready": settings["payment_provider"] != "Not configured",
+        },
+        {
+            "area": "Demo data",
+            "status": "Loaded" if client_count else "No clients yet",
+            "category": "Local testing",
+            "next_step": "Use Missed calls to create sample conversations before a sales demo.",
+            "ready": True,
+        },
+    ]
+    return rows
+
+
+def salon_export_package(salon_id: int | None = None) -> dict[str, object]:
+    sid = salon_id or active_salon_id()
+    salon = salon_by_id(sid)
+    def table_records(query: str) -> list[dict[str, object]]:
+        return load_df(query, (sid,)).to_dict("records")
+
+    return {
+        "generated_at": now_iso(),
+        "salon": dict(salon) if salon else salon_settings(sid),
+        "readiness": salon_setup_report(sid),
+        "services": table_records("SELECT * FROM services WHERE salon_id = ? ORDER BY category, name"),
+        "stylists": table_records("SELECT * FROM stylists WHERE salon_id = ? ORDER BY name"),
+        "staff_users": table_records("SELECT id, salon_id, name, role, phone, email, active, created_at FROM staff_users WHERE salon_id = ? ORDER BY name"),
+        "webhooks": {
+            "missed_call_path": "/webhooks/missed-call",
+            "inbound_sms_path": "/webhooks/inbound-sms",
+            "routing": "Include salon_id when possible, or make the provider To/Called number match the salon phone/from-number.",
+        },
+        "manual_blockers": [
+            "Create/verify the phone provider account.",
+            "Buy or port each salon phone/SMS number.",
+            "Complete texting compliance and billing verification.",
+            "Approve the salon's consent, deposit, cancellation, and refund policies.",
+        ],
+    }
 
 
 def setup_readiness_items() -> list[tuple[str, bool, str]]:
@@ -2237,20 +2429,59 @@ def render_overview_tab() -> None:
             st.markdown(status_badge(label, "good" if ready else "warn"), unsafe_allow_html=True)
             st.caption(detail)
         st.markdown("#### What is missing")
-        missing = [
-            "A real missed-call webhook from the salon phone provider.",
-            "A confirmed texting consent and opt-out process.",
-            "The salon's true service rules, deposits, add-ons, and cancellation policy.",
-            "Staff accounts and permissions before storing real client data.",
-        ]
-        for item in missing:
-            st.write(f"- {item}")
+        report = salon_setup_report()
+        missing = [row for row in report if not bool(row["ready"])]
+        if not missing:
+            st.success("This salon workspace is fully configured for the current app checks.")
+        else:
+            for row in missing[:5]:
+                st.write(f"- {row['area']}: {row['next_step']}")
 
 
 def render_missed_call_tab() -> None:
     st.subheader("Missed Call Capture")
     left, right = st.columns([0.95, 1.05], gap="large")
     with left:
+        st.markdown("#### Fast demo scenarios")
+        scenarios = {
+            "Price question": {
+                "name": "Ari Johnson",
+                "phone": "404-555-0198",
+                "reply": "Hi, how much are knotless braids and do you have Saturday open?",
+                "consent": "transactional_missed_call",
+            },
+            "Ready to book": {
+                "name": "Morgan Lee",
+                "phone": "404-555-0124",
+                "reply": "Can I book a silk press tomorrow afternoon?",
+                "consent": "transactional_missed_call",
+            },
+            "Reschedule request": {
+                "name": "Taylor Smith",
+                "phone": "404-555-0166",
+                "reply": "I need to reschedule my color appointment.",
+                "consent": "transactional_missed_call",
+            },
+            "STOP compliance test": {
+                "name": "Casey Brown",
+                "phone": "404-555-0177",
+                "reply": "STOP",
+                "consent": "opted_in",
+            },
+        }
+        scenario_name = st.selectbox("Scenario", list(scenarios.keys()))
+        scenario = scenarios[scenario_name]
+        if st.button("Run selected demo scenario", type="primary", width="stretch"):
+            conversation_id = create_missed_call(
+                str(scenario["name"]),
+                str(scenario["phone"]),
+                str(scenario["consent"]),
+            )
+            add_client_reply(conversation_id, str(scenario["reply"]))
+            st.session_state["active_conversation_id"] = conversation_id
+            st.success(f"{scenario_name} scenario created.")
+            st.rerun()
+
         st.markdown("#### Simulate a missed salon call")
         name = st.text_input("Client name", value="Ari Johnson")
         phone = st.text_input("Client phone", value="404-555-0198")
@@ -2586,6 +2817,22 @@ def render_admin_tab() -> None:
     st.caption("Each workspace has its own clients, conversations, service menu, stylists, bookings, webhooks, and analytics.")
 
     sid = active_salon_id()
+    package = salon_export_package(sid)
+    st.download_button(
+        "Download salon setup package",
+        data=json.dumps(package, indent=2),
+        file_name=f"{package['salon'].get('slug', 'salon')}-setup-package.json",
+        mime="application/json",
+        width="stretch",
+    )
+    st.markdown("#### Current salon checklist")
+    checklist = pd.DataFrame(salon_setup_report(sid))
+    st.dataframe(
+        checklist[["area", "status", "category", "next_step"]],
+        hide_index=True,
+        width="stretch",
+    )
+
     services = load_df("SELECT * FROM services WHERE salon_id = ? ORDER BY id", (sid,))
     stylists = load_df("SELECT * FROM stylists WHERE salon_id = ? ORDER BY id", (sid,))
     staff_users = load_df("SELECT * FROM staff_users WHERE salon_id = ? ORDER BY id", (sid,))
@@ -2671,9 +2918,34 @@ def render_admin_tab() -> None:
 def render_launch_plan_tab() -> None:
     st.subheader("Production Launch Plan")
     st.write(
-        "This is the gap list between the demo and a salon-ready product. "
-        "The app can be coded around these pieces, but the salon owner still has to choose providers and approve policies."
+        "Use this as the operating checklist for turning the current workspace into a live salon location. "
+        "Items marked external need the salon owner or provider account holder."
     )
+    report = pd.DataFrame(salon_setup_report())
+    ready_total = int(report["ready"].sum()) if not report.empty else 0
+    st.progress(ready_total / len(report), text=f"{ready_total} of {len(report)} checks complete for this salon")
+    st.dataframe(
+        report[["area", "status", "category", "next_step"]],
+        hide_index=True,
+        width="stretch",
+    )
+
+    st.markdown("#### What is already working locally")
+    local_ready = pd.DataFrame(
+        [
+            {"capability": "Multi-salon database", "proof": "Separate clients, services, appointments, webhooks, and analytics per salon."},
+            {"capability": "Missed-call capture", "proof": "Manual simulator and webhook functions create conversations."},
+            {"capability": "Price lookup", "proof": "Client messages are matched against the selected salon's service menu."},
+            {"capability": "Booking workflow", "proof": "Slots respect stylist availability and existing appointments."},
+            {"capability": "Consent ledger", "proof": "STOP/HELP and staff consent changes are logged per salon."},
+        ]
+    )
+    st.dataframe(local_ready, hide_index=True, width="stretch")
+
+    show_external = st.toggle("Show production-only external account tasks", value=True)
+    if not show_external:
+        return
+
     rows = []
     for label, description, owner in PRODUCTION_REQUIREMENTS:
         if label in {"Phone webhook", "SMS consent and opt-out policy", "Real service menu"}:

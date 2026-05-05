@@ -20,6 +20,8 @@ services:
         sync: false
       - key: SALON_WEBHOOK_SECRET
         sync: false
+      - key: SALON_REQUIRE_WEBHOOK_SECRET
+        value: "true"
       - key: SALON_CONSENT_POLICY_APPROVED
         sync: false
       - key: TWILIO_ACCOUNT_SID
@@ -57,6 +59,8 @@ services:
         value: America/New_York
       - key: SALON_WEBHOOK_SECRET
         sync: false
+      - key: SALON_REQUIRE_WEBHOOK_SECRET
+        value: "true"
       - key: SALON_CONSENT_POLICY_APPROVED
         sync: false
       - key: TWILIO_ACCOUNT_SID

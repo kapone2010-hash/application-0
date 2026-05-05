@@ -48,6 +48,7 @@ $env:SALON_SLUG='your-salon'
 $env:SALON_PHONE='Your Salon Phone'
 $env:SALON_STAFF_PASSCODE='choose-a-staff-passcode'
 $env:SALON_WEBHOOK_SECRET='shared-webhook-signing-secret'
+$env:SALON_REQUIRE_WEBHOOK_SECRET='true'
 $env:SALON_CONSENT_POLICY_APPROVED='true'
 $env:BOOKING_PROVIDER='Google Calendar'
 $env:PAYMENT_PROVIDER='Square'
@@ -68,6 +69,8 @@ For each salon, enter:
 - That salon's service menu, stylists, staff users, and policy details.
 
 When webhooks arrive, the app uses `salon_id` first when present. If there is no `salon_id`, it matches the provider's `To`, `Called`, or `salon_phone` value against each salon's phone/from-number fields.
+
+Unknown webhook destinations are rejected instead of being assigned to the currently selected salon. For live deployments, set `SALON_REQUIRE_WEBHOOK_SECRET=true` so unsigned callbacks are rejected too.
 
 ## Optional Webhook Receiver
 

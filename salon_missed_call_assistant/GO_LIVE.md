@@ -51,6 +51,7 @@ SALON_PHONE=
 SALON_TIMEZONE=America/New_York
 SALON_STAFF_PASSCODE=
 SALON_WEBHOOK_SECRET=
+SALON_REQUIRE_WEBHOOK_SECRET=true
 SALON_CONSENT_POLICY_APPROVED=true
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
@@ -62,6 +63,7 @@ SALON_DATABASE_URL=
 ```
 
 Use a long random value for `SALON_WEBHOOK_SECRET`. Use a staff-only passcode for `SALON_STAFF_PASSCODE`.
+Keep `SALON_REQUIRE_WEBHOOK_SECRET=true` in production so unsigned or incorrectly signed webhook requests are rejected.
 
 For more than one salon, use these values as the first/default salon. After the dashboard is live, add the other salons from `Admin Database` -> `Salon workspaces` and give each salon its own phone/from-number values.
 
@@ -77,6 +79,7 @@ The app expects JSON payloads. If your provider sends form data instead, add a p
 Twilio inbound SMS webhooks send `application/x-www-form-urlencoded` data, which `webhook_receiver.py` accepts.
 
 For multi-salon routing, include `salon_id` in custom webhooks when possible. If the provider cannot include that, make sure its `To`, `Called`, or `salon_phone` field matches the salon's saved phone, `sms_from_number`, or `twilio_from_number`.
+If neither `salon_id` nor a configured destination phone matches, the app rejects the webhook instead of placing the client into the wrong salon workspace.
 
 ## 5. Add Additional Salons
 

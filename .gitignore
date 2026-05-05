@@ -6,6 +6,8 @@ __pycache__/
 *.log
 application0_crm.sqlite3
 application0_crm.sqlite3-*
+salon_missed_call_assistant/salon_assistant.sqlite3
+salon_missed_call_assistant/salon_assistant.sqlite3-*
 .venv/
 venv/
 

@@ -1,0 +1,61 @@
+services:
+  - type: web
+    name: salon-assistant-ui
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt
+    startCommand: streamlit run salon_missed_call_assistant/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --browser.gatherUsageStats false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SALON_NAME
+        sync: false
+      - key: SALON_PHONE
+        sync: false
+      - key: SALON_TIMEZONE
+        value: America/New_York
+      - key: SALON_STAFF_PASSCODE
+        sync: false
+      - key: SALON_WEBHOOK_SECRET
+        sync: false
+      - key: SALON_CONSENT_POLICY_APPROVED
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: BOOKING_PROVIDER
+        sync: false
+      - key: PAYMENT_PROVIDER
+        sync: false
+      - key: PAYMENT_CHECKOUT_BASE_URL
+        sync: false
+      - key: SALON_DATABASE_URL
+        sync: false
+
+  - type: web
+    name: salon-assistant-webhooks
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt
+    startCommand: uvicorn webhook_receiver:api --app-dir salon_missed_call_assistant --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SALON_NAME
+        sync: false
+      - key: SALON_PHONE
+        sync: false
+      - key: SALON_WEBHOOK_SECRET
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: SALON_DATABASE_URL
+        sync: false

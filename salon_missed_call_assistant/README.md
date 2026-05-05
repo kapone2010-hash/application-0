@@ -34,6 +34,13 @@ From `C:\Users\Aniya\OneDrive\Documents\New project 3`:
 ```
 
 The demo creates `salon_assistant.sqlite3` inside this folder on first run.
+The app also reads an optional uncommitted `salon_missed_call_assistant/.env` file, using the same keys shown in `.env.example`.
+
+Run the live-readiness preflight any time:
+
+```powershell
+& 'C:\Users\Aniya\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' salon_missed_call_assistant\preflight.py
+```
 
 ## Optional SMS Settings
 

@@ -64,6 +64,13 @@ SALON_DATABASE_URL=
 
 Use a long random value for `SALON_WEBHOOK_SECRET`. Use a staff-only passcode for `SALON_STAFF_PASSCODE`.
 Keep `SALON_REQUIRE_WEBHOOK_SECRET=true` in production so unsigned or incorrectly signed webhook requests are rejected.
+For local testing, these values can live in an uncommitted `salon_missed_call_assistant/.env` file.
+
+Run this preflight before deploying or testing a real call:
+
+```powershell
+& 'C:\Users\Aniya\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' salon_missed_call_assistant\preflight.py
+```
 
 For more than one salon, use these values as the first/default salon. After the dashboard is live, add the other salons from `Admin Database` -> `Salon workspaces` and give each salon its own phone/from-number values.
 

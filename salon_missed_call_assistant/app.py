@@ -16,6 +16,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional local convenience
+    load_dotenv = None
+
+
+if load_dotenv:
+    load_dotenv()
+    load_dotenv(Path(__file__).with_name(".env"))
 
 APP_TITLE = "Salon Missed-Call Assistant"
 DB_PATH = Path(__file__).with_name("salon_assistant.sqlite3")

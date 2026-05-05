@@ -3,7 +3,7 @@ services:
     name: salon-assistant-ui
     runtime: python
     plan: starter
-    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt
+    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt && python salon_missed_call_assistant/preflight.py
     startCommand: streamlit run salon_missed_call_assistant/app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true --browser.gatherUsageStats false
     envVars:
       - key: PYTHON_VERSION
@@ -43,7 +43,7 @@ services:
     name: salon-assistant-webhooks
     runtime: python
     plan: starter
-    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt
+    buildCommand: pip install -r salon_missed_call_assistant/requirements.txt && python salon_missed_call_assistant/preflight.py
     startCommand: uvicorn webhook_receiver:api --app-dir salon_missed_call_assistant --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
